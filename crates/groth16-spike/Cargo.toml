@@ -1,0 +1,19 @@
+[package]
+name = "beatex-groth16-spike"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+license = "Apache-2.0"
+publish = false
+description = "Host-only BN254 Groth16 feasibility spike for BeatEx order validity"
+
+[dependencies]
+ark-bn254 = "=0.5.0"
+ark-ec = "=0.5.0"
+ark-ff = "=0.5.0"
+ark-groth16 = "=0.5.0"
+ark-relations = "=0.5.1"
+ark-snark = "=0.5.1"
+groth16-solana = "=0.2.0"
+rand = "=0.8.6"
+rand_chacha = "=0.3.1"

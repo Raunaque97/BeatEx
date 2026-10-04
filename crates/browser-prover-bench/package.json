@@ -1,0 +1,8 @@
+{
+  "name": "beatex-browser-prover-bench",
+  "private": true,
+  "scripts": {
+    "build": "wasm-pack build --target web --release --out-dir web/pkg",
+    "serve": "python3 -m http.server 4173 --directory web"
+  }
+}

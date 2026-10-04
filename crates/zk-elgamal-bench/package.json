@@ -1,0 +1,8 @@
+{
+  "name": "beatex-zk-elgamal-browser-bench",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@solana/zk-sdk": "0.5.3"
+  }
+}

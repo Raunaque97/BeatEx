@@ -1,0 +1,14 @@
+[package]
+name = "beatex-bn254-g1-groth16-spike"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+ark-bn254 = "0.5"
+ark-ec = "0.5"
+ark-ff = "0.5"
+ark-r1cs-std = "0.5"
+ark-relations = "0.5"

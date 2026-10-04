@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>BeatEx browser Groth16 benchmark</title>
+    <style>
+      :root { color-scheme: light dark; font: 16px/1.5 system-ui, sans-serif; }
+      body { max-width: 920px; margin: 3rem auto; padding: 0 1.25rem; }
+      .controls { display: flex; flex-wrap: wrap; gap: 1rem; align-items: end; }
+      label { display: grid; gap: .35rem; }
+      select, input, button { font: inherit; padding: .55rem .7rem; }
+      button { cursor: pointer; }
+      .warning { border-left: .3rem solid #d98b00; padding-left: 1rem; }
+      pre { padding: 1rem; overflow: auto; border: 1px solid #8886; min-height: 10rem; }
+      small { opacity: .8; }
+    </style>
+  </head>
+  <body>
+    <h1>BeatEx browser Groth16 benchmark</h1>
+    <p class="warning">
+      The timed proof is the arithmetic-only control circuit. The exact
+      Ristretto relation is available as a constraint measurement because even
+      one ciphertext exceeds five million constraints.
+    </p>
+    <div class="controls">
+      <label>Price levels
+        <select id="levels"><option value="3">3</option><option value="17">17</option></select>
+      </label>
+      <label>Proof rounds
+        <input id="rounds" type="number" min="1" max="100" value="3" />
+      </label>
+      <button id="run">Run in WebAssembly</button>
+      <button id="measure-ristretto">Measure exact Ristretto constraints</button>
+      <button id="download" disabled>Download JSON</button>
+    </div>
+    <p><small>Reload between runs for a clean WASM-memory baseline. The exact measurement synthesizes one full ciphertext relation and may hold the page busy for a while.</small></p>
+    <pre id="output">Loading WebAssembly…</pre>
+    <script type="module" src="./index.js"></script>
+  </body>
+</html>

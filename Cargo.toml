@@ -1,0 +1,31 @@
+[workspace]
+members = [
+    "crates/babyjubjub-groth16-spike",
+    "crates/demo-sim",
+    "crates/groth16-spike",
+    "crates/threshold-crypto",
+    "crates/zk-elgamal-bench",
+    "programs/beatex",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.89"
+
+[workspace.dependencies]
+curve25519-dalek = { version = "4.1.3", features = ["digest", "rand_core", "serde"] }
+rand = "0.8.6"
+sha2 = "0.10.9"
+solana-zk-sdk = "7.0.1"
+thiserror = "2.0.18"
+zeroize = "1.8.2"
+
+[profile.dev]
+debug = 0
+incremental = false
+
+[profile.test]
+debug = 0
+incremental = false

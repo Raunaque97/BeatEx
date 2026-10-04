@@ -1,0 +1,39 @@
+[package]
+name = "babyjub-sbf-spike"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[features]
+custom-heap = []
+custom-panic = []
+
+[dependencies]
+ark-ec = { version = "0.5.0", default-features = false }
+ark-ed-on-bn254 = { version = "0.5.0", default-features = false }
+ark-ff = { version = "0.5.0", default-features = false }
+ark-serialize = { version = "0.5.0", default-features = false }
+solana-account-info = "=3.1.1"
+solana-big-mod-exp = "=3.0.0"
+solana-program-entrypoint = "=3.1.1"
+solana-program-error = "=3.0.1"
+solana-pubkey = "=4.4.0"
+
+[dev-dependencies]
+litesvm = "=0.10.0"
+solana-account = "=3.4.0"
+solana-compute-budget-interface = "=3.1.0"
+solana-instruction = "=3.5.1"
+solana-keypair = "=3.1.2"
+solana-message = "=3.1.0"
+solana-signer = "=3.0.0"
+solana-transaction = "=3.1.0"
+
+[lints.rust.unexpected_cfgs]
+level = "warn"
+check-cfg = ['cfg(target_os, values("solana"))']

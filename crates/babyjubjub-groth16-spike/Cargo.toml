@@ -1,0 +1,26 @@
+[package]
+name = "beatex-babyjubjub-groth16-spike"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+license = "Apache-2.0"
+publish = false
+description = "Host-only Baby Jubjub ElGamal / BN254 Groth16 spike for BeatEx"
+
+[lib]
+name = "beatex_babyjubjub_groth16_spike"
+path = "src/lib.rs"
+
+[dependencies]
+ark-bn254 = "=0.5.0"
+ark-ec = "=0.5.0"
+ark-ed-on-bn254 = { version = "=0.5.0", features = ["r1cs", "std"] }
+ark-ff = "=0.5.0"
+ark-groth16 = "=0.5.0"
+ark-r1cs-std = "=0.5.0"
+ark-relations = "=0.5.1"
+ark-serialize = "=0.5.0"
+ark-snark = "=0.5.1"
+light-poseidon = "=0.4.0"
+rand = "=0.8.6"
+rand_chacha = "=0.3.1"

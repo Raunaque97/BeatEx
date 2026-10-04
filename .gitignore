@@ -1,0 +1,20 @@
+# Rust build output (including standalone benchmark crates).
+target/
+**/target/
+
+# Local demo wallets, validator ledgers, deployed artifacts, and secrets.
+.demo/
+
+# Rust profiling output.
+*.profraw
+
+# JavaScript/WebAssembly benchmark dependencies and generated packages.
+node_modules/
+**/node_modules/
+pkg/
+**/pkg/
+
+# Local editor and operating-system files.
+.DS_Store
+.idea/
+.vscode/

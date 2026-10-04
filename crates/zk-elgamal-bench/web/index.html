@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>BeatEx native ZK ElGamal browser benchmark</title>
+    <style>
+      :root { color-scheme: light dark; font: 16px/1.5 system-ui, sans-serif; }
+      body { max-width: 960px; margin: 3rem auto; padding: 0 1.25rem; }
+      .controls { display: flex; flex-wrap: wrap; align-items: end; gap: 1rem; }
+      label { display: grid; gap: .35rem; }
+      input, button { font: inherit; padding: .5rem .7rem; }
+      pre { min-height: 16rem; padding: 1rem; overflow: auto; border: 1px solid #8886; }
+      .warning { border-left: .3rem solid #d98b00; padding-left: 1rem; }
+    </style>
+    <script type="importmap">
+      {
+        "imports": {
+          "@solana/zk-sdk/web": "/node_modules/@solana/zk-sdk/dist/web/index.js"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <h1>BeatEx native ZK ElGamal browser benchmark</h1>
+    <p class="warning">
+      Measures browser-WASM ciphertext construction, grouped validity proofs,
+      and strict 4-bit range proofs. It does not include the private no-wash OR proof.
+    </p>
+    <div class="controls">
+      <label>Rounds
+        <input id="rounds" type="number" min="1" max="30" value="5" />
+      </label>
+      <button id="run">Run 3/9/17/33/65 levels</button>
+    </div>
+    <pre id="output">Loading WASM…</pre>
+    <script type="module" src="./index.js"></script>
+  </body>
+</html>

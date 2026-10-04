@@ -43,21 +43,23 @@ Before an auction opens, the market fixes a finite set of valid prices:
 
 The grid itself is public. What remains confidential is where an order sits on that grid and how much liquidity it contributes.
 
-Consider a buy order for 10 units with a limit of 101. It can be represented as the demand it contributes at every possible clearing price:
+Asset `A` is the base asset and asset `B` is the quote asset. Every order
+quantity is denominated in base-asset `A` lots; prices are quote-asset `B` lots
+per base lot.
+
+An order is a contingent schedule. Each entry states the amount of base asset
+`A` the trader will buy or sell if that exact index becomes the clearing price.
+Entries are not cumulative across prices. For example:
 
 ```text
-Price:      99   100   101   102   103
-Demand:     10    10    10     0     0
+Price in B/A:        99   100   101   102   103
+Buy A if it clears:   6    10     4     0     0
+Sell A if it clears:  0     0     0     3     8
 ```
 
-A sell order for 8 units with a limit of 101 becomes:
-
-```text
-Price:      99   100   101   102   103
-Supply:      0     0     8     8     8
-```
-
-The values are encrypted.
+If price `100` clears, this order may buy `10` units of `A`; none of its other
+entries execute. If price `103` clears, it may sell `8` units of `A`. The two
+vectors are encrypted, and at any one index at most one side may be non-zero.
 
 Now clearing no longer requires comparing encrypted prices. The protocol only has to **add encrypted numbers at each public price point**.
 
@@ -100,7 +102,16 @@ Orders are encrypted under a **common auction ElGamal key**. The auction's confi
 
 An order should never reach clearing only to discover that the trader cannot settle it. Collateral is therefore locked when the order is submitted.
 
-For a order, the trader locks enough base asset to cover the maximum amount that can be sold and enough quote asset to cover its maximum possible liability.
+For an order, the trader locks enough base asset `A` to cover the maximum amount
+that can be sold and enough quote asset `B` to cover its maximum possible
+liability:
+
+```text
+required_A = max_i(sell[i])
+required_B = max_i(price[i] * buy[i])
+```
+
+Only the selected clearing index executes, so these are maxima rather than sums.
 
 The actual tokens are locked using a **Token-2022 confidential transfer** from the trader's confidential balance into a market collateral vault. Token-2022 verifies that the trader has sufficient balance and moves the funds without revealing the amount.
 
@@ -115,9 +126,9 @@ The trader therefore does not maintain a separate "locked balance": locked colla
 Each market continuously pipelines independent auction epochs:
 
 1. **Open** — the price grid and auction parameters are fixed.
-2. **Submit** — traders send encrypted orders and lock collateral.
-3. **Seal** — after the deadline, no more orders can enter that auction.
-4. **Decrypt aggregates** — threshold key holders publish decryption shares for the aggregated demand and supply vectors.
+2. **Submit and fold** — each trader sends one independent encrypted order and locks collateral; permissionless bots continuously prove batches into the encrypted aggregate.
+3. **Seal** — after the deadline, no more orders can enter. Decryption waits until the folded-order counter equals the accepted-order counter.
+4. **Decrypt aggregates** — threshold key holders publish decryption shares for the complete aggregated demand and supply vectors.
 5. **Clear** — anyone can reconstruct the aggregate curves; the program applies the deterministic clearing rule.
 6. **Settle and claim** — traders consume their resulting claims and recover unused collateral.
 
@@ -241,6 +252,7 @@ auction timing
 price grids
 collateral custody
 encrypted aggregate state
+accepted-order and folded-order counters
 decryption shares
 clearing result
 settlement state
