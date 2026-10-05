@@ -112,31 +112,6 @@ pub struct QueueVerificationKey {
     pub bump: u8,
 }
 
-/// Auction phases relevant to queue processing.
-///
-/// Folding is intentionally permitted in both `Open` and `Sealed`. Later
-/// lifecycle phases cannot modify the accumulator.
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, Eq, InitSpace, PartialEq)]
-#[borsh(use_discriminant = true)]
-#[repr(u8)]
-pub enum QueuePhase {
-    Open = 0,
-    Sealed = 1,
-    Decrypting = 2,
-    Settled = 3,
-    Cancelled = 4,
-}
-
-impl QueuePhase {
-    pub const fn allows_folding(self) -> bool {
-        matches!(self, Self::Open | Self::Sealed)
-    }
-
-    pub const fn is_terminal(self) -> bool {
-        matches!(self, Self::Settled | Self::Cancelled)
-    }
-}
-
 /// Immutable queue deadlines fixed when the auction is opened.
 ///
 /// Both ranges are half-open: submission is valid before
@@ -248,8 +223,6 @@ pub struct EncryptedPrivateBalance {
 pub enum QueueInvariantError {
     InvalidDeadlines,
     CollectionClosed,
-    AuctionNotOpen,
-    FoldingNotAllowed,
     AggregationDeadlineReached,
     AggregationDeadlineNotReached,
     OrderAlreadyFolded,
@@ -257,7 +230,6 @@ pub enum QueueInvariantError {
     CountOverflow,
     FoldedCountExceedsAccepted,
     CollectionStillOpen,
-    AuctionNotSealed,
     AggregationIncomplete,
     AggregationAlreadyComplete,
 }
@@ -300,15 +272,11 @@ pub const fn advance_withdrawal(
 /// The handler must create the order account and store both values atomically
 /// with the proof-controlled encrypted balance transition.
 pub fn accept_order(
-    phase: QueuePhase,
     current_slot: u64,
     deadlines: QueueDeadlines,
     accepted_order_count: u64,
 ) -> QueueInvariantResult<(u64, u64)> {
     validate_deadlines(deadlines)?;
-    if phase != QueuePhase::Open {
-        return Err(QueueInvariantError::AuctionNotOpen);
-    }
     if !deadlines.collection_is_open(current_slot) {
         return Err(QueueInvariantError::CollectionClosed);
     }
@@ -333,7 +301,6 @@ pub const fn fold_order_state(state: QueuedOrderState) -> QueueInvariantResult<Q
 /// the same auction. This count preflight prevents a malformed batch from ever
 /// making the folded count exceed the authoritative accepted count.
 pub fn advance_fold(
-    phase: QueuePhase,
     current_slot: u64,
     deadlines: QueueDeadlines,
     accepted_order_count: u64,
@@ -343,9 +310,6 @@ pub fn advance_fold(
 ) -> QueueInvariantResult<(u64, u64)> {
     validate_deadlines(deadlines)?;
     validate_counts(accepted_order_count, folded_order_count)?;
-    if !phase.allows_folding() {
-        return Err(QueueInvariantError::FoldingNotAllowed);
-    }
     if !deadlines.aggregation_is_open(current_slot) {
         return Err(QueueInvariantError::AggregationDeadlineReached);
     }
@@ -377,7 +341,6 @@ pub const fn aggregation_is_complete(accepted_order_count: u64, folded_order_cou
 /// already complete remains settleable even if the settlement transaction is
 /// submitted later. This also makes a zero-order auction settleable.
 pub fn authorize_settlement(
-    phase: QueuePhase,
     current_slot: u64,
     deadlines: QueueDeadlines,
     accepted_order_count: u64,
@@ -385,9 +348,6 @@ pub fn authorize_settlement(
 ) -> QueueInvariantResult<()> {
     validate_deadlines(deadlines)?;
     validate_counts(accepted_order_count, folded_order_count)?;
-    if phase != QueuePhase::Sealed {
-        return Err(QueueInvariantError::AuctionNotSealed);
-    }
     if deadlines.collection_is_open(current_slot) {
         return Err(QueueInvariantError::CollectionStillOpen);
     }
@@ -399,7 +359,6 @@ pub fn authorize_settlement(
 
 /// Authorize permissionless cancellation of an incomplete aggregate.
 pub fn authorize_aggregation_timeout(
-    phase: QueuePhase,
     current_slot: u64,
     deadlines: QueueDeadlines,
     accepted_order_count: u64,
@@ -407,9 +366,6 @@ pub fn authorize_aggregation_timeout(
 ) -> QueueInvariantResult<()> {
     validate_deadlines(deadlines)?;
     validate_counts(accepted_order_count, folded_order_count)?;
-    if !phase.allows_folding() {
-        return Err(QueueInvariantError::FoldingNotAllowed);
-    }
     if !deadlines.aggregation_timed_out(current_slot) {
         return Err(QueueInvariantError::AggregationDeadlineNotReached);
     }
@@ -475,20 +431,13 @@ mod tests {
 
     #[test]
     fn submission_assigns_preincrement_sequence() {
+        assert_eq!(accept_order(99, DEADLINES, 41), Ok((41, 42)));
         assert_eq!(
-            accept_order(QueuePhase::Open, 99, DEADLINES, 41),
-            Ok((41, 42))
-        );
-        assert_eq!(
-            accept_order(QueuePhase::Open, 100, DEADLINES, 41),
+            accept_order(100, DEADLINES, 41),
             Err(QueueInvariantError::CollectionClosed)
         );
         assert_eq!(
-            accept_order(QueuePhase::Sealed, 99, DEADLINES, 41),
-            Err(QueueInvariantError::AuctionNotOpen)
-        );
-        assert_eq!(
-            accept_order(QueuePhase::Open, 99, DEADLINES, u64::MAX),
+            accept_order(99, DEADLINES, u64::MAX),
             Err(QueueInvariantError::CountOverflow)
         );
     }
@@ -554,51 +503,35 @@ mod tests {
     }
 
     #[test]
-    fn folding_is_allowed_while_open_and_after_sealing() {
-        for phase in [QueuePhase::Open, QueuePhase::Sealed] {
-            assert_eq!(advance_fold(phase, 150, DEADLINES, 10, 3, 7, 4), Ok((7, 8)));
-        }
-
-        for phase in [
-            QueuePhase::Decrypting,
-            QueuePhase::Settled,
-            QueuePhase::Cancelled,
-        ] {
-            assert_eq!(
-                advance_fold(phase, 150, DEADLINES, 10, 3, 7, 4),
-                Err(QueueInvariantError::FoldingNotAllowed)
-            );
-        }
+    fn folding_is_allowed_until_the_temporal_deadline() {
+        assert_eq!(advance_fold(150, DEADLINES, 10, 3, 7, 4), Ok((7, 8)));
     }
 
     #[test]
     fn fold_preflight_preserves_count_invariant() {
         assert_eq!(
-            advance_fold(QueuePhase::Open, 50, DEADLINES, 5, 3, 9, 0),
+            advance_fold(50, DEADLINES, 5, 3, 9, 0),
             Err(QueueInvariantError::EmptyFoldBatch)
         );
         assert_eq!(
-            advance_fold(QueuePhase::Open, 50, DEADLINES, 5, 3, 9, 3),
+            advance_fold(50, DEADLINES, 5, 3, 9, 3),
             Err(QueueInvariantError::FoldedCountExceedsAccepted)
         );
         assert_eq!(
-            advance_fold(QueuePhase::Open, 50, DEADLINES, 4, 5, 9, 1),
+            advance_fold(50, DEADLINES, 4, 5, 9, 1),
             Err(QueueInvariantError::FoldedCountExceedsAccepted)
         );
         assert_eq!(
-            advance_fold(QueuePhase::Open, 50, DEADLINES, 5, 4, u64::MAX, 1),
+            advance_fold(50, DEADLINES, 5, 4, u64::MAX, 1),
             Err(QueueInvariantError::CountOverflow)
         );
     }
 
     #[test]
     fn aggregation_deadline_is_half_open() {
+        assert_eq!(advance_fold(199, DEADLINES, 2, 0, 0, 2), Ok((2, 1)));
         assert_eq!(
-            advance_fold(QueuePhase::Sealed, 199, DEADLINES, 2, 0, 0, 2),
-            Ok((2, 1))
-        );
-        assert_eq!(
-            advance_fold(QueuePhase::Sealed, 200, DEADLINES, 2, 0, 0, 2),
+            advance_fold(200, DEADLINES, 2, 0, 0, 2),
             Err(QueueInvariantError::AggregationDeadlineReached)
         );
     }
@@ -606,48 +539,28 @@ mod tests {
     #[test]
     fn settlement_waits_for_collection_and_exact_completeness() {
         assert_eq!(
-            authorize_settlement(QueuePhase::Sealed, 99, DEADLINES, 2, 2),
+            authorize_settlement(99, DEADLINES, 2, 2),
             Err(QueueInvariantError::CollectionStillOpen)
         );
         assert_eq!(
-            authorize_settlement(QueuePhase::Open, 100, DEADLINES, 2, 2),
-            Err(QueueInvariantError::AuctionNotSealed)
-        );
-        assert_eq!(
-            authorize_settlement(QueuePhase::Sealed, 100, DEADLINES, 2, 1),
+            authorize_settlement(100, DEADLINES, 2, 1),
             Err(QueueInvariantError::AggregationIncomplete)
         );
-        assert_eq!(
-            authorize_settlement(QueuePhase::Sealed, 100, DEADLINES, 2, 2),
-            Ok(())
-        );
-        assert_eq!(
-            authorize_settlement(QueuePhase::Sealed, 250, DEADLINES, 2, 2),
-            Ok(())
-        );
-        assert_eq!(
-            authorize_settlement(QueuePhase::Sealed, 100, DEADLINES, 0, 0),
-            Ok(())
-        );
+        assert_eq!(authorize_settlement(100, DEADLINES, 2, 2), Ok(()));
+        assert_eq!(authorize_settlement(250, DEADLINES, 2, 2), Ok(()));
+        assert_eq!(authorize_settlement(100, DEADLINES, 0, 0), Ok(()));
     }
 
     #[test]
     fn timeout_only_cancels_incomplete_aggregation() {
         assert_eq!(
-            authorize_aggregation_timeout(QueuePhase::Open, 199, DEADLINES, 2, 1),
+            authorize_aggregation_timeout(199, DEADLINES, 2, 1),
             Err(QueueInvariantError::AggregationDeadlineNotReached)
         );
+        assert_eq!(authorize_aggregation_timeout(200, DEADLINES, 2, 1), Ok(()));
         assert_eq!(
-            authorize_aggregation_timeout(QueuePhase::Open, 200, DEADLINES, 2, 1),
-            Ok(())
-        );
-        assert_eq!(
-            authorize_aggregation_timeout(QueuePhase::Sealed, 200, DEADLINES, 2, 2),
+            authorize_aggregation_timeout(200, DEADLINES, 2, 2),
             Err(QueueInvariantError::AggregationAlreadyComplete)
-        );
-        assert_eq!(
-            authorize_aggregation_timeout(QueuePhase::Decrypting, 200, DEADLINES, 2, 1),
-            Err(QueueInvariantError::FoldingNotAllowed)
         );
     }
 
@@ -664,7 +577,7 @@ mod tests {
             },
         ] {
             assert_eq!(
-                accept_order(QueuePhase::Open, 1, deadlines, 0),
+                accept_order(1, deadlines, 0),
                 Err(QueueInvariantError::InvalidDeadlines)
             );
         }

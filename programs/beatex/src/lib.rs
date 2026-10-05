@@ -4,13 +4,13 @@
 
 use {
     anchor_lang::prelude::*,
+    pyth_solana_receiver_sdk::price_update::PriceUpdateV2,
     solana_curve25519::ristretto::{add_ristretto, validate_ristretto, PodRistrettoPoint},
 };
 
 pub mod allocation;
 pub mod auction;
 pub mod groth16;
-pub mod lifecycle;
 pub mod queue;
 pub mod queue_hash;
 pub mod state;
@@ -59,6 +59,10 @@ pub mod beatex {
         );
         require!(args.tick_size > 0, BeatExError::InvalidMarketParameters);
         require!(
+            args.market_start_slot >= Clock::get()?.slot,
+            BeatExError::InvalidMarketParameters
+        );
+        require!(
             args.grid_radius <= state::MAX_GRID_RADIUS,
             BeatExError::InvalidMarketParameters
         );
@@ -72,20 +76,25 @@ pub mod beatex {
             args.submission_duration_slots > 0
                 && args.aggregation_duration_slots > 0
                 && args.decryption_duration_slots > 0
-                && args.claim_duration_slots > 0,
+                && args.oracle_max_age_seconds > 0
+                && args.oracle_max_confidence_bps <= 10_000,
             BeatExError::InvalidMarketParameters
         );
         let price_span = args
             .tick_size
             .checked_mul(args.grid_radius as u64)
             .ok_or_else(|| error!(BeatExError::ArithmeticOverflow))?;
-        args.initial_reference_price
+        args.min_reference_price
             .checked_sub(price_span)
             .ok_or_else(|| error!(BeatExError::InvalidMarketParameters))?;
         let upper_price = args
-            .initial_reference_price
+            .max_reference_price
             .checked_add(price_span)
             .ok_or_else(|| error!(BeatExError::ArithmeticOverflow))?;
+        require!(
+            args.min_reference_price <= args.max_reference_price,
+            BeatExError::InvalidMarketParameters
+        );
         // A two-sided contingent order can withdraw its unused reserve and
         // proceeds in the same asset. Bound that worst case to Token-2022's
         // 48-bit confidential-transfer amount.
@@ -113,13 +122,21 @@ pub mod beatex {
         market.max_order_quantity = args.max_order_quantity;
         market.max_aggregate_quantity = args.max_aggregate_quantity;
         market.current_key_epoch = Pubkey::default();
-        market.last_clearing_price = args.initial_reference_price;
+        market.market_start_slot = args.market_start_slot;
+        market.last_clearing_price = 0;
+        market.last_clearing_volume = 0;
         market.last_cleared_auction_sequence = 0;
-        market.next_auction_id = 0;
+        market.minimum_reference_volume = args.minimum_reference_volume;
+        market.oracle_price_account = ctx.accounts.oracle_price.key();
+        market.oracle_feed_id = args.oracle_feed_id;
+        market.oracle_max_age_seconds = args.oracle_max_age_seconds;
+        market.oracle_max_confidence_bps = args.oracle_max_confidence_bps;
+        market.oracle_exponent_adjustment = args.oracle_exponent_adjustment;
+        market.min_reference_price = args.min_reference_price;
+        market.max_reference_price = args.max_reference_price;
         market.submission_duration_slots = args.submission_duration_slots;
         market.aggregation_duration_slots = args.aggregation_duration_slots;
         market.decryption_duration_slots = args.decryption_duration_slots;
-        market.claim_duration_slots = args.claim_duration_slots;
         market.allocation_rule_version = args.allocation_rule_version;
         market.order_circuit_version = args.order_circuit_version;
         market.claim_circuit_version = args.claim_circuit_version;
@@ -221,16 +238,32 @@ pub mod beatex {
         Ok(())
     }
 
-    pub fn open_auction(ctx: Context<OpenAuction>, auction_id: u64) -> Result<()> {
-        let market = &mut ctx.accounts.market;
+    /// Materialize the deterministic auction for the current slot. This is a
+    /// permissionless storage-allocation step, not an authority transition.
+    pub fn initialize_auction(ctx: Context<InitializeAuction>, auction_id: u64) -> Result<()> {
+        let market = &ctx.accounts.market;
         require!(!market.paused, BeatExError::MarketPaused);
         require!(
             market.current_key_epoch != Pubkey::default(),
             BeatExError::NoActiveKeyEpoch
         );
-        require!(auction_id == market.next_auction_id, BeatExError::AuctionId);
-        let slot = Clock::get()?.slot;
-        let submission_end_slot = slot
+        require_keys_eq!(
+            ctx.accounts.oracle_price.key(),
+            market.oracle_price_account,
+            BeatExError::InvalidOraclePrice
+        );
+        let clock = Clock::get()?;
+        let expected_id = current_auction_id(market, clock.slot)?;
+        require!(auction_id == expected_id, BeatExError::AuctionId);
+        let open_slot = market
+            .market_start_slot
+            .checked_add(
+                auction_id
+                    .checked_mul(market.submission_duration_slots)
+                    .ok_or_else(|| error!(BeatExError::ArithmeticOverflow))?,
+            )
+            .ok_or_else(|| error!(BeatExError::ArithmeticOverflow))?;
+        let submission_end_slot = open_slot
             .checked_add(market.submission_duration_slots)
             .ok_or_else(|| error!(BeatExError::ArithmeticOverflow))?;
         let aggregation_deadline_slot = submission_end_slot
@@ -239,35 +272,87 @@ pub mod beatex {
         let decryption_deadline_slot = aggregation_deadline_slot
             .checked_add(market.decryption_duration_slots)
             .ok_or_else(|| error!(BeatExError::ArithmeticOverflow))?;
-        let claim_deadline_slot = decryption_deadline_slot
-            .checked_add(market.claim_duration_slots)
-            .ok_or_else(|| error!(BeatExError::ArithmeticOverflow))?;
+
+        let use_previous_clearing = auction_id > 0
+            && market.last_cleared_auction_sequence == auction_id
+            && market.last_clearing_volume >= market.minimum_reference_volume;
+        let (reference_price, reference_from_oracle, oracle_publish_time) = if use_previous_clearing
+        {
+            (market.last_clearing_price, false, 0)
+        } else {
+            let price = ctx
+                .accounts
+                .oracle_price
+                .get_price_no_older_than(
+                    &clock,
+                    market.oracle_max_age_seconds,
+                    &market.oracle_feed_id,
+                )
+                .map_err(|_| error!(BeatExError::InvalidOraclePrice))?;
+            require!(price.price > 0, BeatExError::InvalidOraclePrice);
+            require!(
+                u128::from(price.conf)
+                    .checked_mul(10_000)
+                    .is_some_and(|confidence| {
+                        confidence
+                            <= u128::from(price.price as u64)
+                                * u128::from(market.oracle_max_confidence_bps)
+                    }),
+                BeatExError::InvalidOraclePrice
+            );
+            (
+                normalize_oracle_price(
+                    price.price,
+                    price.exponent,
+                    market.oracle_exponent_adjustment,
+                    market.tick_size,
+                )?,
+                true,
+                price.publish_time,
+            )
+        };
+        validate_reference_price(market, reference_price)?;
 
         let auction = &mut ctx.accounts.auction;
         auction.version = state::PROTOCOL_VERSION;
         auction.market = market.key();
         auction.auction_id = auction_id;
         auction.key_epoch = market.current_key_epoch;
-        auction.state = AuctionState::Open;
-        auction.open_slot = slot;
+        auction.state = AuctionState::Pending;
+        auction.open_slot = open_slot;
         auction.submission_end_slot = submission_end_slot;
         auction.aggregation_deadline_slot = aggregation_deadline_slot;
         auction.decryption_deadline_slot = decryption_deadline_slot;
-        auction.claim_deadline_slot = claim_deadline_slot;
-        auction.reference_price = market.last_clearing_price;
+        auction.reference_price = reference_price;
+        auction.reference_from_oracle = reference_from_oracle;
+        auction.oracle_publish_time = oracle_publish_time;
         auction.tick_size = market.tick_size;
         auction.grid_size = market.grid_radius * 2 + 1;
         auction.allocation_rule_version = market.allocation_rule_version;
         auction.order_circuit_version = market.order_circuit_version;
         auction.claim_circuit_version = market.claim_circuit_version;
         auction.clearing_index = market.grid_radius;
-        auction.clearing_price = market.last_clearing_price;
+        auction.clearing_price = reference_price;
         auction.bump = ctx.bumps.auction;
 
-        market.next_auction_id = market
-            .next_auction_id
-            .checked_add(1)
-            .ok_or_else(|| error!(BeatExError::ArithmeticOverflow))?;
+        let counter = &mut ctx.accounts.submission_counter;
+        counter.version = state::PROTOCOL_VERSION;
+        counter.auction = auction.key();
+        counter.accepted_order_count = 0;
+        counter.bump = ctx.bumps.submission_counter;
+
+        let accumulator = &mut ctx.accounts.accumulator;
+        accumulator.version = state::PROTOCOL_VERSION;
+        accumulator.auction = auction.key();
+        accumulator.folded_order_count = 0;
+        accumulator.fold_revision = 0;
+        accumulator.ciphertexts = queue_hash::order_bytes(&queue_hash::identity_order());
+        accumulator.ciphertext_digest = queue_hash::order_ciphertext_digest(
+            &auction.key(),
+            &accumulator.key(),
+            &accumulator.ciphertexts,
+        )?;
+        accumulator.bump = ctx.bumps.accumulator;
         Ok(())
     }
 
@@ -290,36 +375,6 @@ pub mod beatex {
         key.delta_g2 = args.delta_g2;
         key.ic = args.ic;
         key.bump = ctx.bumps.verification_key;
-        Ok(())
-    }
-
-    pub fn initialize_queue_state(ctx: Context<InitializeQueueState>) -> Result<()> {
-        require!(
-            ctx.accounts.auction.state == AuctionState::Open,
-            BeatExError::AuctionState
-        );
-        require!(
-            ctx.accounts.auction.grid_size as usize == queue::QUEUE_PRICE_LEVELS,
-            BeatExError::UnsupportedQueueGrid
-        );
-        let counter = &mut ctx.accounts.submission_counter;
-        counter.version = state::PROTOCOL_VERSION;
-        counter.auction = ctx.accounts.auction.key();
-        counter.accepted_order_count = 0;
-        counter.bump = ctx.bumps.submission_counter;
-
-        let accumulator = &mut ctx.accounts.accumulator;
-        accumulator.version = state::PROTOCOL_VERSION;
-        accumulator.auction = ctx.accounts.auction.key();
-        accumulator.folded_order_count = 0;
-        accumulator.fold_revision = 0;
-        accumulator.ciphertexts = queue_hash::order_bytes(&queue_hash::identity_order());
-        accumulator.ciphertext_digest = queue_hash::order_ciphertext_digest(
-            &ctx.accounts.auction.key(),
-            &accumulator.key(),
-            &accumulator.ciphertexts,
-        )?;
-        accumulator.bump = ctx.bumps.accumulator;
         Ok(())
     }
 
@@ -452,9 +507,12 @@ pub mod beatex {
             BeatExError::OrderState
         );
         let auction = &queue_accounts.auction;
+        require!(
+            auction.state == AuctionState::Pending,
+            BeatExError::AuctionState
+        );
         let deadlines = queue_deadlines(auction);
         let (sequence, next_count) = queue::accept_order(
-            queue_phase(auction.state)?,
             slot,
             deadlines,
             queue_accounts.submission_counter.accepted_order_count,
@@ -570,7 +628,6 @@ pub mod beatex {
         }
 
         let (next_count, next_revision) = queue::advance_fold(
-            queue_phase(ctx.accounts.auction.state)?,
             Clock::get()?.slot,
             queue_deadlines(&ctx.accounts.auction),
             ctx.accounts.submission_counter.accepted_order_count,
@@ -579,6 +636,10 @@ pub mod beatex {
             batch_size as u64,
         )
         .map_err(|_| error!(BeatExError::QueueInvariant))?;
+        require!(
+            ctx.accounts.auction.state == AuctionState::Pending,
+            BeatExError::AuctionState
+        );
         let digest = queue_hash::fold_statement_digest(&queue_hash::FoldStatement {
             auction: &ctx.accounts.auction.key(),
             old_folded_count: ctx.accounts.accumulator.folded_order_count,
@@ -602,32 +663,25 @@ pub mod beatex {
         Ok(())
     }
 
-    pub fn finalize_queue_aggregation(ctx: Context<FinalizeQueueAggregation>) -> Result<()> {
-        queue::authorize_settlement(
-            queue_phase(ctx.accounts.auction.state)?,
-            Clock::get()?.slot,
-            queue_deadlines(&ctx.accounts.auction),
-            ctx.accounts.submission_counter.accepted_order_count,
-            ctx.accounts.accumulator.folded_order_count,
-        )
-        .map_err(|_| error!(BeatExError::AggregationIncomplete))?;
-        ctx.accounts.auction.state = AuctionState::Decrypting;
-        Ok(())
-    }
-
-    /// Publish the exact per-price aggregate buy and sell quantities after an
-    /// arbitrary registered 3-of-7 Baby Jubjub quorum has decrypted the frozen
-    /// accumulator. Decryption shares and DLEQ transcripts remain private
-    /// witnesses; the proof binds the selected participant public keys.
-    pub fn publish_aggregate_curves(
-        ctx: Context<PublishAggregateCurves>,
+    /// Verify aggregate publication and deterministically clear in one atomic
+    /// permissionless instruction. Temporal eligibility comes from the clock;
+    /// no stored seal/decrypt phase is required.
+    pub fn publish_and_clear(
+        ctx: Context<PublishAndClear>,
         args: PublishAggregateCurvesArgs,
     ) -> Result<()> {
         let auction = &ctx.accounts.auction;
         require!(
-            auction.state == AuctionState::Decrypting,
+            auction.state == AuctionState::Pending,
             BeatExError::AuctionState
         );
+        queue::authorize_settlement(
+            Clock::get()?.slot,
+            queue_deadlines(auction),
+            ctx.accounts.submission_counter.accepted_order_count,
+            ctx.accounts.accumulator.folded_order_count,
+        )
+        .map_err(|_| error!(BeatExError::AggregationIncomplete))?;
         require!(
             Clock::get()?.slot < auction.decryption_deadline_slot,
             BeatExError::DeadlineReached
@@ -637,9 +691,8 @@ pub mod beatex {
             BeatExError::UnsupportedQueueGrid
         );
         require!(
-            ctx.accounts.submission_counter.accepted_order_count > 0
-                && ctx.accounts.submission_counter.accepted_order_count
-                    == ctx.accounts.accumulator.folded_order_count,
+            ctx.accounts.submission_counter.accepted_order_count
+                == ctx.accounts.accumulator.folded_order_count,
             BeatExError::AggregationIncomplete
         );
         require!(
@@ -696,113 +749,6 @@ pub mod beatex {
         auction.decrypted_demand = args.demand;
         auction.decrypted_supply = args.supply;
         auction.decrypted_entry_bitmap = (1_u128 << queue::QUEUED_CIPHERTEXT_COUNT) - 1;
-        auction.state = AuctionState::Decrypted;
-        Ok(())
-    }
-
-    pub fn cancel_stalled_aggregation(ctx: Context<FinalizeQueueAggregation>) -> Result<()> {
-        queue::authorize_aggregation_timeout(
-            queue_phase(ctx.accounts.auction.state)?,
-            Clock::get()?.slot,
-            queue_deadlines(&ctx.accounts.auction),
-            ctx.accounts.submission_counter.accepted_order_count,
-            ctx.accounts.accumulator.folded_order_count,
-        )
-        .map_err(|_| error!(BeatExError::QueueInvariant))?;
-        ctx.accounts.auction.state = AuctionState::Cancelled;
-        Ok(())
-    }
-
-    pub fn seal_auction(ctx: Context<MutateAuction>) -> Result<()> {
-        let auction = &mut ctx.accounts.auction;
-        require!(
-            auction.state == AuctionState::Open,
-            BeatExError::AuctionState
-        );
-        require!(
-            Clock::get()?.slot >= auction.submission_end_slot,
-            BeatExError::DeadlineNotReached
-        );
-        auction.state = AuctionState::Sealed;
-        Ok(())
-    }
-
-    pub fn cancel_expired_auction(ctx: Context<MutateAuction>) -> Result<()> {
-        let auction = &mut ctx.accounts.auction;
-        require!(
-            matches!(
-                auction.state,
-                AuctionState::Open
-                    | AuctionState::Sealed
-                    | AuctionState::Decrypting
-                    | AuctionState::Decrypted
-            ),
-            BeatExError::AuctionState
-        );
-        require!(
-            Clock::get()?.slot >= auction.decryption_deadline_slot,
-            BeatExError::DeadlineNotReached
-        );
-        auction.state = AuctionState::Cancelled;
-        Ok(())
-    }
-
-    /// Test/demo-only plaintext ingress used to exercise the complete auction
-    /// state machine before the encrypted collection proof is wired in.
-    pub fn submit_test_plaintext_curves(
-        ctx: Context<SubmitTestPlaintextCurves>,
-        demand: Vec<u64>,
-        supply: Vec<u64>,
-    ) -> Result<()> {
-        let auction = &mut ctx.accounts.auction;
-        require!(
-            matches!(
-                auction.state,
-                AuctionState::Sealed | AuctionState::Decrypting
-            ),
-            BeatExError::AuctionState
-        );
-        require!(
-            Clock::get()?.slot < auction.decryption_deadline_slot,
-            BeatExError::DeadlineReached
-        );
-        let grid = auction::PriceGrid {
-            reference_price: auction.reference_price,
-            tick_size: auction.tick_size,
-            level_count: auction.grid_size as u16,
-        };
-        auction::validate_aggregate_curves(&grid, &demand, &supply)
-            .map_err(|_| error!(BeatExError::InvalidCurves))?;
-        require!(
-            demand
-                .iter()
-                .chain(&supply)
-                .all(|quantity| *quantity <= ctx.accounts.market.max_aggregate_quantity),
-            BeatExError::QuantityBound
-        );
-
-        let grid_size = auction.active_grid_size();
-        auction.decrypted_demand[..grid_size].copy_from_slice(&demand);
-        auction.decrypted_supply[..grid_size].copy_from_slice(&supply);
-        auction.decrypted_entry_bitmap = (1_u128 << (grid_size * 2)) - 1;
-        auction.state = AuctionState::Decrypted;
-        Ok(())
-    }
-
-    pub fn clear_auction(ctx: Context<ClearAuction>) -> Result<()> {
-        let auction = &mut ctx.accounts.auction;
-        require!(
-            auction.state == AuctionState::Decrypted,
-            BeatExError::AuctionState
-        );
-        require!(
-            auction.all_entries_decrypted(),
-            BeatExError::IncompleteDecryption
-        );
-        require!(
-            Clock::get()?.slot < auction.decryption_deadline_slot,
-            BeatExError::DeadlineReached
-        );
         let grid_size = auction.active_grid_size();
         let grid = auction::PriceGrid {
             reference_price: auction.reference_price,
@@ -818,7 +764,7 @@ pub mod beatex {
         auction.clearing_index = result.index as u8;
         auction.clearing_price = result.price;
         auction.clearing_volume = result.executable_volume;
-        auction.state = AuctionState::ClaimsOpen;
+        auction.state = AuctionState::Settled;
 
         let sequence = auction
             .auction_id
@@ -827,7 +773,29 @@ pub mod beatex {
         if sequence > ctx.accounts.market.last_cleared_auction_sequence {
             ctx.accounts.market.last_cleared_auction_sequence = sequence;
             ctx.accounts.market.last_clearing_price = result.price;
+            ctx.accounts.market.last_clearing_volume = result.executable_volume;
         }
+        Ok(())
+    }
+
+    /// Cancel a pending auction once either aggregation is irrecoverably
+    /// incomplete or the final publication deadline has elapsed.
+    pub fn cancel_pending_auction(ctx: Context<CancelPendingAuction>) -> Result<()> {
+        let auction = &mut ctx.accounts.auction;
+        require!(
+            auction.state == AuctionState::Pending,
+            BeatExError::AuctionState
+        );
+        let slot = Clock::get()?.slot;
+        let counts_differ = ctx.accounts.submission_counter.accepted_order_count
+            != ctx.accounts.accumulator.folded_order_count;
+        let aggregation_stalled = slot >= auction.aggregation_deadline_slot && counts_differ;
+        let publication_expired = slot >= auction.decryption_deadline_slot;
+        require!(
+            aggregation_stalled || publication_expired,
+            BeatExError::DeadlineNotReached
+        );
+        auction.state = AuctionState::Cancelled;
         Ok(())
     }
 
@@ -837,7 +805,7 @@ pub mod beatex {
     ) -> Result<()> {
         let auction = &ctx.accounts.auction;
         require!(
-            auction.state == AuctionState::Open,
+            auction.state == AuctionState::Pending,
             BeatExError::AuctionState
         );
         require!(
@@ -869,7 +837,7 @@ pub mod beatex {
         let auction = &ctx.accounts.auction;
         let order = &mut ctx.accounts.order;
         require!(
-            auction.state == AuctionState::Open,
+            auction.state == AuctionState::Pending,
             BeatExError::AuctionState
         );
         require!(order.state == OrderState::Writing, BeatExError::OrderState);
@@ -913,7 +881,7 @@ pub mod beatex {
         let auction = &mut ctx.accounts.auction;
         let order = &mut ctx.accounts.order;
         require!(
-            auction.state == AuctionState::Open,
+            auction.state == AuctionState::Pending,
             BeatExError::AuctionState
         );
         require!(order.state == OrderState::Writing, BeatExError::OrderState);
@@ -954,11 +922,12 @@ pub mod beatex {
     ) -> Result<()> {
         let auction = &mut ctx.accounts.auction;
         require!(
-            matches!(
-                auction.state,
-                AuctionState::Sealed | AuctionState::Decrypting
-            ),
+            auction.state == AuctionState::Pending,
             BeatExError::AuctionState
+        );
+        require!(
+            Clock::get()?.slot >= auction.submission_end_slot,
+            BeatExError::DeadlineNotReached
         );
         require!(
             Clock::get()?.slot < auction.decryption_deadline_slot,
@@ -1007,14 +976,13 @@ pub mod beatex {
             auction.decrypted_supply[position] = args.claimed_amount;
         }
         auction.decrypted_entry_bitmap |= bit;
-        auction.state = AuctionState::Decrypting;
         Ok(())
     }
 
     pub fn finalize_decryption(ctx: Context<FinalizeDecryption>) -> Result<()> {
         let auction = &mut ctx.accounts.auction;
         require!(
-            auction.state == AuctionState::Decrypting,
+            auction.state == AuctionState::Pending,
             BeatExError::AuctionState
         );
         require!(
@@ -1025,7 +993,6 @@ pub mod beatex {
             auction.all_entries_decrypted(),
             BeatExError::IncompleteDecryption
         );
-        auction.state = AuctionState::Decrypted;
         Ok(())
     }
 
@@ -1102,12 +1069,8 @@ pub mod beatex {
             );
         } else {
             require!(
-                auction.state == AuctionState::ClaimsOpen,
+                auction.state == AuctionState::Settled,
                 BeatExError::WithdrawalNotAllowed
-            );
-            require!(
-                Clock::get()?.slot < auction.claim_deadline_slot,
-                BeatExError::DeadlineReached
             );
         }
 
@@ -1290,11 +1253,17 @@ pub struct InitializeMarketArgs {
     pub grid_radius: u8,
     pub max_order_quantity: u64,
     pub max_aggregate_quantity: u64,
-    pub initial_reference_price: u64,
+    pub market_start_slot: u64,
+    pub minimum_reference_volume: u64,
+    pub oracle_feed_id: [u8; 32],
+    pub oracle_max_age_seconds: u64,
+    pub oracle_max_confidence_bps: u16,
+    pub oracle_exponent_adjustment: i8,
+    pub min_reference_price: u64,
+    pub max_reference_price: u64,
     pub submission_duration_slots: u64,
     pub aggregation_duration_slots: u64,
     pub decryption_duration_slots: u64,
-    pub claim_duration_slots: u64,
     pub allocation_rule_version: u16,
     pub order_circuit_version: u16,
     pub claim_circuit_version: u16,
@@ -1324,16 +1293,30 @@ pub struct InitializeQueueVerificationKey<'info> {
 }
 
 #[derive(Accounts)]
-pub struct InitializeQueueState<'info> {
+#[instruction(auction_id: u64)]
+pub struct InitializeAuction<'info> {
     #[account(mut)]
-    pub authority: Signer<'info>,
-    #[account(has_one = authority)]
+    pub payer: Signer<'info>,
     pub market: Box<Account<'info, Market>>,
-    #[account(has_one = market)]
+    #[account(
+        constraint = key_epoch.key() == market.current_key_epoch @ BeatExError::NoActiveKeyEpoch,
+        constraint = !key_epoch.retired @ BeatExError::RetiredKeyEpoch,
+        has_one = market,
+    )]
+    pub key_epoch: Box<Account<'info, KeyEpoch>>,
+    #[account(address = market.oracle_price_account @ BeatExError::InvalidOraclePrice)]
+    pub oracle_price: Account<'info, PriceUpdateV2>,
+    #[account(
+        init,
+        payer = payer,
+        space = 8 + Auction::INIT_SPACE,
+        seeds = [b"auction", market.key().as_ref(), &auction_id.to_le_bytes()],
+        bump,
+    )]
     pub auction: Box<Account<'info, Auction>>,
     #[account(
         init,
-        payer = authority,
+        payer = payer,
         space = 8 + SubmissionCounter::INIT_SPACE,
         seeds = [b"submission-counter", auction.key().as_ref()],
         bump,
@@ -1341,7 +1324,7 @@ pub struct InitializeQueueState<'info> {
     pub submission_counter: Box<Account<'info, SubmissionCounter>>,
     #[account(
         init,
-        payer = authority,
+        payer = payer,
         space = 8 + AggregateAccumulator::INIT_SPACE,
         seeds = [b"aggregate-accumulator", auction.key().as_ref()],
         bump,
@@ -1475,7 +1458,7 @@ pub struct FoldQueuedOrders<'info> {
 }
 
 #[derive(Accounts)]
-pub struct FinalizeQueueAggregation<'info> {
+pub struct CancelPendingAuction<'info> {
     pub market: Box<Account<'info, Market>>,
     #[account(mut, has_one = market)]
     pub auction: Box<Account<'info, Auction>>,
@@ -1487,7 +1470,8 @@ pub struct FinalizeQueueAggregation<'info> {
 
 #[derive(Accounts)]
 #[instruction(args: PublishAggregateCurvesArgs)]
-pub struct PublishAggregateCurves<'info> {
+pub struct PublishAndClear<'info> {
+    #[account(mut)]
     pub market: Box<Account<'info, Market>>,
     #[account(mut, has_one = market, has_one = key_epoch)]
     pub auction: Box<Account<'info, Auction>>,
@@ -1534,6 +1518,8 @@ pub struct InitializeMarket<'info> {
     pub base_vault: UncheckedAccount<'info>,
     /// CHECK: Typed Token-2022 validation is added with Phase 4.
     pub quote_vault: UncheckedAccount<'info>,
+    /// Canonical fully-verified Pyth price-feed account selected for this market.
+    pub oracle_price: Account<'info, PriceUpdateV2>,
     /// CHECK: This PDA signs vault CPIs and stores no data.
     #[account(seeds = [b"vault-authority", market.key().as_ref()], bump)]
     pub vault_authority: UncheckedAccount<'info>,
@@ -1804,53 +1790,6 @@ pub struct AcknowledgeKeyEpoch<'info> {
 }
 
 #[derive(Accounts)]
-#[instruction(auction_id: u64)]
-pub struct OpenAuction<'info> {
-    #[account(mut)]
-    pub authority: Signer<'info>,
-    #[account(mut, has_one = authority)]
-    pub market: Box<Account<'info, Market>>,
-    #[account(
-        constraint = key_epoch.key() == market.current_key_epoch @ BeatExError::NoActiveKeyEpoch,
-        constraint = !key_epoch.retired @ BeatExError::RetiredKeyEpoch,
-    )]
-    pub key_epoch: Box<Account<'info, KeyEpoch>>,
-    #[account(
-        init,
-        payer = authority,
-        space = 8 + Auction::INIT_SPACE,
-        seeds = [b"auction", market.key().as_ref(), &auction_id.to_le_bytes()],
-        bump,
-    )]
-    pub auction: Box<Account<'info, Auction>>,
-    pub system_program: Program<'info, System>,
-}
-
-#[derive(Accounts)]
-pub struct MutateAuction<'info> {
-    pub market: Box<Account<'info, Market>>,
-    #[account(mut, has_one = market)]
-    pub auction: Box<Account<'info, Auction>>,
-}
-
-#[derive(Accounts)]
-pub struct SubmitTestPlaintextCurves<'info> {
-    pub authority: Signer<'info>,
-    #[account(has_one = authority)]
-    pub market: Box<Account<'info, Market>>,
-    #[account(mut, has_one = market)]
-    pub auction: Box<Account<'info, Auction>>,
-}
-
-#[derive(Accounts)]
-pub struct ClearAuction<'info> {
-    #[account(mut)]
-    pub market: Box<Account<'info, Market>>,
-    #[account(mut, has_one = market)]
-    pub auction: Box<Account<'info, Auction>>,
-}
-
-#[derive(Accounts)]
 pub struct VerifyThresholdDecryption<'info> {
     pub key_epoch: Box<Account<'info, KeyEpoch>>,
 }
@@ -2049,7 +1988,7 @@ fn execute_private_withdrawal(
     match kind {
         WithdrawalKind::Claim => {
             require!(
-                auction.state == AuctionState::ClaimsOpen,
+                auction.state == AuctionState::Settled,
                 BeatExError::WithdrawalNotAllowed
             );
             // A cleared auction cannot safely return full reserves, because
@@ -2317,23 +2256,72 @@ fn add_ciphertexts(left: &[u8; 64], right: &[u8; 64]) -> Result<[u8; 64]> {
     Ok(result)
 }
 
-fn queue_phase(state: AuctionState) -> Result<queue::QueuePhase> {
-    match state {
-        AuctionState::Open => Ok(queue::QueuePhase::Open),
-        AuctionState::Sealed => Ok(queue::QueuePhase::Sealed),
-        AuctionState::Decrypting | AuctionState::Decrypted | AuctionState::ClaimsOpen => {
-            Ok(queue::QueuePhase::Decrypting)
-        }
-        AuctionState::Cancelled => Ok(queue::QueuePhase::Cancelled),
-        AuctionState::Finalized => Ok(queue::QueuePhase::Settled),
-    }
-}
-
 fn queue_deadlines(auction: &Auction) -> queue::QueueDeadlines {
     queue::QueueDeadlines {
         collection_end_slot: auction.submission_end_slot,
         aggregation_deadline_slot: auction.aggregation_deadline_slot,
     }
+}
+
+fn current_auction_id(market: &Market, slot: u64) -> Result<u64> {
+    let elapsed = slot
+        .checked_sub(market.market_start_slot)
+        .ok_or_else(|| error!(BeatExError::MarketNotStarted))?;
+    elapsed
+        .checked_div(market.submission_duration_slots)
+        .ok_or_else(|| error!(BeatExError::InvalidMarketParameters))
+}
+
+fn normalize_oracle_price(
+    price: i64,
+    exponent: i32,
+    exponent_adjustment: i8,
+    tick_size: u64,
+) -> Result<u64> {
+    require!(price > 0 && tick_size > 0, BeatExError::InvalidOraclePrice);
+    let adjusted_exponent = exponent
+        .checked_add(i32::from(exponent_adjustment))
+        .ok_or_else(|| error!(BeatExError::InvalidOraclePrice))?;
+    let magnitude = adjusted_exponent.unsigned_abs();
+    require!(magnitude <= 38, BeatExError::InvalidOraclePrice);
+    let scale = 10_u128
+        .checked_pow(magnitude)
+        .ok_or_else(|| error!(BeatExError::ArithmeticOverflow))?;
+    let raw = u128::from(price as u64);
+    let whole = if adjusted_exponent >= 0 {
+        raw.checked_mul(scale)
+            .ok_or_else(|| error!(BeatExError::ArithmeticOverflow))?
+    } else {
+        raw.checked_add(scale / 2)
+            .ok_or_else(|| error!(BeatExError::ArithmeticOverflow))?
+            / scale
+    };
+    let tick = u128::from(tick_size);
+    let rounded = whole
+        .checked_add(tick / 2)
+        .ok_or_else(|| error!(BeatExError::ArithmeticOverflow))?
+        .checked_div(tick)
+        .and_then(|ticks| ticks.checked_mul(tick))
+        .ok_or_else(|| error!(BeatExError::ArithmeticOverflow))?;
+    u64::try_from(rounded).map_err(|_| error!(BeatExError::InvalidOraclePrice))
+}
+
+fn validate_reference_price(market: &Market, reference_price: u64) -> Result<()> {
+    require!(
+        (market.min_reference_price..=market.max_reference_price).contains(&reference_price),
+        BeatExError::InvalidOraclePrice
+    );
+    let span = market
+        .tick_size
+        .checked_mul(u64::from(market.grid_radius))
+        .ok_or_else(|| error!(BeatExError::ArithmeticOverflow))?;
+    reference_price
+        .checked_sub(span)
+        .ok_or_else(|| error!(BeatExError::InvalidOraclePrice))?;
+    reference_price
+        .checked_add(span)
+        .ok_or_else(|| error!(BeatExError::ArithmeticOverflow))?;
+    Ok(())
 }
 
 #[error_code]
@@ -2368,11 +2356,15 @@ pub enum BeatExError {
     MarketPaused,
     #[msg("the market has no active key epoch")]
     NoActiveKeyEpoch,
+    #[msg("the market's deterministic auction schedule has not started")]
+    MarketNotStarted,
+    #[msg("the configured Pyth account, feed, freshness, confidence or price is invalid")]
+    InvalidOraclePrice,
     #[msg("the key epoch is retired")]
     RetiredKeyEpoch,
     #[msg("the key epoch configuration or proof version is invalid")]
     InvalidKeyEpoch,
-    #[msg("the auction id is not the market's next id")]
+    #[msg("the auction id is not the one derived from the current slot")]
     AuctionId,
     #[msg("the auction is not in the required state")]
     AuctionState,
@@ -2446,4 +2438,31 @@ pub enum BeatExError {
     InsufficientDepositFunds,
     #[msg("the vault did not receive the exact public amount proved by the deposit circuit")]
     NonExactDeposit,
+}
+
+#[cfg(test)]
+mod temporal_lifecycle_tests {
+    use super::normalize_oracle_price;
+
+    #[test]
+    fn oracle_price_scales_and_rounds_to_the_nearest_tick() {
+        assert_eq!(
+            normalize_oracle_price(12_345_678_901_234, -8, 0, 10).unwrap(),
+            123_460
+        );
+        assert_eq!(normalize_oracle_price(123, 2, 0, 100).unwrap(), 12_300);
+        // $100,000 BTC/USD, converted from 8-decimal BTC and 6-decimal USD
+        // smallest units: 10^13 * 10^(-8 - 2) = 1,000 quote units/base unit.
+        assert_eq!(
+            normalize_oracle_price(10_000_000_000_000, -8, -2, 1).unwrap(),
+            1_000
+        );
+    }
+
+    #[test]
+    fn oracle_price_rejects_non_positive_and_unrepresentable_values() {
+        assert!(normalize_oracle_price(0, -8, 0, 10).is_err());
+        assert!(normalize_oracle_price(-1, -8, 0, 10).is_err());
+        assert!(normalize_oracle_price(i64::MAX, 38, 0, 1).is_err());
+    }
 }

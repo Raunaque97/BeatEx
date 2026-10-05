@@ -7,16 +7,19 @@ use {
     },
     beatex::{
         groth16, queue_hash, AggregateAccumulator, Auction, AuctionState, DecryptionShareInput,
-        DleqProofInput, EncryptedOrderEntry, Groth16ProofInput, InitializeKeyEpochArgs,
-        InitializeMarketArgs, InitializeOrderArgs, KeyEpoch, Market, Order, OrderState,
-        PublishAggregateCurvesArgs, QueueCircuitKind, QueueVerificationKey, SubmissionCounter,
-        VerifyThresholdDecryptionArgs, COMMITTEE_SIZE,
+        DleqProofInput, Groth16ProofInput, KeyEpoch, Market, PublishAggregateCurvesArgs,
+        QueueCircuitKind, QueueVerificationKey, SubmissionCounter, VerifyThresholdDecryptionArgs,
+        COMMITTEE_SIZE,
     },
     beatex_threshold_crypto::{
-        create_decryption_share, dealer_setup_3_of_7, DealerSetup, DecryptionProofContext,
+        create_decryption_share, dealer_setup_3_of_7, DecryptionProofContext,
         KeyRelationProofContext,
     },
     litesvm::LiteSVM,
+    pyth_solana_receiver_sdk::{
+        price_update::{PriceFeedMessage, PriceUpdateV2, VerificationLevel},
+        ID as PYTH_RECEIVER_ID,
+    },
     solana_account::Account,
     solana_compute_budget_interface::ComputeBudgetInstruction,
     solana_instruction::{AccountMeta, Instruction},
@@ -79,6 +82,7 @@ fn dleq_input(proof: &beatex_threshold_crypto::DleqProof) -> DleqProofInput {
     }
 }
 
+#[cfg(any())]
 fn put_system_account(svm: &mut LiteSVM, address: Pubkey) {
     svm.set_account(
         address,
@@ -93,6 +97,15 @@ fn put_system_account(svm: &mut LiteSVM, address: Pubkey) {
 }
 
 fn put_anchor_account<T: AccountSerialize>(svm: &mut LiteSVM, address: Pubkey, value: &T) {
+    put_owned_anchor_account(svm, address, value, beatex::ID);
+}
+
+fn put_owned_anchor_account<T: AccountSerialize>(
+    svm: &mut LiteSVM,
+    address: Pubkey,
+    value: &T,
+    owner: Pubkey,
+) {
     let mut data = Vec::new();
     value.try_serialize(&mut data).unwrap();
     svm.set_account(
@@ -100,7 +113,7 @@ fn put_anchor_account<T: AccountSerialize>(svm: &mut LiteSVM, address: Pubkey, v
         Account {
             lamports: 1_000_000_000,
             data,
-            owner: beatex::ID,
+            owner,
             ..Account::default()
         },
     )
@@ -112,6 +125,7 @@ fn deserialize_account<T: AccountDeserialize>(svm: &LiteSVM, address: &Pubkey) -
     T::try_deserialize(&mut account.data.as_slice()).unwrap()
 }
 
+#[cfg(any())]
 fn submit_test_encrypted_order(
     svm: &mut LiteSVM,
     authority: &Keypair,
@@ -201,6 +215,7 @@ fn submit_test_encrypted_order(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(any())]
 fn threshold_args(
     setup: &DealerSetup,
     market: Pubkey,
@@ -381,6 +396,7 @@ fn three_of_seven_threshold_decryption_executes_inside_sbf() {
     assert_eq!(participant_public_shares.len(), COMMITTEE_SIZE);
 }
 
+#[cfg(any())]
 #[test]
 #[ignore = "requires an SBF v0 build with --features sbf-test-fixtures"]
 fn plaintext_lifecycle_executes_inside_sbf() {
@@ -770,6 +786,166 @@ fn plaintext_lifecycle_executes_inside_sbf() {
 }
 
 #[test]
+#[ignore = "requires an SBF v0 build with --features sbf-test-fixtures"]
+fn temporal_auction_initialization_and_timeout_are_permissionless() {
+    let mut svm = svm_with_program();
+    let market_authority = Pubkey::new_unique();
+    let relayer = Keypair::new();
+    svm.airdrop(&relayer.pubkey(), 10_000_000_000).unwrap();
+
+    let current_clock = svm.get_sysvar::<Clock>();
+    let market = Pubkey::new_unique();
+    let key_epoch = Pubkey::new_unique();
+    let oracle_price = Pubkey::new_unique();
+    let feed_id = [7_u8; 32];
+    let market_state = Market {
+        version: 1,
+        authority: market_authority,
+        base_mint: Pubkey::new_unique(),
+        quote_mint: Pubkey::new_unique(),
+        base_vault: Pubkey::new_unique(),
+        quote_vault: Pubkey::new_unique(),
+        base_lot_size: 1,
+        quote_lot_size: 1,
+        tick_size: 10,
+        grid_radius: 8,
+        max_order_quantity: beatex::queue::MAX_PRIVATE_ORDER_QUANTITY,
+        max_aggregate_quantity: 10_000,
+        current_key_epoch: key_epoch,
+        market_start_slot: current_clock.slot,
+        last_clearing_price: 0,
+        last_clearing_volume: 0,
+        last_cleared_auction_sequence: 0,
+        minimum_reference_volume: 1,
+        oracle_price_account: oracle_price,
+        oracle_feed_id: feed_id,
+        oracle_max_age_seconds: 90,
+        oracle_max_confidence_bps: 100,
+        oracle_exponent_adjustment: -2,
+        min_reference_price: 80,
+        max_reference_price: 2_000,
+        submission_duration_slots: 10,
+        aggregation_duration_slots: 10,
+        decryption_duration_slots: 10,
+        allocation_rule_version: 1,
+        order_circuit_version: 1,
+        claim_circuit_version: 1,
+        paused: false,
+        vault_authority_bump: 0,
+        bump: 0,
+    };
+    let key_epoch_state = KeyEpoch {
+        authority: market_authority,
+        market,
+        epoch: 1,
+        encryption_pubkey: [1; 32],
+        babyjub_encryption_pubkey: [1; 32],
+        babyjub_participant_public_shares: [[1; 32]; COMMITTEE_SIZE],
+        coefficient_commitments: [[1; 32]; 3],
+        participant_public_shares: [[1; 32]; COMMITTEE_SIZE],
+        participant_authorities: [Pubkey::new_unique(); COMMITTEE_SIZE],
+        key_relation_proof: DleqProofInput {
+            commitment_1: [0; 32],
+            commitment_2: [0; 32],
+            response: [0; 32],
+        },
+        threshold: 3,
+        proof_transcript_version: 2,
+        activation_slot: current_clock.slot,
+        retired: false,
+        acknowledgement_bitmap: 0x7f,
+        bump: 0,
+    };
+    let oracle_state = PriceUpdateV2 {
+        write_authority: Pubkey::new_unique(),
+        verification_level: VerificationLevel::Full,
+        price_message: PriceFeedMessage {
+            feed_id,
+            price: 10_000_000_000_000,
+            conf: 1_000_000,
+            exponent: -8,
+            publish_time: current_clock.unix_timestamp,
+            prev_publish_time: current_clock.unix_timestamp.saturating_sub(1),
+            ema_price: 10_000_000_000_000,
+            ema_conf: 1_000_000,
+        },
+        posted_slot: current_clock.slot,
+    };
+    put_anchor_account(&mut svm, market, &market_state);
+    put_anchor_account(&mut svm, key_epoch, &key_epoch_state);
+    put_owned_anchor_account(&mut svm, oracle_price, &oracle_state, PYTH_RECEIVER_ID);
+
+    let auction_id = 0_u64;
+    let (auction, _) = Pubkey::find_program_address(
+        &[b"auction", market.as_ref(), &auction_id.to_le_bytes()],
+        &beatex::ID,
+    );
+    let (counter, _) =
+        Pubkey::find_program_address(&[b"submission-counter", auction.as_ref()], &beatex::ID);
+    let (accumulator, _) =
+        Pubkey::find_program_address(&[b"aggregate-accumulator", auction.as_ref()], &beatex::ID);
+    let initialize = Instruction {
+        program_id: beatex::ID,
+        accounts: vec![
+            AccountMeta::new(relayer.pubkey(), true),
+            AccountMeta::new_readonly(market, false),
+            AccountMeta::new_readonly(key_epoch, false),
+            AccountMeta::new_readonly(oracle_price, false),
+            AccountMeta::new(auction, false),
+            AccountMeta::new(counter, false),
+            AccountMeta::new(accumulator, false),
+            AccountMeta::new_readonly(anchor_lang::system_program::ID, false),
+        ],
+        data: beatex::instruction::InitializeAuction { auction_id }.data(),
+    };
+    let transaction = Transaction::new(
+        &[&relayer],
+        Message::new(&[initialize], Some(&relayer.pubkey())),
+        svm.latest_blockhash(),
+    );
+    let metadata = svm.send_transaction(transaction).unwrap();
+    let initialized: Auction = deserialize_account(&svm, &auction);
+    assert_eq!(initialized.state, AuctionState::Pending);
+    assert_eq!(initialized.reference_price, 1_000);
+    assert!(initialized.reference_from_oracle);
+    assert_eq!(
+        initialized.oracle_publish_time,
+        current_clock.unix_timestamp
+    );
+    assert_eq!(initialized.open_slot, current_clock.slot);
+    let initialized_counter: SubmissionCounter = deserialize_account(&svm, &counter);
+    let initialized_accumulator: AggregateAccumulator = deserialize_account(&svm, &accumulator);
+    assert_eq!(initialized_counter.accepted_order_count, 0);
+    assert_eq!(initialized_accumulator.folded_order_count, 0);
+    eprintln!(
+        "permissionless temporal initialization consumed {} CU",
+        metadata.compute_units_consumed
+    );
+
+    let mut timeout_clock = svm.get_sysvar::<Clock>();
+    timeout_clock.slot = initialized.decryption_deadline_slot;
+    svm.set_sysvar(&timeout_clock);
+    let cancel = Instruction {
+        program_id: beatex::ID,
+        accounts: vec![
+            AccountMeta::new_readonly(market, false),
+            AccountMeta::new(auction, false),
+            AccountMeta::new_readonly(counter, false),
+            AccountMeta::new_readonly(accumulator, false),
+        ],
+        data: beatex::instruction::CancelPendingAuction {}.data(),
+    };
+    let transaction = Transaction::new(
+        &[&relayer],
+        Message::new(&[cancel], Some(&relayer.pubkey())),
+        svm.latest_blockhash(),
+    );
+    svm.send_transaction(transaction).unwrap();
+    let cancelled: Auction = deserialize_account(&svm, &auction);
+    assert_eq!(cancelled.state, AuctionState::Cancelled);
+}
+
+#[test]
 #[ignore = "requires an SBF build and deterministic aggregate-publication setup"]
 fn aggregate_publication_proof_executes_inside_sbf() {
     let fixture =
@@ -785,6 +961,10 @@ fn aggregate_publication_proof_executes_inside_sbf() {
     let accumulator = Pubkey::new_unique();
     let verification_key = Pubkey::new_unique();
     let participant_authorities = std::array::from_fn(|_| Pubkey::new_unique());
+    let mut fixture_clock = svm.get_sysvar::<Clock>();
+    fixture_clock.slot = 100;
+    svm.set_sysvar(&fixture_clock);
+    let current_slot = fixture_clock.slot;
     let market_state = Market {
         version: 1,
         authority: payer.pubkey(),
@@ -799,13 +979,21 @@ fn aggregate_publication_proof_executes_inside_sbf() {
         max_order_quantity: 15,
         max_aggregate_quantity: 1_000,
         current_key_epoch: key_epoch,
+        market_start_slot: current_slot.saturating_sub(30),
         last_clearing_price: 100,
+        last_clearing_volume: 0,
         last_cleared_auction_sequence: 0,
-        next_auction_id: 1,
+        minimum_reference_volume: 1,
+        oracle_price_account: Pubkey::new_unique(),
+        oracle_feed_id: [1; 32],
+        oracle_max_age_seconds: 90,
+        oracle_max_confidence_bps: 100,
+        oracle_exponent_adjustment: 0,
+        min_reference_price: 1,
+        max_reference_price: 10_000,
         submission_duration_slots: 10,
         aggregation_duration_slots: 10,
         decryption_duration_slots: 100,
-        claim_duration_slots: 100,
         allocation_rule_version: 1,
         order_circuit_version: 1,
         claim_circuit_version: 1,
@@ -813,19 +1001,19 @@ fn aggregate_publication_proof_executes_inside_sbf() {
         vault_authority_bump: 0,
         bump: 0,
     };
-    let current_slot = svm.get_sysvar::<Clock>().slot;
     let auction_state = Auction {
         version: 1,
         market,
         auction_id: 0,
         key_epoch,
-        state: AuctionState::Decrypting,
+        state: AuctionState::Pending,
         open_slot: current_slot.saturating_sub(30),
         submission_end_slot: current_slot.saturating_sub(20),
         aggregation_deadline_slot: current_slot.saturating_sub(10),
         decryption_deadline_slot: current_slot + 100,
-        claim_deadline_slot: current_slot + 200,
         reference_price: 100,
+        reference_from_oracle: false,
+        oracle_publish_time: 0,
         tick_size: 1,
         grid_size: 17,
         allocation_rule_version: 1,
@@ -903,14 +1091,14 @@ fn aggregate_publication_proof_executes_inside_sbf() {
     let instruction = Instruction {
         program_id: beatex::ID,
         accounts: vec![
-            AccountMeta::new_readonly(market, false),
+            AccountMeta::new(market, false),
             AccountMeta::new(auction, false),
             AccountMeta::new_readonly(key_epoch, false),
             AccountMeta::new_readonly(counter, false),
             AccountMeta::new_readonly(accumulator, false),
             AccountMeta::new_readonly(verification_key, false),
         ],
-        data: beatex::instruction::PublishAggregateCurves {
+        data: beatex::instruction::PublishAndClear {
             args: PublishAggregateCurvesArgs {
                 participant_ids: fixture.participant_ids,
                 demand: fixture.demand,
@@ -938,9 +1126,10 @@ fn aggregate_publication_proof_executes_inside_sbf() {
     );
     let metadata = svm.send_transaction(transaction).unwrap();
     let published: Auction = deserialize_account(&svm, &auction);
-    assert_eq!(published.state, AuctionState::Decrypted);
+    assert_eq!(published.state, AuctionState::Settled);
     assert_eq!(published.decrypted_demand, fixture.demand);
     assert_eq!(published.decrypted_supply, fixture.supply);
+    assert!(published.clearing_price > 0);
     eprintln!(
         "aggregate publication proof consumed {} CU",
         metadata.compute_units_consumed

@@ -10,13 +10,9 @@ pub const MAX_ORDER_CHUNKS: usize = 8;
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, Eq, InitSpace, PartialEq)]
 pub enum AuctionState {
-    Open,
-    Sealed,
-    Decrypting,
-    Decrypted,
-    ClaimsOpen,
+    Pending,
+    Settled,
     Cancelled,
-    Finalized,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, Eq, InitSpace, PartialEq)]
@@ -43,14 +39,28 @@ pub struct Market {
     pub max_order_quantity: u64,
     pub max_aggregate_quantity: u64,
     pub current_key_epoch: Pubkey,
+    /// Slot at which deterministic auction zero begins collecting orders.
+    pub market_start_slot: u64,
     pub last_clearing_price: u64,
+    pub last_clearing_volume: u64,
     /// Highest cleared auction id plus one; zero means no auction has cleared.
     pub last_cleared_auction_sequence: u64,
-    pub next_auction_id: u64,
+    /// Minimum previous-auction volume required to reuse its clearing price.
+    pub minimum_reference_volume: u64,
+    /// Canonical Pyth price update account and feed configured at market creation.
+    pub oracle_price_account: Pubkey,
+    pub oracle_feed_id: [u8; 32],
+    pub oracle_max_age_seconds: u64,
+    pub oracle_max_confidence_bps: u16,
+    /// Added to the Pyth exponent to convert the feed into quote lots per base lot.
+    pub oracle_exponent_adjustment: i8,
+    /// Reference-price bounds protect grid arithmetic and circuit amount bounds.
+    pub min_reference_price: u64,
+    pub max_reference_price: u64,
+    /// The collection duration is also the interval between consecutive auctions.
     pub submission_duration_slots: u64,
     pub aggregation_duration_slots: u64,
     pub decryption_duration_slots: u64,
-    pub claim_duration_slots: u64,
     pub allocation_rule_version: u16,
     pub order_circuit_version: u16,
     pub claim_circuit_version: u16,
@@ -71,8 +81,11 @@ pub struct Auction {
     pub submission_end_slot: u64,
     pub aggregation_deadline_slot: u64,
     pub decryption_deadline_slot: u64,
-    pub claim_deadline_slot: u64,
     pub reference_price: u64,
+    /// True when `reference_price` came from the configured Pyth feed.
+    pub reference_from_oracle: bool,
+    /// Pyth publish time used for an oracle reference; zero for prior clearing.
+    pub oracle_publish_time: i64,
     pub tick_size: u64,
     pub grid_size: u8,
     /// Immutable protocol versions captured when the auction opens.

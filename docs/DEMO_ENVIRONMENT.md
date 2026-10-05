@@ -90,6 +90,21 @@ The October 2026 Devnet checkpoint deployed BeatEx and created:
 | tUSD mint | `7Fg3pJw2stGKi7WTQRYNsWYqYrFcuwziD8C5HpH9s9Ng` |
 | tUSD owner account | `8fRxn1rXBtJoBSVNT5CiVXQZzBdib5CAbBJ1da2gH6Up` |
 
+The demo reference oracle is Pyth's sponsored BTC/USD shard-zero price-feed
+account, which is available on Solana Devnet:
+
+| Item | Value |
+| --- | --- |
+| Price-feed account | `4cSM2e6rvbGQUFiJbqytoVMi5GgghSMr8LwVrT9VPSPo` |
+| Feed ID | `e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43` |
+| Receiver owner | `rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ` |
+
+The account's presence and receiver ownership were checked directly against
+Devnet. BeatEx does not need to deploy its own oracle for the named test assets;
+the program interprets tBTC/tUSD as the demo BTC/USD market. Its market config
+uses `oracle_exponent_adjustment = -2` to convert 8-decimal tBTC and 6-decimal
+tUSD smallest units before rounding to the configured tick.
+
 Before the public demo, replace the default metadata URI with a hosted JSON
 base URI:
 

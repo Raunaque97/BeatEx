@@ -25,7 +25,7 @@ The milestone must demonstrate an end-to-end auction on Solana:
 1. A market opens an auction with an odd-sized public price grid.
 2. Traders confidentially submit two-sided curves and lock confidential Token-2022 collateral.
 3. The program homomorphically aggregates encrypted demand and supply.
-4. After the auction seals, a 3-of-7 committee produces a proof-backed threshold decryption of the aggregate curves.
+4. After collection ends, a 3-of-7 committee produces a proof-backed threshold decryption of the aggregate curves.
 5. Anyone can verify the published plaintext aggregate curves and relay the proof onchain.
 6. The program deterministically selects and stores the uniform clearing price.
 7. A trader proves a claim without publishing the trader's original curve.
@@ -86,7 +86,11 @@ Individual orders remain confidential after clearing. Publishing aggregate curve
 
 ### 2.3 Committee trust
 
-Fewer than three committee members cannot decrypt a ciphertext under the auction key. Any three members can collude and decrypt aggregate or individual order ciphertexts, including before an auction seals. The program rejects aggregate-publication proofs outside the `Decrypting` window, but it cannot prevent offchain collusion by a threshold.
+Fewer than three committee members cannot decrypt a ciphertext under the auction
+key. Any three members can collude and decrypt aggregate or individual order
+ciphertexts, including before collection ends. The program rejects aggregate
+publication before collection or after the publication deadline, but it cannot
+prevent offchain collusion by a threshold.
 
 Committee encryption keys are not token-account signing authorities. Escrow token accounts are owned by a program-derived authority. Knowing an ElGamal decryption key may reveal confidential amounts and allow proof generation, but it does not independently authorize token movement.
 
@@ -353,7 +357,8 @@ CU in SBF.
 
 ### 6.4 Share and publication policy
 
-- The frozen aggregate is available only in `Decrypting`, before the decryption deadline.
+- The frozen aggregate is available after collection once every accepted event
+  has been folded, and publication must occur before the decryption deadline.
 - A committee coordinator obtains three share vectors offchain and generates the aggregate-publication proof.
 - The participant IDs are public, sorted, distinct, and restricted to `1..=7`; the program binds their registered public shares into the proof statement.
 - Decryption shares and DLEQ commitments/responses are private witnesses. No share PDA or share-submission transaction exists.
@@ -400,11 +405,12 @@ price(i) = reference_price + (i - k) * tick_size
 
 All grid parameters are fixed before the auction opens and included in proof domains.
 
-For the first auction, `reference_price` is a market-configuration value.
+For the first auction, `reference_price` is normalized from the configured Pyth
+feed because the previous clearing volume is zero.
 
 ### 7.3 Out-of-grid markets
 
-An auction cannot clear outside its grid. If executable liquidity is concentrated at an edge, the result is still deterministic, but the next auction should recenter on the edge clearing price. Production safeguards such as oracle-relative circuit breakers are outside the prototype.
+An auction cannot clear outside its grid. If executable liquidity is concentrated at an edge, the result is still deterministic. The first-version reference policy uses the previous clearing price when the previous clearing volume meets the configured minimum and otherwise uses a fresh Pyth BTC/USD price; the first auction therefore uses Pyth because its previous volume is zero. Oracle-relative circuit breakers remain a later hardening item.
 
 ---
 
@@ -483,6 +489,16 @@ Solana v1 permits a 4,096-byte transaction. The measured 17-level order, two upd
 
 `submit_queued_order` verifies the order/balance proof, creates an immutable `QueuedOrder` PDA in `Accepted` state, applies the encrypted balance transition, and increments `accepted_order_count` atomically. It does not read the aggregate accumulator. The proof statement is consequently unaffected by folds or other traders' submissions; only Solana's normal writable lock on the small counter can delay execution.
 
+The current implementation treats every submission as an independent immutable
+order and has no cancel/replace instruction. The planned revision replaces this
+with one private active-order account per trader and immutable queue events.
+Replacing an order proves and enqueues the encrypted delta `new - old`; cancelling
+proves and enqueues `-old`. It also releases the old private reserve and locks the
+new reserve in the same proof-backed balance transition. Once every accepted
+event is folded, the aggregate contains exactly the final active orders even if
+some deltas were folded before the corresponding positive event. Only the final
+active revision is eligible for claim or cancellation refund.
+
 The older `initialize_order` / `write_order_chunk` / authority-gated `finalize_test_order` instructions remain only as a legacy demo harness and are not the selected untrusted order path.
 
 ---
@@ -500,30 +516,67 @@ Curve arithmetic is not performed by the Solana program. A permissionless bot re
 
 `fold_queued_orders` verifies that the supplied order accounts are distinct, sorted, belong to the auction, and are still `Accepted`. It verifies the proof against a versioned verification-key PDA, writes the new aggregate, irreversibly changes every selected order to `Folded`, increments `folded_order_count` by the exact batch size, and increments the aggregate revision. Failure is atomic.
 
-Folds may execute during `Open` and `Sealed`, up to the aggregation deadline. They write the aggregate PDA but do not write the submission counter. Order submission writes the submission counter but does not write the aggregate, so proof generation never races aggregate changes. After collection, `finalize_queue_aggregation` permits decryption only when `folded_order_count == accepted_order_count`. The aggregate becomes immutable on the transition to `Decrypting`.
+Folds may execute while the auction is `Pending`, up to the aggregation
+deadline. They write the aggregate PDA but do not write the submission counter.
+Order submission writes the submission counter but does not write the
+aggregate, so proof generation never races aggregate changes. After collection,
+publication is permitted only when `folded_order_count == accepted_order_count`;
+at that point no order can enter and no accepted event remains to fold, so the
+aggregate is immutable without another stored phase.
 
 ---
 
 ## 10. Auction lifecycle
 
+The selected lifecycle is temporal rather than a sequence of manually cranked
+phase labels. The market authority configures the base mint, quote mint, oracle,
+lot/tick grid, schedule, proof versions, committee epoch policy, and safety
+bounds once when starting the market. It does not open or seal each auction.
+
+For market start slot `S`, collection interval `I`, and current slot `s`, the
+active auction is derived as:
+
+```text
+auction_id = floor((s - S) / I)
+auction_start = S + auction_id * I
+submission_end = auction_start + I
+```
+
+The auction PDA, counter, and accumulator still require account allocation, so
+a transaction must materialize them. `initialize_auction` is permissionless,
+accepts only the slot-derived ID, computes every deadline from market
+configuration, and snapshots the active key epoch and reference price. A bot
+normally sends it at the interval boundary; a trader may do so if the bot has
+not. This transaction creates storage—it does not grant a party authority over
+the auction.
+
+The persisted status is only:
+
+```text
+Pending
+Settled
+Cancelled
+```
+
+Order admission, folding, settlement eligibility, and timeouts are derived
+from `Clock`, immutable deadlines, and accepted/folded counters. There is no
+stored `Open`, `Sealed`, `Decrypting`, or `Decrypted` phase. After collection
+ends and the counters match, the aggregate is already immutable: no new order
+event is admissible and no accepted event remains to fold.
+
 ```mermaid
 stateDiagram-v2
-    [*] --> Open
-    Open --> Sealed: end_slot reached
-    Open --> Open: proof-backed folds
-    Sealed --> Sealed: remaining proof-backed folds
-    Sealed --> Decrypting: accepted_count == folded_count
-    Decrypting --> Decrypted: threshold shares + plaintext checks
-    Decrypted --> Cleared: deterministic clearing
-    Cleared --> ClaimsOpen
-
-    Open --> Cancelled: incomplete aggregation timeout
-    Sealed --> Cancelled: incomplete aggregation timeout
-    Decrypting --> Cancelled: decryption deadline
-
-    ClaimsOpen --> Finalized: optional cleanup criteria
-    Cancelled --> Finalized: refunds consumed / cleanup
+    [*] --> Pending: permissionless account initialization
+    Pending --> Pending: slot-gated orders and folds
+    Pending --> Settled: publication proof + deterministic clearing
+    Pending --> Cancelled: aggregation or publication timeout
 ```
+
+`publish_and_clear` verifies the committee-produced aggregate-publication
+proof, stores the public curves, computes the deterministic clearing result,
+updates the market's last clearing price and volume, and changes `Pending` to
+`Settled` atomically. Anyone may relay it. A separate seal, aggregate-finalize,
+or clear instruction is unnecessary.
 
 ### 10.1 Slot-based timing
 
@@ -531,10 +584,12 @@ Program deadlines use Solana slots rather than wall-clock timestamps:
 
 - `open_slot`;
 - `submission_end_slot`;
+- `aggregation_deadline_slot`;
 - `decryption_deadline_slot`;
-- `claim_or_refund_expiry_slot`, if cleanup is supported.
+- claims have no global auction deadline and remain open until consumed.
 
-State transitions after deadlines are permissionless instructions. No privileged crank is required to seal, clear, or cancel an eligible auction.
+Settlement and cancellation are permissionless. No privileged per-auction
+opener, sealer, or clearing crank exists in the selected lifecycle.
 
 ### 10.2 Pipelining
 
@@ -637,7 +692,7 @@ Refunded
 
 The program changes `Pending` to `Claimed` or `Refunded` in the same transaction that authorizes the relevant token movement. This prevents replay and double withdrawal.
 
-Once an auction reaches `ClaimsOpen`, claims remain available until consumed.
+Once an auction reaches `Settled`, claims remain available until consumed.
 The program does not later convert a cleared auction into full-reserve refunds,
 because counterparties may already have claimed and such a transition could
 make the shared vault insolvent.
@@ -703,7 +758,16 @@ max_order_quantity
 max_aggregate_quantity
 current_key_epoch
 last_clearing_price
-next_auction_id
+last_clearing_volume
+minimum_reference_volume
+pyth_feed_id
+oracle_price_account
+oracle_max_age_seconds
+oracle_max_confidence_bps
+oracle_exponent_adjustment
+min_reference_price
+max_reference_price
+market_start_slot
 timing configuration
 allocation_rule_version
 order_circuit_version
@@ -852,24 +916,17 @@ Suggested seeds:
 
 ### 15.2 Auction lifecycle
 
-`open_auction`
+`initialize_auction`
 
-- fixes submission, aggregation, decryption and claim slots, grid, reference price, key epoch, and proof versions.
+- is permissionless and accepts only the current slot-derived auction ID;
+- atomically creates the auction, accepted-event counter, and encrypted aggregate accumulator, initializing all 34 aggregate ciphertexts to the canonical Baby Jubjub identity;
+- fixes the derived submission, aggregation and publication deadlines, grid, key epoch, and proof versions;
+- uses the immediately preceding auction's clearing price when it is settled and its volume meets `minimum_reference_volume`; otherwise it validates and normalizes a fresh Pyth price, including for auction zero.
 
-`initialize_queue_state`
+`cancel_pending_auction`
 
-- creates the accepted-order counter and encrypted aggregate accumulator;
-- initializes all 34 aggregate ciphertexts to the canonical Baby Jubjub identity.
-
-`seal_auction`
-
-- permissionless after `submission_end_slot`;
-- prevents new or finalized order submissions.
-
-`cancel_expired_auction`
-
-- permissionless after the relevant deadline;
-- transitions an unsettled auction to `Cancelled`.
+- is permissionless after the applicable aggregation or publication deadline;
+- transitions an unsettled `Pending` auction to `Cancelled`.
 
 ### 15.3 Order collection and aggregation
 
@@ -897,35 +954,19 @@ Suggested seeds:
 - accepts one to four distinct, sorted `Accepted` order accounts;
 - verifies one Groth16 proof of their offchain Baby Jubjub addition into the supplied new aggregate;
 - atomically writes the aggregate, marks every selected order `Folded`, and advances the folded counter;
-- is permissionless and valid during collection as well as after sealing.
-
-`finalize_queue_aggregation`
-
-- requires collection to be over and exact accepted/folded counter equality;
-- freezes the aggregate and enters `Decrypting`.
-
-`cancel_stalled_aggregation`
-
-- is permissionless after the aggregation deadline when the counters differ;
-- cancels the auction so collateral can follow the refund path.
+- is permissionless and valid until the aggregation deadline.
 
 ### 15.4 Decryption and clearing
 
-`publish_aggregate_curves`
+`publish_and_clear`
 
-- is callable only after `finalize_queue_aggregation` has frozen the complete accumulator;
+- is callable after collection ends, before the publication deadline, and only when accepted and folded counters match;
 - accepts the 17-level plaintext demand/supply vectors, three sorted participant IDs, and one aggregate-publication Groth16 proof;
 - binds the selected registered public shares and proves three private Baby Jubjub share relations plus the batched threshold-decryption equation;
 - is permissionless to relay even though producing the witness requires the committee;
-- writes the public aggregate curves and changes auction state to `Decrypted` atomically.
+- writes the public aggregate curves, runs deterministic max-volume and zigzag tie-breaking, stores the clearing result, updates the market's last clearing price and volume, and changes `Pending` to `Settled` atomically.
 
 The existing `finalize_decrypted_entry` / `finalize_decryption` Ristretto instructions are retained only for the earlier threshold feasibility harness. They are not the selected Baby Jubjub queue path.
-
-`clear_auction`
-
-- runs deterministic max-volume and zigzag tie-breaking;
-- stores the clearing result and immutable public settlement parameters;
-- changes state to `ClaimsOpen`.
 
 ### 15.5 Settlement
 
@@ -997,8 +1038,10 @@ The implementation and tests must preserve these invariants:
 
 1. An accepted order can transition to `Folded` and contribute to aggregate state exactly once.
 2. No order can be accepted after the submission deadline.
-3. The aggregate may change only during `Open` or `Sealed`, before the aggregation deadline, and becomes immutable in `Decrypting`.
-4. Decryption cannot begin before sealing or before `folded_order_count == accepted_order_count`.
+3. The aggregate may change only while `Pending` and before the aggregation
+   deadline; publication requires exact accepted/folded counter equality.
+4. Aggregate publication cannot begin before collection ends or before
+   `folded_order_count == accepted_order_count`.
 5. Only registered committee indices from the auction's key epoch count toward threshold.
 6. Every private decryption-share vector must verify against its selected registered public share and the exact aggregate ciphertext vector.
 7. Plaintext aggregate entries must match the threshold-decrypted group points.
@@ -1205,10 +1248,11 @@ The scripted hackathon demonstration should show:
 
 1. Creation of confidential base and quote Token-2022 mints and accounts.
 2. Initialization of one market and a dealer-assisted 3-of-7 key epoch.
-3. Opening an auction around the previous/reference price.
+3. Permissionlessly materializing the slot-derived auction around its selected
+   prior-clearing or oracle reference price.
 4. Submission of several confidential two-sided curves.
 5. Onchain ciphertext aggregates changing while quantities remain unreadable.
-6. Auction sealing.
+6. The slot-derived collection window ending.
 7. Three committee members providing private shares to the publication prover.
 8. Permissionless relay of the proof and publication of aggregate demand and supply curves.
 9. Independent recomputation of the deterministic clearing price.

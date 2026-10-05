@@ -7,6 +7,86 @@ deposit, aggregate-publication, private-claim, and cancellation-refund Groth16 c
 vault integration, LiteSVM/SBF benchmarks, and local demo-token/deployment
 tooling described in [`TECHNICAL_DESIGN.md`](./TECHNICAL_DESIGN.md).
 
+## Auction FAQ
+
+### Can one wallet submit more than one order in an auction?
+
+The current program accepts multiple immutable orders: every submission gets a
+new sequence-based PDA, and submitting again does not cancel the earlier order.
+There is no order-cancel or order-replace instruction yet.
+
+The intended replacement design will keep one private `ActiveOrder` per
+`(auction, owner)` without rejecting later submissions. A replace proof will
+release the previous private reserve, lock the replacement reserve, and enqueue
+an encrypted delta `new_order - old_order`. A cancel proof will enqueue
+`-old_order` and return its reserve to the trader's encrypted balance. Folding
+all accepted delta events therefore leaves exactly the latest order in the
+aggregate while still allowing bots to fold during collection. The final active
+revision, rather than every historical event, will be claimable. Observers can
+see that an authority submitted, changed, or cancelled an order, but not its
+private quantities.
+
+This preserves ordinary cancel/replace UX. It also prevents one signing
+authority from leaving simultaneous opposite orders in the auction, although a
+permissionless market cannot prevent the same person from using unrelated
+wallets.
+
+### Can a market maker claim auction N and place auction N+1's order atomically?
+
+Not by merely packing the existing claim and submission instructions together.
+The claim pays confidential Token-2022 accounts, while submission spends the
+trader's separate Baby Jubjub encrypted balance; the combined payload would
+also be too close to or beyond the transaction-size budget.
+
+The intended optimization is a dedicated `rollover_order` path. One proof
+would settle the old private order into the trader's encrypted balance, deduct
+the next order's reserves, create the new queued order, and terminally mark the
+old order, without withdrawing and redepositing tokens. It should require one
+Groth16 verification and no Token-2022 transfer proof contexts. The prototype
+should initially permit rollover only when both auctions use the same key
+epoch; key-rotation cases can use the existing claim/deposit path.
+
+### How is an auction's reference price selected?
+
+The first-version policy uses the previous clearing price when the previous
+clearing volume meets a configured minimum; otherwise it uses a fresh Pyth
+BTC/USD price. The first auction has previous volume zero and therefore uses
+Pyth. An immutable exponent adjustment converts the feed into quote lots per
+base lot (for 8-decimal tBTC / 6-decimal tUSD it is `-2`), then the price is
+rounded to the nearest tick before the 17-level grid is constructed. A stale update, wrong feed,
+excessive confidence interval, or arithmetic overflow makes initialization fail
+closed. The auction records the chosen reference price and its source.
+
+Pyth already runs its receiver on Solana Devnet, and its sponsored shard-zero
+BTC/USD feed is available there. BeatEx therefore does not need to deploy a demo
+oracle for tBTC/tUSD. The Devnet account is
+`4cSM2e6rvbGQUFiJbqytoVMi5GgghSMr8LwVrT9VPSPo`, for feed ID
+`e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43`.
+
+### What auction state does the program actually store?
+
+`Auction.state` stores only `Pending`, `Settled`, or `Cancelled`. The market
+authority configures and starts the market once; it does not open, seal, or
+clear individual auctions. The current auction ID and every time window are
+derived from the onchain slot.
+
+- `initialize_auction` is permissionless and creates the PDA, counter, and
+  accumulator for exactly the slot-derived auction ID. It snapshots the active
+  key epoch and either the eligible prior clearing price or the configured Pyth
+  price.
+- While `Pending`, slot checks admit orders only during collection and folds
+  only through the aggregation deadline.
+- `publish_and_clear` is permissionless. After collection and once accepted and
+  folded counters match, it verifies the committee-produced Groth16 proof,
+  publishes both aggregate curves, deterministically clears, and atomically
+  changes `Pending -> Settled`.
+- `cancel_pending_auction` is permissionless and changes `Pending -> Cancelled`
+  after an incomplete-aggregation or publication timeout.
+
+Claims and cancellation refunds are terminal per-order transitions; they do
+not add another auction phase. Settled claims remain available until consumed.
+A failed instruction is atomic and leaves the state unchanged.
+
 ## Implementation roadmap
 
 There are seven phases, numbered 0 through 6:
