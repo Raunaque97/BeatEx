@@ -3,7 +3,7 @@
 Confidential frequent batch auctions on Solana.
 
 The repository now contains the Anchor program, Baby Jubjub order/fold,
-deposit, and aggregate-publication Groth16 circuits, Token-2022 confidential
+deposit, aggregate-publication, private-claim, and cancellation-refund Groth16 circuits, Token-2022 confidential
 vault integration, LiteSVM/SBF benchmarks, and local demo-token/deployment
 tooling described in [`TECHNICAL_DESIGN.md`](./TECHNICAL_DESIGN.md).
 
@@ -30,8 +30,8 @@ There are seven phases, numbered 0 through 6:
 - **Phase 2 — Encrypted queue and proof-backed folding (Anchor + host proofs complete; clean SBF build complete)**
 - **Phase 3 — Committee decryption (Baby Jubjub publication circuit and SBF verification complete)**
 - **Phase 4 — Confidential collateral (proved public deposits and Token-2022 vault linkage complete)**
-- **Phase 5 — Private claims and cancellation fallback (state/CPI skeleton implemented; claim proof pending)**
-- **Phase 6 — Devnet demo hardening (local validator deployment and named demo assets complete; Devnet pending)**
+- **Phase 5 — Private claims and cancellation fallback (complete in host and SBF tests)**
+- **Phase 6 — Devnet demo hardening (program and named confidential demo assets deployed; scripted full-auction run pending)**
 
 The completed Phase 0 checkpoint currently provides:
 
@@ -55,6 +55,16 @@ The completed Phase 0 checkpoint currently provides:
   deposits to the trader's Baby Jubjub encrypted private balance;
 - a 518,852-constraint aggregate-publication circuit for any sorted 3-of-7
   Baby Jubjub quorum, with private committee-share witnesses and SBF verification;
+- 2,924,068-constraint claim and 2,923,244-constraint refund circuits that
+  reopen the private order commitment, enforce exact-index allocation, and bind
+  two Token-2022 payouts through one exact batched Ristretto relation;
+- permissionless claim/refund relay handlers plus a threshold vault-proof
+  library that produces host-verified standard Token-2022 proof bundles while
+  retaining the private Pedersen opening needed by the claim prover, creates
+  the six proof-context transaction plans, and assembles the exact
+  program-bound claim/refund witness;
+- a full production SBF claim using the 2.9-million-constraint Groth16 proof
+  and two Token-2022 confidential-transfer CPIs at 265,954 CU;
 - native two-handle grouped-ciphertext validity and strict four-bit range-proof
   benchmarks in Rust and browser WebAssembly;
 - a clean default-stack SBF build with a measured monolithic grid cap of 17
@@ -77,10 +87,19 @@ It encrypts three private order curves, homomorphically aggregates every grid
 entry, verifies participant-specific 3-of-7 decryption-share proofs, publishes
 only the aggregate curves, and applies the deterministic clearing rule.
 
+The current exact private-claim prover is committee-side, not browser-side. On
+an Apple M4 its Arkworks release benchmark takes 40.833 seconds per proof after
+the one-time setup; host verification is 1.331 ms. The circuit is deliberately
+kept exact while faster proving is treated as demo-hardening work.
+
 The hackathon environment uses named Token-2022 test assets `tBTC` and `tUSD`.
 The idempotent local-validator/Devnet mint workflow and current toolchain
 requirements are documented in
 [`docs/DEMO_ENVIRONMENT.md`](./docs/DEMO_ENVIRONMENT.md).
+
+The current SBF program is deployed on Devnet at
+`2P37xv7CzDv7pSet6LaXJDq4m1auW3pZ8PzPLtErfsVd`; the retained Devnet tBTC and
+tUSD addresses are recorded in `docs/DEMO_ENVIRONMENT.md`.
 
 Build the SBF v0 test artifact and run the ignored LiteSVM suite with:
 
@@ -116,6 +135,18 @@ performs two public `TransferChecked` CPIs followed by two confidential
 `Deposit` CPIs, then commits the same amounts to the trader's encrypted
 balance. Measured costs are 15,601 CU for apply-pending, 51,258 CU for two
 transfers, and 157,151 CU for the complete two-asset deposit instruction.
+
+Run the expensive exact production-claim fixture separately in release mode:
+
+```sh
+BEATEX_SBF_SO="$PWD/target/deploy-v0/beatex.so" \
+TOKEN_2022_SBF_SO="$PWD/target/deploy-v0/spl_token_2022-11.0.0.so" \
+  cargo test --release -p beatex-vault-proof-service \
+  --test full_withdrawal_sbf -- --ignored --nocapture
+```
+
+It generates the real 2.9-million-constraint proof, creates both standard
+Token-2022 proof bundles, and executes the production atomic claim handler.
 
 The SBF suite performs encrypted order chunking and aggregation, verifies ten
 3-of-7 threshold decryptions, publishes the aggregate curves, clears the

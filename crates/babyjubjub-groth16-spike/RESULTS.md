@@ -127,7 +127,7 @@ public.
 | Native verification median | 1.258 ms |
 | Compressed proving key | 94,048,400 bytes |
 | Compact publication instruction data | about 560 bytes |
-| SBF publication instruction | 266,074 CU |
+| SBF publication instruction | 268,990 CU |
 | Complete publication stage | one transaction |
 
 The Groth16 public digest is reconstructed by the program from the auction,
@@ -151,9 +151,45 @@ key epoch, revision, amounts, key, and all four old/new ciphertexts.
 | Native proving median | 380.048 ms |
 | Compressed proving key | 5,127,920 bytes |
 | Estimated instruction payload | about 432 bytes |
-| Full two-asset SBF deposit path | 157,151 CU |
+| Full two-asset SBF deposit path | 159,533 CU |
 
 The SBF path verifies the proof, moves public tokens from the trader sources
 to the market vaults, immediately converts those public vault amounts into
 Token-2022 confidential pending balances, and only then advances the encrypted
 private-balance revision.
+
+## Private claim and cancellation refund
+
+The withdrawal circuit reopens the salted order commitment authenticated at
+submission, selects the buy/sell quantities at only the clearing index, and
+enforces exact-index pro-rata allocation. The long side is rounded adversely:
+base received and quote proceeds round down, while base spent and quote paid
+round up. A separate refund circuit returns the two original reserves.
+
+Both circuits bind the full standard Token-2022 transfer-proof contexts and
+combine the two private 48-bit payout commitments with a transcript-derived
+128-bit coefficient. One exact emulated-Ristretto Pedersen equation inside
+BN254 connects the private payouts to those commitments. The program performs
+the same commitment combination natively before verifying the one-input
+Groth16 proof.
+
+| Measurement | Claim | Refund |
+| --- | ---: | ---: |
+| Constraints | 2,924,068 | 2,923,244 |
+| Instance variables | 2 | 2 |
+| Witness variables | 2,908,453 | 2,907,651 |
+| Exact circuit satisfaction, release | 17.96 s | 18.19 s |
+| Deterministic setup, Apple M4 | 43.838 s | not measured |
+| Native proving, Apple M4 | 40.833 s | not measured |
+| Native host verification | 1.331 ms | not measured |
+| Full production SBF claim + two Token-2022 CPIs | 265,954 CU | not measured |
+
+The proof is correct but is not presently suitable for browser generation or
+an interactive claim UX. The prototype therefore assigns claim/refund proving
+to the committee-side vault-proof service. Faster proving, GPU acceleration,
+or a different exact cross-curve backend remains demo-hardening work.
+
+The full SBF fixture uses independently generated standard Token-2022 proof
+bundles, the exact program-bound claim witness, and the production withdrawal
+handler. Both confidential destination pending balances and the terminal order
+state are checked after the atomic transaction.

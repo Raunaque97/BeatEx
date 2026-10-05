@@ -776,9 +776,11 @@ dependencies = [
  "ark-relations",
  "ark-serialize 0.5.0",
  "ark-snark",
+ "curve25519-dalek",
  "light-poseidon 0.4.0",
  "rand 0.8.6",
  "rand_chacha 0.3.1",
+ "sha3",
 ]
 
 [[package]]
@@ -832,6 +834,7 @@ dependencies = [
  "solana-sha256-hasher",
  "solana-signer",
  "solana-transaction",
+ "solana-zk-elgamal-proof-interface",
  "solana-zk-sdk 7.0.1",
  "solana-zk-sdk-pod",
  "spl-token-2022-interface",
@@ -846,6 +849,41 @@ dependencies = [
  "rand 0.8.6",
  "sha2 0.10.9",
  "solana-zk-sdk 7.0.1",
+ "thiserror 2.0.21",
+ "zeroize",
+]
+
+[[package]]
+name = "beatex-vault-proof-service"
+version = "0.1.0"
+dependencies = [
+ "anchor-lang",
+ "ark-bn254 0.5.0",
+ "ark-ed-on-bn254",
+ "ark-ff 0.5.0",
+ "ark-groth16",
+ "ark-snark",
+ "beatex-babyjubjub-groth16-spike",
+ "beatex-program",
+ "beatex-threshold-crypto",
+ "curve25519-dalek",
+ "litesvm",
+ "rand 0.8.6",
+ "rand_chacha 0.3.1",
+ "solana-account",
+ "solana-compute-budget-interface",
+ "solana-instruction 3.5.1",
+ "solana-keypair",
+ "solana-message",
+ "solana-pubkey 3.0.0",
+ "solana-signer",
+ "solana-system-interface 3.3.0",
+ "solana-transaction",
+ "solana-zk-sdk 4.0.0",
+ "solana-zk-sdk 7.0.1",
+ "solana-zk-sdk-pod",
+ "spl-token-2022-interface",
+ "spl-token-confidential-transfer-proof-generation",
  "thiserror 2.0.21",
  "zeroize",
 ]
@@ -2667,9 +2705,9 @@ checksum = "5f179d4e11094a893b82fff208f74d448a7512f99f5a0acbd5c679b705f83ed9"
 
 [[package]]
 name = "sha3"
-version = "0.10.9"
+version = "0.10.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77fd7028345d415a4034cf8777cd4f8ab1851274233b45f84e3d955502d93874"
+checksum = "75872d278a8f37ef87fa0ddbda7802605cb18344497949862c0d4dcb291eba60"
 dependencies = [
  "digest 0.10.7",
  "keccak",
@@ -4332,6 +4370,17 @@ dependencies = [
  "solana-sdk-ids",
  "solana-zk-elgamal-proof-interface",
  "solana-zk-sdk-pod",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "spl-token-confidential-transfer-proof-generation"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a0cd59fce3dc00f563c6fa364d67c3f200d278eae681f4dc250240afcfe044b1"
+dependencies = [
+ "curve25519-dalek",
+ "solana-zk-sdk 4.0.0",
  "thiserror 2.0.21",
 ]
 

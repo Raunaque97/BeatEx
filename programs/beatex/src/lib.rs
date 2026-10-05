@@ -7,6 +7,7 @@ use {
     solana_curve25519::ristretto::{add_ristretto, validate_ristretto, PodRistrettoPoint},
 };
 
+pub mod allocation;
 pub mod auction;
 pub mod groth16;
 pub mod lifecycle;
@@ -19,7 +20,7 @@ pub mod token2022;
 pub use groth16::Groth16ProofInput;
 pub use queue::{
     AggregateAccumulator, EncryptedPrivateBalance, QueueCircuitKind, QueueVerificationKey,
-    QueuedOrder, QueuedOrderState, SubmissionCounter,
+    QueuedOrder, QueuedOrderState, SubmissionCounter, WithdrawalKind, WithdrawalState,
 };
 pub use state::{Auction, AuctionState, Market, Order, OrderState};
 pub use threshold::{DecryptionShareInput, DleqProofInput, VerifyThresholdDecryptionArgs};
@@ -39,9 +40,21 @@ pub mod beatex {
         ctx: Context<InitializeMarket>,
         args: InitializeMarketArgs,
     ) -> Result<()> {
-        require!(args.base_lot_size > 0, BeatExError::InvalidMarketParameters);
+        // Circuit v1 treats order quantities and prices as raw token units.
+        // Fixing both lot sizes to one prevents the program and proof from
+        // silently interpreting the same witness in different denominations.
         require!(
-            args.quote_lot_size > 0,
+            args.base_lot_size == 1,
+            BeatExError::InvalidMarketParameters
+        );
+        require!(
+            args.quote_lot_size == 1,
+            BeatExError::InvalidMarketParameters
+        );
+        require!(
+            args.allocation_rule_version == allocation::ALLOCATION_RULE_VERSION
+                && args.order_circuit_version == queue::QUEUE_CIRCUIT_VERSION
+                && args.claim_circuit_version == queue::PRIVATE_CLAIM_CIRCUIT_VERSION,
             BeatExError::InvalidMarketParameters
         );
         require!(args.tick_size > 0, BeatExError::InvalidMarketParameters);
@@ -50,7 +63,9 @@ pub mod beatex {
             BeatExError::InvalidMarketParameters
         );
         require!(
-            args.max_order_quantity > 0 && args.max_aggregate_quantity >= args.max_order_quantity,
+            args.max_order_quantity > 0
+                && args.max_order_quantity <= queue::MAX_PRIVATE_ORDER_QUANTITY
+                && args.max_aggregate_quantity >= args.max_order_quantity,
             BeatExError::InvalidMarketParameters
         );
         require!(
@@ -67,9 +82,22 @@ pub mod beatex {
         args.initial_reference_price
             .checked_sub(price_span)
             .ok_or_else(|| error!(BeatExError::InvalidMarketParameters))?;
-        args.initial_reference_price
+        let upper_price = args
+            .initial_reference_price
             .checked_add(price_span)
             .ok_or_else(|| error!(BeatExError::ArithmeticOverflow))?;
+        // A two-sided contingent order can withdraw its unused reserve and
+        // proceeds in the same asset. Bound that worst case to Token-2022's
+        // 48-bit confidential-transfer amount.
+        require!(
+            u128::from(upper_price)
+                .checked_mul(u128::from(args.max_order_quantity))
+                .and_then(|value| value.checked_mul(2))
+                .is_some_and(|value| {
+                    value <= u128::from(allocation::MAX_CONFIDENTIAL_TRANSFER_AMOUNT)
+                }),
+            BeatExError::InvalidMarketParameters
+        );
 
         let market = &mut ctx.accounts.market;
         market.version = state::PROTOCOL_VERSION;
@@ -229,6 +257,9 @@ pub mod beatex {
         auction.reference_price = market.last_clearing_price;
         auction.tick_size = market.tick_size;
         auction.grid_size = market.grid_radius * 2 + 1;
+        auction.allocation_rule_version = market.allocation_rule_version;
+        auction.order_circuit_version = market.order_circuit_version;
+        auction.claim_circuit_version = market.claim_circuit_version;
         auction.clearing_index = market.grid_radius;
         auction.clearing_price = market.last_clearing_price;
         auction.bump = ctx.bumps.auction;
@@ -414,13 +445,19 @@ pub mod beatex {
             BeatExError::UnsupportedQueueGrid
         );
         let slot = Clock::get()?.slot;
-        let auction = &ctx.accounts.auction;
+        let queue_accounts = &ctx.accounts.queue_accounts;
+        require_keys_eq!(
+            queue_accounts.private_balance.owner,
+            ctx.accounts.owner.key(),
+            BeatExError::OrderState
+        );
+        let auction = &queue_accounts.auction;
         let deadlines = queue_deadlines(auction);
         let (sequence, next_count) = queue::accept_order(
             queue_phase(auction.state)?,
             slot,
             deadlines,
-            ctx.accounts.submission_counter.accepted_order_count,
+            queue_accounts.submission_counter.accepted_order_count,
         )
         .map_err(|_| error!(BeatExError::QueueInvariant))?;
         require!(
@@ -428,9 +465,9 @@ pub mod beatex {
             BeatExError::UnsupportedQueueGrid
         );
         require!(
-            ctx.accounts.order_verification_key.circuit_kind == QueueCircuitKind::OrderSubmission
-                && ctx.accounts.order_verification_key.circuit_version
-                    == ctx.accounts.market.order_circuit_version,
+            queue_accounts.order_verification_key.circuit_kind == QueueCircuitKind::OrderSubmission
+                && queue_accounts.order_verification_key.circuit_version
+                    == auction.order_circuit_version,
             BeatExError::InvalidCircuitVersion
         );
 
@@ -439,34 +476,36 @@ pub mod beatex {
             owner: &ctx.accounts.owner.key(),
             client_order_nonce: args.client_order_nonce,
             order_commitment: args.order_commitment,
-            committee_key: ctx.accounts.key_epoch.babyjub_encryption_pubkey,
+            committee_key: queue_accounts.key_epoch.babyjub_encryption_pubkey,
             reference_price: auction.reference_price,
             tick_size: auction.tick_size,
             ciphertexts: &args.ciphertexts,
-            old_base: &ctx.accounts.private_balance.encrypted_base,
-            old_quote: &ctx.accounts.private_balance.encrypted_quote,
+            old_base: &queue_accounts.private_balance.encrypted_base,
+            old_quote: &queue_accounts.private_balance.encrypted_quote,
             new_base: &args.new_encrypted_base,
             new_quote: &args.new_encrypted_quote,
         })?;
-        groth16::verify_queue_proof(&args.proof, &digest, &ctx.accounts.order_verification_key)?;
+        groth16::verify_queue_proof(&args.proof, &digest, &queue_accounts.order_verification_key)?;
 
         let order = &mut ctx.accounts.order;
         order.version = state::PROTOCOL_VERSION;
-        order.market = ctx.accounts.market.key();
+        order.market = queue_accounts.market.key();
         order.auction = auction.key();
         order.owner = ctx.accounts.owner.key();
         order.funder = ctx.accounts.owner.key();
         order.client_order_nonce = args.client_order_nonce;
         order.sequence = sequence;
         order.state = QueuedOrderState::Accepted;
+        order.withdrawal_state = WithdrawalState::Pending;
+        order.terminal_nullifier = [0; queue::QUEUE_DIGEST_BYTES];
         order.ciphertexts = args.ciphertexts;
         order.ciphertext_digest =
             queue_hash::order_ciphertext_digest(&auction.key(), &order.key(), &order.ciphertexts)?;
         order.order_commitment = args.order_commitment;
-        order.order_circuit_version = ctx.accounts.market.order_circuit_version;
+        order.order_circuit_version = auction.order_circuit_version;
         order.bump = ctx.bumps.order;
 
-        let balance = &mut ctx.accounts.private_balance;
+        let balance = &mut ctx.accounts.queue_accounts.private_balance;
         balance.encrypted_base = args.new_encrypted_base;
         balance.encrypted_quote = args.new_encrypted_quote;
         balance.balance_digest = digest;
@@ -474,7 +513,10 @@ pub mod beatex {
             .revision
             .checked_add(1)
             .ok_or_else(|| error!(BeatExError::ArithmeticOverflow))?;
-        ctx.accounts.submission_counter.accepted_order_count = next_count;
+        ctx.accounts
+            .queue_accounts
+            .submission_counter
+            .accepted_order_count = next_count;
         Ok(())
     }
 
@@ -1079,13 +1121,25 @@ pub mod beatex {
 
         token2022::invoke_confidential_transfer(
             &token_program,
-            &ctx.accounts.base_vault.to_account_info(),
-            &ctx.accounts.base_mint.to_account_info(),
-            &ctx.accounts.base_destination.to_account_info(),
+            &ctx.accounts.base_transfer_accounts.vault.to_account_info(),
+            &ctx.accounts.base_transfer_accounts.mint.to_account_info(),
+            &ctx.accounts
+                .base_transfer_accounts
+                .destination
+                .to_account_info(),
             &vault_authority,
-            &ctx.accounts.base_equality_proof.to_account_info(),
-            &ctx.accounts.base_validity_proof.to_account_info(),
-            &ctx.accounts.base_range_proof.to_account_info(),
+            &ctx.accounts
+                .base_transfer_accounts
+                .equality_proof
+                .to_account_info(),
+            &ctx.accounts
+                .base_transfer_accounts
+                .validity_proof
+                .to_account_info(),
+            &ctx.accounts
+                .base_transfer_accounts
+                .range_proof
+                .to_account_info(),
             base_transfer.new_source_decryptable_available_balance,
             base_transfer.auditor_ciphertext_lo,
             base_transfer.auditor_ciphertext_hi,
@@ -1093,13 +1147,25 @@ pub mod beatex {
         )?;
         token2022::invoke_confidential_transfer(
             &token_program,
-            &ctx.accounts.quote_vault.to_account_info(),
-            &ctx.accounts.quote_mint.to_account_info(),
-            &ctx.accounts.quote_destination.to_account_info(),
+            &ctx.accounts.quote_transfer_accounts.vault.to_account_info(),
+            &ctx.accounts.quote_transfer_accounts.mint.to_account_info(),
+            &ctx.accounts
+                .quote_transfer_accounts
+                .destination
+                .to_account_info(),
             &vault_authority,
-            &ctx.accounts.quote_equality_proof.to_account_info(),
-            &ctx.accounts.quote_validity_proof.to_account_info(),
-            &ctx.accounts.quote_range_proof.to_account_info(),
+            &ctx.accounts
+                .quote_transfer_accounts
+                .equality_proof
+                .to_account_info(),
+            &ctx.accounts
+                .quote_transfer_accounts
+                .validity_proof
+                .to_account_info(),
+            &ctx.accounts
+                .quote_transfer_accounts
+                .range_proof
+                .to_account_info(),
             quote_transfer.new_source_decryptable_available_balance,
             quote_transfer.auditor_ciphertext_lo,
             quote_transfer.auditor_ciphertext_hi,
@@ -1112,6 +1178,27 @@ pub mod beatex {
             OrderState::Claimed
         };
         Ok(())
+    }
+
+    /// Settle one folded queued order without revealing its price-level
+    /// quantities or reserves. The caller is only a relayer: the Groth16 proof
+    /// binds the private allocation to both Token-2022 transfer contexts.
+    pub fn claim_queued_order(
+        ctx: Context<PrivateWithdrawal>,
+        args: PrivateWithdrawalArgs,
+    ) -> Result<()> {
+        execute_private_withdrawal(ctx, WithdrawalKind::Claim, args)
+    }
+
+    /// Return the private reserves of an accepted or folded order after
+    /// permissionless auction cancellation. The refund circuit uses a distinct
+    /// verification key and proves that the transfer amounts equal the original
+    /// committed reserves.
+    pub fn refund_queued_order(
+        ctx: Context<PrivateWithdrawal>,
+        args: PrivateWithdrawalArgs,
+    ) -> Result<()> {
+        execute_private_withdrawal(ctx, WithdrawalKind::Refund, args)
     }
 
     /// Verify three DLEQ-proven shares and a caller-supplied plaintext against
@@ -1333,10 +1420,27 @@ pub struct DepositCollateral<'info> {
 }
 
 #[derive(Accounts)]
-#[instruction(args: SubmitQueuedOrderArgs)]
 pub struct SubmitQueuedOrder<'info> {
     #[account(mut)]
     pub owner: Signer<'info>,
+    pub queue_accounts: SubmitQueueAccounts<'info>,
+    #[account(
+        init,
+        payer = owner,
+        space = 8 + QueuedOrder::INIT_SPACE,
+        seeds = [
+            b"queued-order",
+            queue_accounts.auction.key().as_ref(),
+            &queue_accounts.submission_counter.accepted_order_count.to_le_bytes(),
+        ],
+        bump,
+    )]
+    pub order: Box<Account<'info, QueuedOrder>>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct SubmitQueueAccounts<'info> {
     pub market: Box<Account<'info, Market>>,
     #[account(has_one = market, has_one = key_epoch)]
     pub auction: Box<Account<'info, Auction>>,
@@ -1349,22 +1453,8 @@ pub struct SubmitQueuedOrder<'info> {
     pub order_verification_key: Box<Account<'info, QueueVerificationKey>>,
     #[account(mut, has_one = auction)]
     pub submission_counter: Box<Account<'info, SubmissionCounter>>,
-    #[account(mut, has_one = market, has_one = owner, has_one = key_epoch)]
+    #[account(mut, has_one = market, has_one = key_epoch)]
     pub private_balance: Box<Account<'info, EncryptedPrivateBalance>>,
-    #[account(
-        init,
-        payer = owner,
-        space = 8 + QueuedOrder::INIT_SPACE,
-        seeds = [
-            b"queued-order",
-            auction.key().as_ref(),
-            owner.key().as_ref(),
-            &args.client_order_nonce.to_le_bytes(),
-        ],
-        bump,
-    )]
-    pub order: Box<Account<'info, QueuedOrder>>,
-    pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
@@ -1420,6 +1510,14 @@ pub struct ConfidentialTransferArgs {
     pub new_source_decryptable_available_balance: [u8; token2022::AE_CIPHERTEXT_LEN],
     pub auditor_ciphertext_lo: [u8; 64],
     pub auditor_ciphertext_hi: [u8; 64],
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct PrivateWithdrawalArgs {
+    pub terminal_nullifier: [u8; 32],
+    pub base_transfer: ConfidentialTransferArgs,
+    pub quote_transfer: ConfidentialTransferArgs,
+    pub proof: Groth16ProofInput,
 }
 
 #[derive(Accounts)]
@@ -1593,45 +1691,66 @@ pub struct SettleTestOrder<'info> {
         constraint = order.market == market.key(),
     )]
     pub order: Box<Account<'info, Order>>,
-    /// CHECK: Address and Token-2022 ownership are checked by the handler and CPI.
-    #[account(owner = token_program.key())]
-    pub base_mint: UncheckedAccount<'info>,
-    /// CHECK: Address and Token-2022 ownership are checked by the handler and CPI.
-    #[account(owner = token_program.key())]
-    pub quote_mint: UncheckedAccount<'info>,
-    /// CHECK: Address, owner, mint, authority and confidential extension are checked.
-    #[account(mut, owner = token_program.key())]
-    pub base_vault: UncheckedAccount<'info>,
-    /// CHECK: Address, owner, mint, authority and confidential extension are checked.
-    #[account(mut, owner = token_program.key())]
-    pub quote_vault: UncheckedAccount<'info>,
-    /// CHECK: Token-2022 validates the destination mint and confidential extension.
-    #[account(mut, owner = token_program.key())]
-    pub base_destination: UncheckedAccount<'info>,
-    /// CHECK: Token-2022 validates the destination mint and confidential extension.
-    #[account(mut, owner = token_program.key())]
-    pub quote_destination: UncheckedAccount<'info>,
+    pub base_transfer_accounts: ConfidentialTransferAccounts<'info>,
+    pub quote_transfer_accounts: ConfidentialTransferAccounts<'info>,
     /// CHECK: PDA signs the Token-2022 CPIs and stores no data.
     #[account(
         seeds = [b"vault-authority", market.key().as_ref()],
         bump = market.vault_authority_bump,
     )]
     pub vault_authority: UncheckedAccount<'info>,
-    /// CHECK: Token-2022 validates the proof-context account and proof type.
-    pub base_equality_proof: UncheckedAccount<'info>,
-    /// CHECK: Token-2022 validates the proof-context account and proof type.
-    pub base_validity_proof: UncheckedAccount<'info>,
-    /// CHECK: Token-2022 validates the proof-context account and proof type.
-    pub base_range_proof: UncheckedAccount<'info>,
-    /// CHECK: Token-2022 validates the proof-context account and proof type.
-    pub quote_equality_proof: UncheckedAccount<'info>,
-    /// CHECK: Token-2022 validates the proof-context account and proof type.
-    pub quote_validity_proof: UncheckedAccount<'info>,
-    /// CHECK: Token-2022 validates the proof-context account and proof type.
-    pub quote_range_proof: UncheckedAccount<'info>,
     /// CHECK: The handler requires the canonical Token-2022 program id.
     #[account(executable)]
     pub token_program: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct PrivateWithdrawal<'info> {
+    pub market: Box<Account<'info, Market>>,
+    #[account(has_one = market)]
+    pub auction: Box<Account<'info, Auction>>,
+    #[account(
+        constraint = key_epoch.key() == auction.key_epoch @ BeatExError::InvalidKeyEpoch,
+        has_one = market,
+    )]
+    pub key_epoch: Box<Account<'info, KeyEpoch>>,
+    #[account(
+        mut,
+        has_one = market,
+        has_one = auction,
+    )]
+    pub order: Box<Account<'info, QueuedOrder>>,
+    #[account(has_one = market)]
+    pub withdrawal_verification_key: Box<Account<'info, QueueVerificationKey>>,
+    pub base_transfer_accounts: ConfidentialTransferAccounts<'info>,
+    pub quote_transfer_accounts: ConfidentialTransferAccounts<'info>,
+    /// CHECK: PDA signs the two Token-2022 CPIs and stores no data.
+    #[account(
+        seeds = [b"vault-authority", market.key().as_ref()],
+        bump = market.vault_authority_bump,
+    )]
+    pub vault_authority: UncheckedAccount<'info>,
+    /// CHECK: The helper requires the canonical Token-2022 program id.
+    #[account(executable)]
+    pub token_program: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct ConfidentialTransferAccounts<'info> {
+    /// CHECK: Address, Token-2022 ownership and mint data are checked by the handler.
+    pub mint: UncheckedAccount<'info>,
+    /// CHECK: Address, authority, mint and confidential extension are checked by the handler.
+    #[account(mut)]
+    pub vault: UncheckedAccount<'info>,
+    /// CHECK: Token-2022 validates the destination mint, keys and confidential extension.
+    #[account(mut)]
+    pub destination: UncheckedAccount<'info>,
+    /// CHECK: Canonical proof context is extracted before Groth16 verification and CPI.
+    pub equality_proof: UncheckedAccount<'info>,
+    /// CHECK: Canonical proof context is extracted before Groth16 verification and CPI.
+    pub validity_proof: UncheckedAccount<'info>,
+    /// CHECK: Canonical proof context is extracted before Groth16 verification and CPI.
+    pub range_proof: UncheckedAccount<'info>,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
@@ -1868,39 +1987,275 @@ fn transfer_demo_deposit_asset<'info>(
 
 fn validate_test_settlement_accounts(ctx: &Context<SettleTestOrder>) -> Result<()> {
     let market = &ctx.accounts.market;
+    let base = &ctx.accounts.base_transfer_accounts;
+    let quote = &ctx.accounts.quote_transfer_accounts;
     require_keys_eq!(
-        ctx.accounts.base_mint.key(),
+        base.mint.key(),
         market.base_mint,
         BeatExError::InvalidConfidentialVault
     );
     require_keys_eq!(
-        ctx.accounts.quote_mint.key(),
+        quote.mint.key(),
         market.quote_mint,
         BeatExError::InvalidConfidentialVault
     );
     require_keys_eq!(
-        ctx.accounts.base_vault.key(),
+        base.vault.key(),
         market.base_vault,
         BeatExError::InvalidConfidentialVault
     );
     require_keys_eq!(
-        ctx.accounts.quote_vault.key(),
+        quote.vault.key(),
         market.quote_vault,
         BeatExError::InvalidConfidentialVault
     );
     require!(
-        ctx.accounts.base_destination.key() != market.base_vault
-            && ctx.accounts.quote_destination.key() != market.quote_vault,
+        base.destination.key() != market.base_vault
+            && quote.destination.key() != market.quote_vault,
         BeatExError::InvalidSettlementDestination
     );
     token2022::validate_confidential_vault(
-        &ctx.accounts.base_vault.try_borrow_data()?,
+        &base.vault.try_borrow_data()?,
         &market.base_mint,
         &ctx.accounts.vault_authority.key(),
         &ctx.accounts.key_epoch.encryption_pubkey,
     )?;
     token2022::validate_confidential_vault(
-        &ctx.accounts.quote_vault.try_borrow_data()?,
+        &quote.vault.try_borrow_data()?,
+        &market.quote_mint,
+        &ctx.accounts.vault_authority.key(),
+        &ctx.accounts.key_epoch.encryption_pubkey,
+    )
+}
+
+fn execute_private_withdrawal(
+    ctx: Context<PrivateWithdrawal>,
+    kind: WithdrawalKind,
+    args: PrivateWithdrawalArgs,
+) -> Result<()> {
+    let auction = &ctx.accounts.auction;
+    let order = &ctx.accounts.order;
+    let next_state =
+        queue::advance_withdrawal(order.state, order.withdrawal_state, kind).map_err(|reason| {
+            match reason {
+                queue::WithdrawalInvariantError::ClaimRequiresFoldedOrder => {
+                    error!(BeatExError::WithdrawalNotAllowed)
+                }
+                queue::WithdrawalInvariantError::AlreadyWithdrawn => {
+                    error!(BeatExError::WithdrawalAlreadyProcessed)
+                }
+            }
+        })?;
+    match kind {
+        WithdrawalKind::Claim => {
+            require!(
+                auction.state == AuctionState::ClaimsOpen,
+                BeatExError::WithdrawalNotAllowed
+            );
+            // A cleared auction cannot safely return full reserves, because
+            // counterparties may already have claimed. Claims therefore stay
+            // open until consumed instead of stranding funds at a deadline.
+        }
+        WithdrawalKind::Refund => require!(
+            auction.state == AuctionState::Cancelled,
+            BeatExError::WithdrawalNotAllowed
+        ),
+    }
+    require!(
+        auction.allocation_rule_version == allocation::ALLOCATION_RULE_VERSION
+            && auction.order_circuit_version == order.order_circuit_version
+            && auction.claim_circuit_version == queue::PRIVATE_CLAIM_CIRCUIT_VERSION,
+        BeatExError::InvalidCircuitVersion
+    );
+    let expected_kind = match kind {
+        WithdrawalKind::Claim => QueueCircuitKind::PrivateClaim,
+        WithdrawalKind::Refund => QueueCircuitKind::CancellationRefund,
+    };
+    require!(
+        ctx.accounts.withdrawal_verification_key.circuit_kind == expected_kind
+            && ctx.accounts.withdrawal_verification_key.circuit_version
+                == queue::circuit_version(expected_kind),
+        BeatExError::InvalidCircuitVersion
+    );
+
+    validate_private_withdrawal_accounts(&ctx)?;
+    let base = &ctx.accounts.base_transfer_accounts;
+    let quote = &ctx.accounts.quote_transfer_accounts;
+    let base_binding = token2022::extract_transfer_proof_binding(
+        &base.equality_proof.to_account_info(),
+        &base.validity_proof.to_account_info(),
+        &base.range_proof.to_account_info(),
+    )?;
+    let quote_binding = token2022::extract_transfer_proof_binding(
+        &quote.equality_proof.to_account_info(),
+        &quote.validity_proof.to_account_info(),
+        &quote.range_proof.to_account_info(),
+    )?;
+    require!(
+        base_binding.source_pubkey == ctx.accounts.key_epoch.encryption_pubkey
+            && quote_binding.source_pubkey == ctx.accounts.key_epoch.encryption_pubkey,
+        BeatExError::InvalidCurveInput
+    );
+    token2022::validate_transfer_args(
+        &base_binding,
+        &args.base_transfer.new_source_decryptable_available_balance,
+        &args.base_transfer.auditor_ciphertext_lo,
+        &args.base_transfer.auditor_ciphertext_hi,
+    )?;
+    token2022::validate_transfer_args(
+        &quote_binding,
+        &args.quote_transfer.new_source_decryptable_available_balance,
+        &args.quote_transfer.auditor_ciphertext_lo,
+        &args.quote_transfer.auditor_ciphertext_hi,
+    )?;
+    let base_amount_commitment = base_binding.combined_amount_commitment()?;
+    let quote_amount_commitment = quote_binding.combined_amount_commitment()?;
+    let batched_amount_commitment = token2022::batch_transfer_amount_commitments(
+        base_amount_commitment,
+        quote_amount_commitment,
+    )?;
+
+    let clearing_index = usize::from(auction.clearing_index);
+    require!(
+        clearing_index < auction.active_grid_size(),
+        BeatExError::GridIndex
+    );
+    let digest =
+        queue_hash::private_withdrawal_statement_digest(&queue_hash::PrivateWithdrawalStatement {
+            kind,
+            market: &ctx.accounts.market.key(),
+            auction: &auction.key(),
+            order: &order.key(),
+            owner: &order.owner,
+            key_epoch: &auction.key_epoch,
+            client_order_nonce: order.client_order_nonce,
+            sequence: order.sequence,
+            allocation_rule_version: auction.allocation_rule_version,
+            order_circuit_version: auction.order_circuit_version,
+            claim_circuit_version: auction.claim_circuit_version,
+            order_commitment: order.order_commitment,
+            clearing_index: auction.clearing_index,
+            clearing_price: auction.clearing_price,
+            demand_at_clearing: auction.decrypted_demand[clearing_index],
+            supply_at_clearing: auction.decrypted_supply[clearing_index],
+            clearing_volume: auction.clearing_volume,
+            terminal_nullifier: args.terminal_nullifier,
+            base_mint: &base.mint.key(),
+            quote_mint: &quote.mint.key(),
+            base_vault: &base.vault.key(),
+            quote_vault: &quote.vault.key(),
+            base_destination: &base.destination.key(),
+            quote_destination: &quote.destination.key(),
+            base_transfer: &base_binding,
+            quote_transfer: &quote_binding,
+            base_new_decryptable_balance: &args
+                .base_transfer
+                .new_source_decryptable_available_balance,
+            quote_new_decryptable_balance: &args
+                .quote_transfer
+                .new_source_decryptable_available_balance,
+            base_amount_commitment,
+            quote_amount_commitment,
+            batched_amount_commitment,
+        })?;
+    groth16::verify_queue_proof(
+        &args.proof,
+        &digest,
+        &ctx.accounts.withdrawal_verification_key,
+    )?;
+
+    let market_key = ctx.accounts.market.key();
+    let bump = [ctx.accounts.market.vault_authority_bump];
+    let signer_seeds: &[&[u8]] = &[b"vault-authority", market_key.as_ref(), &bump];
+    let token_program = ctx.accounts.token_program.to_account_info();
+    let vault_authority = ctx.accounts.vault_authority.to_account_info();
+    token2022::invoke_confidential_transfer(
+        &token_program,
+        &base.vault.to_account_info(),
+        &base.mint.to_account_info(),
+        &base.destination.to_account_info(),
+        &vault_authority,
+        &base.equality_proof.to_account_info(),
+        &base.validity_proof.to_account_info(),
+        &base.range_proof.to_account_info(),
+        args.base_transfer.new_source_decryptable_available_balance,
+        args.base_transfer.auditor_ciphertext_lo,
+        args.base_transfer.auditor_ciphertext_hi,
+        &[signer_seeds],
+    )?;
+    token2022::invoke_confidential_transfer(
+        &token_program,
+        &quote.vault.to_account_info(),
+        &quote.mint.to_account_info(),
+        &quote.destination.to_account_info(),
+        &vault_authority,
+        &quote.equality_proof.to_account_info(),
+        &quote.validity_proof.to_account_info(),
+        &quote.range_proof.to_account_info(),
+        args.quote_transfer.new_source_decryptable_available_balance,
+        args.quote_transfer.auditor_ciphertext_lo,
+        args.quote_transfer.auditor_ciphertext_hi,
+        &[signer_seeds],
+    )?;
+
+    let order = &mut ctx.accounts.order;
+    order.withdrawal_state = next_state;
+    order.terminal_nullifier = args.terminal_nullifier;
+    Ok(())
+}
+
+fn validate_private_withdrawal_accounts(ctx: &Context<PrivateWithdrawal>) -> Result<()> {
+    let market = &ctx.accounts.market;
+    let base = &ctx.accounts.base_transfer_accounts;
+    let quote = &ctx.accounts.quote_transfer_accounts;
+    let token_program = ctx.accounts.token_program.key();
+    for account in [
+        &base.mint,
+        &base.vault,
+        &base.destination,
+        &quote.mint,
+        &quote.vault,
+        &quote.destination,
+    ] {
+        require_keys_eq!(
+            *account.owner,
+            token_program,
+            BeatExError::InvalidTokenProgram
+        );
+    }
+    require_keys_eq!(
+        base.mint.key(),
+        market.base_mint,
+        BeatExError::InvalidConfidentialVault
+    );
+    require_keys_eq!(
+        quote.mint.key(),
+        market.quote_mint,
+        BeatExError::InvalidConfidentialVault
+    );
+    require_keys_eq!(
+        base.vault.key(),
+        market.base_vault,
+        BeatExError::InvalidConfidentialVault
+    );
+    require_keys_eq!(
+        quote.vault.key(),
+        market.quote_vault,
+        BeatExError::InvalidConfidentialVault
+    );
+    require!(
+        base.destination.key() != market.base_vault
+            && quote.destination.key() != market.quote_vault,
+        BeatExError::InvalidSettlementDestination
+    );
+    token2022::validate_confidential_vault(
+        &base.vault.try_borrow_data()?,
+        &market.base_mint,
+        &ctx.accounts.vault_authority.key(),
+        &ctx.accounts.key_epoch.encryption_pubkey,
+    )?;
+    token2022::validate_confidential_vault(
+        &quote.vault.try_borrow_data()?,
         &market.quote_mint,
         &ctx.accounts.vault_authority.key(),
         &ctx.accounts.key_epoch.encryption_pubkey,
@@ -2059,6 +2414,10 @@ pub enum BeatExError {
     InvalidSettlementDestination,
     #[msg("a claim or refund is not allowed in the current state")]
     WithdrawalNotAllowed,
+    #[msg("the private withdrawal nullifier is zero or non-canonical")]
+    InvalidWithdrawalNullifier,
+    #[msg("this queued order has already been claimed or refunded")]
+    WithdrawalAlreadyProcessed,
     #[msg("the Groth16 proof or public inputs are invalid")]
     InvalidGroth16Proof,
     #[msg("the proof circuit version is not supported")]

@@ -916,7 +916,7 @@ fn reverse_chunks<const CHUNK_SIZE: usize, const ARRAY_SIZE: usize>(
     result
 }
 
-pub(super) fn g1_bytes(point: G1Affine) -> [u8; 64] {
+pub(crate) fn g1_bytes(point: G1Affine) -> [u8; 64] {
     let mut bytes = [0_u8; 64];
     point
         .x
@@ -929,7 +929,7 @@ pub(super) fn g1_bytes(point: G1Affine) -> [u8; 64] {
     reverse_chunks::<32, 64>(&bytes)
 }
 
-pub(super) fn g2_bytes(point: G2Affine) -> [u8; 128] {
+pub(crate) fn g2_bytes(point: G2Affine) -> [u8; 128] {
     let mut bytes = [0_u8; 128];
     point
         .serialize_with_mode(&mut bytes[..], Compress::No)
@@ -937,7 +937,7 @@ pub(super) fn g2_bytes(point: G2Affine) -> [u8; 128] {
     reverse_chunks::<64, 128>(&bytes)
 }
 
-pub(super) fn field_bytes(value: Fq) -> [u8; 32] {
+pub(crate) fn field_bytes(value: Fq) -> [u8; 32] {
     let encoded = value.into_bigint().to_bytes_be();
     let mut result = [0_u8; 32];
     result[32 - encoded.len()..].copy_from_slice(&encoded);

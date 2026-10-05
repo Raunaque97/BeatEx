@@ -4,6 +4,7 @@ members = [
     "crates/demo-sim",
     "crates/groth16-spike",
     "crates/threshold-crypto",
+    "crates/vault-proof-service",
     "crates/zk-elgamal-bench",
     "programs/beatex",
 ]

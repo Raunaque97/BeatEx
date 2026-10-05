@@ -26,8 +26,10 @@ use light_poseidon::{parameters::bn254_x5, Poseidon, PoseidonHasher, PoseidonPar
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
+pub mod claim;
 pub mod decryption;
 pub mod deposit;
+pub mod ristretto_bridge;
 pub mod transition;
 
 const LEVELS: usize = 17;
@@ -703,6 +705,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     transition::run()?;
     decryption::run()?;
     deposit::run()?;
+    ristretto_bridge::run()?;
     Ok(())
 }
 

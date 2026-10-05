@@ -8,10 +8,12 @@ use {
     beatex::{
         Auction, AuctionState, ConfidentialTransferArgs, DepositCollateralArgs, DleqProofInput,
         EncryptedPrivateBalance, Groth16ProofInput, KeyEpoch, Market, Order, OrderState,
-        QueueCircuitKind, QueueVerificationKey,
+        PrivateWithdrawalArgs, QueueCircuitKind, QueueVerificationKey, QueuedOrder,
+        QueuedOrderState, WithdrawalState,
     },
     litesvm::LiteSVM,
     solana_account::Account,
+    solana_compute_budget_interface::ComputeBudgetInstruction,
     solana_instruction::{AccountMeta, Instruction},
     solana_keypair::Keypair,
     solana_message::Message,
@@ -179,7 +181,7 @@ fn fixture_market(
         quote_lot_size: 1,
         tick_size: 1,
         grid_radius: 1,
-        max_order_quantity: 1_000,
+        max_order_quantity: beatex::queue::MAX_PRIVATE_ORDER_QUANTITY,
         max_aggregate_quantity: 10_000,
         current_key_epoch: key_epoch,
         last_clearing_price: 1,
@@ -451,6 +453,9 @@ fn vault_pda_transfers_with_preverified_context_accounts() {
         reference_price: 1,
         tick_size: 1,
         grid_size: 3,
+        allocation_rule_version: 1,
+        order_circuit_version: 1,
+        claim_circuit_version: 1,
         finalized_order_count: 1,
         aggregate_buy: [[0; 64]; beatex::state::MAX_GRID_SIZE],
         aggregate_sell: [[0; 64]; beatex::state::MAX_GRID_SIZE],
@@ -523,18 +528,18 @@ fn vault_pda_transfers_with_preverified_context_accounts() {
             AccountMeta::new_readonly(key_epoch, false),
             AccountMeta::new(order, false),
             AccountMeta::new_readonly(base_mint, false),
-            AccountMeta::new_readonly(quote_mint, false),
             AccountMeta::new(base_vault, false),
-            AccountMeta::new(quote_vault, false),
             AccountMeta::new(base_destination, false),
+            AccountMeta::new_readonly(equality, false),
+            AccountMeta::new_readonly(validity, false),
+            AccountMeta::new_readonly(range, false),
+            AccountMeta::new_readonly(quote_mint, false),
+            AccountMeta::new(quote_vault, false),
             AccountMeta::new(quote_destination, false),
+            AccountMeta::new_readonly(equality, false),
+            AccountMeta::new_readonly(validity, false),
+            AccountMeta::new_readonly(range, false),
             AccountMeta::new_readonly(vault_authority, false),
-            AccountMeta::new_readonly(equality, false),
-            AccountMeta::new_readonly(validity, false),
-            AccountMeta::new_readonly(range, false),
-            AccountMeta::new_readonly(equality, false),
-            AccountMeta::new_readonly(validity, false),
-            AccountMeta::new_readonly(range, false),
             AccountMeta::new_readonly(spl_token_2022_interface::id(), false),
         ],
         data: beatex::instruction::SettleTestOrder {
@@ -734,4 +739,239 @@ fn public_deposit_is_proved_and_moved_into_confidential_pending_balance() {
         "proved public deposit plus two confidential Deposit CPIs consumed {} CU",
         metadata.compute_units_consumed
     );
+}
+
+#[test]
+#[ignore = "requires BeatEx and official Token-2022 v11 SBF artifacts"]
+fn production_private_claim_reaches_groth16_verification_before_any_token_cpi() {
+    let mut svm = svm_with_program();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 2_000_000_000).unwrap();
+
+    let market = Pubkey::new_unique();
+    let key_epoch = Pubkey::new_unique();
+    let auction = Pubkey::new_unique();
+    let order = Pubkey::new_unique();
+    let claim_vk = Pubkey::new_unique();
+    let base_mint = Pubkey::new_unique();
+    let quote_mint = Pubkey::new_unique();
+    let base_vault = Pubkey::new_unique();
+    let quote_vault = Pubkey::new_unique();
+    let base_destination = Pubkey::new_unique();
+    let quote_destination = Pubkey::new_unique();
+    let (market_state, key_epoch_state, vault_authority) = fixture_market(
+        payer.pubkey(),
+        market,
+        key_epoch,
+        base_mint,
+        base_vault,
+        quote_mint,
+        quote_vault,
+    );
+    let mut auction_state = Auction {
+        version: 1,
+        market,
+        auction_id: 1,
+        key_epoch,
+        state: AuctionState::ClaimsOpen,
+        open_slot: 0,
+        submission_end_slot: 1,
+        aggregation_deadline_slot: 2,
+        decryption_deadline_slot: 3,
+        claim_deadline_slot: u64::MAX,
+        reference_price: 1,
+        tick_size: 1,
+        grid_size: 3,
+        allocation_rule_version: 1,
+        order_circuit_version: 1,
+        claim_circuit_version: 1,
+        finalized_order_count: 1,
+        aggregate_buy: [[0; 64]; beatex::state::MAX_GRID_SIZE],
+        aggregate_sell: [[0; 64]; beatex::state::MAX_GRID_SIZE],
+        decrypted_demand: [0; beatex::state::MAX_GRID_SIZE],
+        decrypted_supply: [0; beatex::state::MAX_GRID_SIZE],
+        decrypted_entry_bitmap: 0,
+        clearing_index: 1,
+        clearing_price: 1,
+        clearing_volume: 0,
+        base_residual: 0,
+        quote_residual: 0,
+        bump: 0,
+    };
+    auction_state.decrypted_entry_bitmap = 0b111;
+    let mut order_commitment = [0u8; 32];
+    order_commitment[0] = 1;
+    let order_state = QueuedOrder {
+        version: 1,
+        market,
+        auction,
+        owner: payer.pubkey(),
+        funder: payer.pubkey(),
+        client_order_nonce: 7,
+        sequence: 0,
+        state: QueuedOrderState::Folded,
+        withdrawal_state: WithdrawalState::Pending,
+        terminal_nullifier: [0; 32],
+        ciphertexts: vec![0; beatex::queue::QUEUED_CIPHERTEXT_COUNT * 64],
+        ciphertext_digest: [0; 32],
+        order_commitment,
+        order_circuit_version: 1,
+        bump: 0,
+    };
+    let valid_fixture =
+        beatex_babyjubjub_groth16_spike::deposit::deterministic_solana_fixture().unwrap();
+    let vk_state = QueueVerificationKey {
+        version: 1,
+        market,
+        circuit_kind: QueueCircuitKind::PrivateClaim,
+        circuit_version: beatex::queue::PRIVATE_CLAIM_CIRCUIT_VERSION,
+        alpha_g1: valid_fixture.vk_alpha_g1,
+        beta_g2: valid_fixture.vk_beta_g2,
+        gamma_g2: valid_fixture.vk_gamma_g2,
+        delta_g2: valid_fixture.vk_delta_g2,
+        ic: valid_fixture.vk_ic,
+        bump: 0,
+    };
+    put_anchor_account(&mut svm, market, &market_state);
+    put_anchor_account(&mut svm, key_epoch, &key_epoch_state);
+    put_anchor_account(&mut svm, auction, &auction_state);
+    put_anchor_account(&mut svm, order, &order_state);
+    put_anchor_account(&mut svm, claim_vk, &vk_state);
+    put_system_account(&mut svm, vault_authority);
+    for mint in [base_mint, quote_mint] {
+        put_token_2022_account(&mut svm, mint, confidential_mint_data());
+    }
+    for (address, mint, owner) in [
+        (base_vault, base_mint, vault_authority),
+        (quote_vault, quote_mint, vault_authority),
+        (base_destination, base_mint, payer.pubkey()),
+        (quote_destination, quote_mint, payer.pubkey()),
+    ] {
+        put_token_2022_account(
+            &mut svm,
+            address,
+            confidential_token_account_data(mint, owner, key_epoch_state.encryption_pubkey, 0, 0),
+        );
+    }
+    let (base_equality, base_validity, base_range) = put_zero_transfer_proof_contexts(
+        &mut svm,
+        key_epoch_state.encryption_pubkey,
+        key_epoch_state.encryption_pubkey,
+    );
+    let (quote_equality, quote_validity, quote_range) = put_zero_transfer_proof_contexts(
+        &mut svm,
+        key_epoch_state.encryption_pubkey,
+        key_epoch_state.encryption_pubkey,
+    );
+    let transfer = ConfidentialTransferArgs {
+        new_source_decryptable_available_balance: [0; beatex::token2022::AE_CIPHERTEXT_LEN],
+        auditor_ciphertext_lo: [0; 64],
+        auditor_ciphertext_hi: [0; 64],
+    };
+    let mut terminal_nullifier = [0u8; 32];
+    terminal_nullifier[0] = 2;
+    let binding = beatex::token2022::TransferProofBinding {
+        source_pubkey: key_epoch_state.encryption_pubkey,
+        destination_pubkey: key_epoch_state.encryption_pubkey,
+        auditor_pubkey: [0; 32],
+        new_source_ciphertext: [0; 64],
+        ciphertexts_lo: [[0; 64]; 3],
+        ciphertexts_hi: [[0; 64]; 3],
+    };
+    let mut public_input = beatex::queue_hash::private_withdrawal_statement_digest(
+        &beatex::queue_hash::PrivateWithdrawalStatement {
+            kind: beatex::queue::WithdrawalKind::Claim,
+            market: &market,
+            auction: &auction,
+            order: &order,
+            owner: &payer.pubkey(),
+            key_epoch: &key_epoch,
+            client_order_nonce: order_state.client_order_nonce,
+            sequence: order_state.sequence,
+            allocation_rule_version: auction_state.allocation_rule_version,
+            order_circuit_version: auction_state.order_circuit_version,
+            claim_circuit_version: auction_state.claim_circuit_version,
+            order_commitment,
+            clearing_index: auction_state.clearing_index,
+            clearing_price: auction_state.clearing_price,
+            demand_at_clearing: 0,
+            supply_at_clearing: 0,
+            clearing_volume: 0,
+            terminal_nullifier,
+            base_mint: &base_mint,
+            quote_mint: &quote_mint,
+            base_vault: &base_vault,
+            quote_vault: &quote_vault,
+            base_destination: &base_destination,
+            quote_destination: &quote_destination,
+            base_transfer: &binding,
+            quote_transfer: &binding,
+            base_new_decryptable_balance: &transfer.new_source_decryptable_available_balance,
+            quote_new_decryptable_balance: &transfer.new_source_decryptable_available_balance,
+            base_amount_commitment: [0; 32],
+            quote_amount_commitment: [0; 32],
+            batched_amount_commitment: [0; 32],
+        },
+    )
+    .unwrap();
+    public_input.reverse();
+    let instruction = Instruction {
+        program_id: beatex::ID,
+        accounts: vec![
+            AccountMeta::new_readonly(market, false),
+            AccountMeta::new_readonly(auction, false),
+            AccountMeta::new_readonly(key_epoch, false),
+            AccountMeta::new(order, false),
+            AccountMeta::new_readonly(claim_vk, false),
+            AccountMeta::new_readonly(base_mint, false),
+            AccountMeta::new(base_vault, false),
+            AccountMeta::new(base_destination, false),
+            AccountMeta::new_readonly(base_equality, false),
+            AccountMeta::new_readonly(base_validity, false),
+            AccountMeta::new_readonly(base_range, false),
+            AccountMeta::new_readonly(quote_mint, false),
+            AccountMeta::new(quote_vault, false),
+            AccountMeta::new(quote_destination, false),
+            AccountMeta::new_readonly(quote_equality, false),
+            AccountMeta::new_readonly(quote_validity, false),
+            AccountMeta::new_readonly(quote_range, false),
+            AccountMeta::new_readonly(vault_authority, false),
+            AccountMeta::new_readonly(spl_token_2022_interface::id(), false),
+        ],
+        data: beatex::instruction::ClaimQueuedOrder {
+            args: PrivateWithdrawalArgs {
+                terminal_nullifier,
+                base_transfer: transfer,
+                quote_transfer: transfer,
+                proof: Groth16ProofInput {
+                    proof_a: [0; 64],
+                    proof_b: [0; 128],
+                    proof_c: [0; 64],
+                    public_input,
+                },
+            },
+        }
+        .data(),
+    };
+    let transaction = Transaction::new(
+        &[&payer],
+        Message::new(
+            &[
+                ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
+                instruction,
+            ],
+            Some(&payer.pubkey()),
+        ),
+        svm.latest_blockhash(),
+    );
+    let failure = svm.send_transaction(transaction).unwrap_err();
+    let debug = format!("{failure:?}");
+    assert!(debug.contains("InvalidGroth16Proof"), "{debug}");
+
+    let unchanged: QueuedOrder = {
+        let account = svm.get_account(&order).unwrap();
+        QueuedOrder::try_deserialize(&mut account.data.as_slice()).unwrap()
+    };
+    assert_eq!(unchanged.withdrawal_state, WithdrawalState::Pending);
+    assert_eq!(unchanged.terminal_nullifier, [0; 32]);
 }

@@ -75,6 +75,10 @@ pub struct Auction {
     pub reference_price: u64,
     pub tick_size: u64,
     pub grid_size: u8,
+    /// Immutable protocol versions captured when the auction opens.
+    pub allocation_rule_version: u16,
+    pub order_circuit_version: u16,
+    pub claim_circuit_version: u16,
     pub finalized_order_count: u32,
     pub aggregate_buy: [[u8; 64]; MAX_GRID_SIZE],
     pub aggregate_sell: [[u8; 64]; MAX_GRID_SIZE],

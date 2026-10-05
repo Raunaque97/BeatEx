@@ -586,28 +586,26 @@ All arithmetic is checked. A malformed plaintext curve, out-of-range aggregate, 
 
 ## 12. Allocation and rounding
 
-The exact per-order allocation rule has not yet been approved and must be frozen before the claim circuit is finalized.
+Allocation rule v1 is frozen as exact-index pro-rata. `buy[i]` is always the
+amount of base token requested at price `P[i]`; its quote liability is
+`buy[i] * P[i]`. Only `buy[c]` and `sell[c]` at the clearing index `c`
+participate. There is no cumulative price-priority curve.
 
-The leading prototype candidate is:
+Let `b`, `s`, `D`, `S`, and `P` be the trader buy, trader sell, aggregate
+demand, aggregate supply, and price at `c`:
 
-- every order with non-zero quantity on the short side at the clearing price fills that quantity;
-- the long side is filled proportionally using its quantity at the clearing price;
-- the claim circuit proves the proportional calculation and the specified integer rounding;
-- base and quote residuals are assigned explicitly to an auction residual account rather than being silently lost.
+- if `D > S`, sellers execute exactly; a buyer receives
+  `floor(b*S/D)` base and pays `ceil(b*S*P/D)` quote;
+- if `S > D`, buyers execute exactly; a seller spends
+  `ceil(s*D/S)` base and receives `floor(s*D*P/S)` quote;
+- if `D == S`, both sides execute exactly;
+- zero volume returns the complete reserve.
 
-This candidate is attractive because a trader can calculate a claim using the trader's private quantity and public aggregate totals. It does not provide conventional price-time priority among all eligible orders.
-
-Before implementation, the final rule must specify:
-
-- whether price priority applies before pro-rata allocation;
-- the exact numerator and denominator for each side;
-- floor/ceiling behavior for base and quote quantities;
-- how conservation is maintained when individual divisions leave remainders;
-- who owns base and quote dust;
-- maximum rounding loss per order;
-- zero-volume and one-sided edge cases.
-
-This is a protocol decision, not an implementation detail. Tests and circuit constraints must encode the final rule exactly.
+Every division is constrained by quotient, remainder, denominator, and a
+strict remainder bound. Rounding is deliberately adverse to the long side, so
+integer dust remains in the shared market vault and can never make it
+insolvent. The prototype fixes both lot sizes to one token unit and constrains
+each private payout to Token-2022's 48-bit confidential-transfer range.
 
 ---
 
@@ -615,9 +613,9 @@ This is a protocol decision, not an implementation detail. Tests and circuit con
 
 ### 13.1 Claim proof statement
 
-The intended claim proof demonstrates, without revealing the order, that:
+The claim proof demonstrates, without revealing the order, that:
 
-1. the prover knows the plaintext quantities and openings behind the finalized order ciphertexts;
+1. the prover reopens the salted private-order commitment already authenticated by the submission proof;
 2. the order is bound to the specified market, auction, owner, and key epoch;
 3. the public clearing result is the one stored by the program;
 4. the claimed fill follows the allocation and rounding rules;
@@ -629,7 +627,7 @@ The proof does not reveal the order quantities, fill, refund, or transfer amount
 
 ### 13.2 Claim state
 
-For the prototype, each finalized order PDA contains a terminal status:
+For the prototype, each queued order PDA contains a terminal withdrawal status:
 
 ```text
 Pending
@@ -639,16 +637,21 @@ Refunded
 
 The program changes `Pending` to `Claimed` or `Refunded` in the same transaction that authorizes the relevant token movement. This prevents replay and double withdrawal.
 
+Once an auction reaches `ClaimsOpen`, claims remain available until consumed.
+The program does not later convert a cleared auction into full-reserve refunds,
+because counterparties may already have claimed and such a transition could
+make the shared vault insolvent.
+
 ### 13.3 Token-2022 source proof requirement
 
 Token-2022 confidential transfers require source-side proofs against the vault's current encrypted available balance. The trader does not possess the shared vault's ElGamal/AES proof material.
 
 The prototype therefore includes an offchain **vault-proof service**, initially operated alongside the committee:
 
-1. The trader generates the claim Groth16 proof and the desired destination ciphertext material.
-2. The vault-proof service validates the claim inputs or waits for an accepted claim-preparation state.
+1. The trader supplies the private order opening and confidential destination accounts to the committee-side coordinator.
+2. The vault-proof service validates the onchain order and clearing state and derives the exact private allocation.
 3. A threshold reconstructs or otherwise makes the required vault proof material available for the duration of proof generation.
-4. The service generates the standard Token-2022 transfer proof contexts.
+4. The service generates the standard Token-2022 transfer proof contexts and the claim/refund Groth16 proof.
 5. The trader or any relayer submits the final claim transaction.
 6. The FBA program verifies the claim proof and signs the Token-2022 CPI with PDA seeds.
 
@@ -660,14 +663,14 @@ Incoming Token-2022 collateral is public in the prototype: `deposit_collateral` 
 
 Funds in confidential pending balances must be applied into the available balance before they can fund outgoing claims. The program and test harness track pending-balance counters and include an explicit vault-apply step in the auction pipeline.
 
-Implementation status: `deposit_collateral` verifies the 26,885-constraint encrypted-balance transition and completes both public transfers and confidential-deposit CPIs atomically. `apply_vault_pending_balance` validates the selected market vault, mint, vault-authority PDA, active key epoch, confidential extension, approval flag, and ElGamal public key before invoking Token-2022. `settle_test_order` performs the base and quote confidential transfers in one transaction and writes `Claimed` or `Refunded` only after both CPIs return successfully. It is authority-gated until the private claim/refund proof is finalized.
+Implementation status: `deposit_collateral` verifies the 26,885-constraint encrypted-balance transition and completes both public transfers and confidential-deposit CPIs atomically. `apply_vault_pending_balance` validates the selected market vault, mint, vault-authority PDA, active key epoch, confidential extension, approval flag, and ElGamal public key before invoking Token-2022. The production `claim_queued_order` and `refund_queued_order` handlers extract and bind both standard Token-2022 proof-context bundles, verify a circuit-specific one-input Groth16 proof, execute both confidential transfers atomically, and only then mark the queued order terminal. The exact claim circuit is 2,924,068 constraints; the refund circuit is 2,923,244 constraints. The vault-proof library reconstructs any valid 3-of-7 vault key, generates and host-verifies the standard equality/validity/range bundles, and retains the zeroized combined Pedersen opening required by the Groth16 bridge.
 
 ### 13.5 Timeout refund
 
-After the cancellation deadline:
+After a settlement-stage timeout moves the auction to `Cancelled`:
 
 - clearing and claims are disabled;
-- a finalized order may be refunded at most once;
+- an accepted or folded queued order may be refunded at most once;
 - the refund is the full base and quote collateral originally deposited for that order;
 - the refund proof binds to the original collateral-transfer commitments and order PDA;
 - the order becomes `Refunded` atomically with token authorization.
@@ -787,7 +790,7 @@ order circuit version
 Suggested seeds:
 
 ```text
-["queued-order", auction, owner, client_order_nonce]
+["queued-order", auction, accepted_sequence]
 ```
 
 ### 14.5 Queue state
@@ -926,9 +929,7 @@ The existing `finalize_decrypted_entry` / `finalize_decryption` Ristretto instru
 
 ### 15.5 Settlement
 
-`prepare_claim` may be introduced if Token-2022 proof generation requires a two-step state transition. It must not allow an order to be claimed twice or reserve funds indefinitely.
-
-`claim_order`
+`claim_queued_order`
 
 - verifies order ownership or an authorized relayer binding;
 - verifies the claim Groth16 proof;
@@ -936,7 +937,7 @@ The existing `finalize_decrypted_entry` / `finalize_decryption` Ristretto instru
 - invokes Token-2022 transfers with the vault-authority PDA;
 - marks the order `Claimed` atomically.
 
-`refund_cancelled_order`
+`refund_queued_order`
 
 - requires auction state `Cancelled`;
 - verifies the refund proof and original collateral binding;
@@ -1091,15 +1092,17 @@ The October 2026 local checkpoint uses Anchor 1.1.2, Agave/Solana 3.1-compatible
 
 Measured results:
 
-- standalone 3-of-7 threshold-decryption verification: 40,093 CU;
-- the versioned one-public-input Groth16 pipeline: 80,298 CU;
-- five-level deterministic clearing: 9,785 CU;
-- ten typed aggregate-entry threshold decryptions: 476,548 CU total across ten transactions;
-- aggregate Baby Jubjub decryption/publication proof and state transition: 266,074 CU in one transaction;
+- standalone 3-of-7 threshold-decryption verification: 40,382 CU;
+- the versioned one-public-input Groth16 pipeline: 80,464 CU;
+- five-level deterministic clearing: 10,399 CU;
+- ten typed aggregate-entry threshold decryptions: 483,550 CU total across ten transactions;
+- aggregate Baby Jubjub decryption/publication proof and state transition: 268,990 CU in one transaction;
 - default-stack SBF builds: 17 monolithic price levels pass cleanly, while 19 levels fail in `Auction` deserialization;
 - encrypted order initialization, two chunk writes, immutable aggregation, threshold publication of aggregate curves, clearing, and permissionless timeout cancellation all pass in LiteSVM.
 
-The Token-2022 CPI layer also passes a dedicated LiteSVM integration harness against the official v11.0.0 SBF artifact: PDA-signed `ApplyPendingBalance` consumes 15,601 CU, an atomic two-asset settlement containing two confidential `Transfer` CPIs consumes 51,258 CU, and the complete proved two-asset public-deposit path consumes 157,151 CU. The transfer harness supplies correctly encoded, ZK-program-owned preverified equality, ciphertext-validity, and range-proof context accounts, so it tests context extraction, cross-account consistency, PDA signing, state mutation, and CPI wiring. It does not re-run native ZK ElGamal proof verification. LiteSVM 0.10's bundled Token-2022 v10 omits `zk-ops` and rejects these confidential instructions with `InvalidInstructionData`; the harness therefore overrides it with the official v11 artifact.
+The Token-2022 CPI layer also passes a dedicated LiteSVM integration harness against the official v11.0.0 SBF artifact: PDA-signed `ApplyPendingBalance` consumes 15,966 CU, an atomic two-asset settlement containing two confidential `Transfer` CPIs consumes 52,094 CU, and the complete proved two-asset public-deposit path consumes 159,533 CU. The transfer harness supplies correctly encoded, ZK-program-owned preverified equality, ciphertext-validity, and range-proof context accounts, so it tests context extraction, cross-account consistency, PDA signing, state mutation, and CPI wiring. It does not re-run native ZK ElGamal proof verification. LiteSVM 0.10's bundled Token-2022 v10 omits `zk-ops` and rejects these confidential instructions with `InvalidInstructionData`; the harness therefore overrides it with the official v11 artifact.
+
+The exact claim relation has 2,924,068 constraints and the cancellation-refund relation has 2,923,244. On an Apple M4 using the current Arkworks release prover, deterministic claim setup took 43.838 seconds, recurring proof generation took 40.833 seconds, and host verification took 1.331 milliseconds. This is correct but too slow for browser-side claim proving; the demo should run claim/refund proving in the committee-side service and treat prover optimization or a different cross-curve proof backend as post-prototype work.
 
 ---
 
@@ -1163,7 +1166,21 @@ Checkpoint: Token-2022 validation, pending-balance CPI, outgoing confidential-tr
 - confidential payouts and refunds;
 - cancellation path.
 
-Checkpoint: cancellation, claim/refund mutual exclusion, and atomic two-asset demo settlement are implemented. The allocation decision, claim circuit, nullifier statement, and vault-proof service harness remain open.
+Checkpoint: the exact-index allocation rule, separate claim/refund circuits,
+terminal nullifier, full onchain transcript reconstruction, real batched
+Ristretto-to-Token-2022 commitment bridge, permissionless relay handlers,
+claim/refund mutual exclusion, atomic two-asset transfers, and threshold vault
+proof-generation library are implemented. Host circuit satisfaction,
+onchain/circuit transcript parity, batching parity, standard Token-2022 proof
+verification, workspace tests, and strict Clippy pass. The coordinator now
+builds exact create/verify/close instructions for all six proof-context
+accounts, checks their program transcript against the circuit transcript,
+constructs the private claim/refund witness, and exposes Groth16 proof
+generation from a loaded proving key. A real 2.9-million-constraint claim proof
+and two independently generated Token-2022 transfer bundles execute atomically
+through the production SBF handler at 265,954 CU. Both destination pending
+balances advance, the queued order becomes terminal, and the invalid-proof path
+leaves it unchanged.
 
 ### Phase 6: demo hardening
 
@@ -1173,7 +1190,12 @@ Checkpoint: cancellation, claim/refund mutual exclusion, and atomic two-asset de
 - benchmark report;
 - explicit prototype threat-model disclosure.
 
-Checkpoint: the local encrypted auction script and LiteSVM SBF flows pass. Anchor 1.1.2, Agave 3.1.10, `spl-token` 5.5.0, an isolated local CLI wallet, tBTC/tUSD Token-2022 mints, and the 700,088-byte BeatEx program have been exercised on a local validator. Native Token-2022 proof execution and Devnet deployment remain required.
+Checkpoint: the local encrypted auction script and LiteSVM SBF flows pass. The
+801,152-byte BeatEx program is deployed on Devnet at
+`2P37xv7CzDv7pSet6LaXJDq4m1auW3pZ8PzPLtErfsVd`. Named tBTC/tUSD Token-2022
+mints and confidential owner accounts were created on Devnet with
+`spl-token` 5.6.1; 5.5.0 was rejected by the current Devnet proof program. A
+scripted multi-trader auction against those live accounts remains required.
 
 ---
 
@@ -1200,15 +1222,15 @@ The demo should also show negative tests: corrupted publication proof, invalid p
 
 ## 22. Known risks and unresolved decisions
 
-### 22.1 Must be resolved before claim-circuit implementation
+### 22.1 Frozen in claim circuit v1
 
-- Exact allocation and rounding rule.
-- Conservation and ownership of rounding residuals.
-- Exact claim public inputs and nullifier construction.
+- Exact-index pro-rata allocation with adverse long-side rounding.
+- Rounding residuals remain in the shared market vault.
+- One Poseidon public input binds the complete claim/refund and Token-2022 context; a circuit-derived terminal nullifier is stored in the queued order.
 
 ### 22.2 Feasibility risks
 
-- Source-proof generation for confidential transfers from a shared vault.
+- Serialized source-proof generation for confidential transfers from a shared vault.
 - Committee-independent refund liveness.
 - Browser-WASM memory and latency for the 234k order and 311k fold circuits.
 

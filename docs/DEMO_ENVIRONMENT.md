@@ -14,8 +14,9 @@ automatic approval. They are test assets with no claim on BTC or USD.
 
 The repository pins Anchor 1.1.2 and Solana/Agave 3.1.10 in `Anchor.toml` for
 reproducible program builds. That is an intentional matched build pair. The
-mint script also expects `spl-token` 5.5.0 or newer because its interface
-includes both embedded metadata and confidential-transfer commands.
+mint script requires `spl-token` 5.6.1 or newer because current Devnet rejects
+the public-key-validity proof produced by 5.5.0. The newer interface includes
+both embedded metadata and confidential-transfer commands.
 
 Check the machine without installing anything:
 
@@ -79,6 +80,16 @@ scripts/demo/setup-test-tokens.sh \
 Devnet keys and addresses are isolated under `.demo/devnet/`. The script
 explicitly refuses any cluster other than localnet or Devnet.
 
+The October 2026 Devnet checkpoint deployed BeatEx and created:
+
+| Item | Devnet address |
+| --- | --- |
+| BeatEx program | `2P37xv7CzDv7pSet6LaXJDq4m1auW3pZ8PzPLtErfsVd` |
+| tBTC mint | `33D68TXfhVb8qiKXBF6yob5opkaeD4ayPsNPketQdgxm` |
+| tBTC owner account | `AELxK7o5px97XjhMYuEBQunMBXTCQUebqbyzeqEvcnoJ` |
+| tUSD mint | `7Fg3pJw2stGKi7WTQRYNsWYqYrFcuwziD8C5HpH9s9Ng` |
+| tUSD owner account | `8fRxn1rXBtJoBSVNT5CiVXQZzBdib5CAbBJ1da2gH6Up` |
+
 Before the public demo, replace the default metadata URI with a hosted JSON
 base URI:
 
@@ -92,6 +103,9 @@ scripts/demo/setup-test-tokens.sh \
 The local integration suite uses the official Token-2022 v11.0.0 SBF artifact.
 Native confidential proof execution remains an integration gate that must be
 tested on the chosen cluster rather than inferred from host or LiteSVM tests.
+
+Devnet token-account configuration was validated with `spl-token` 5.6.1. The
+setup script checks this minimum before creating any new state.
 
 ## Build and deploy BeatEx
 

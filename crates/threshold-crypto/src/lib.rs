@@ -13,7 +13,7 @@ use {
     rand::rngs::OsRng,
     sha2::{Digest, Sha256},
     solana_zk_sdk::encryption::{
-        elgamal::{ElGamalCiphertext, ElGamalKeypair, ElGamalPubkey},
+        elgamal::{ElGamalCiphertext, ElGamalKeypair, ElGamalPubkey, ElGamalSecretKey},
         pedersen::{G, H},
     },
     std::collections::BTreeSet,
@@ -199,6 +199,10 @@ pub enum ThresholdError {
     InvalidDecryptionProof(u64),
     #[error("the claimed plaintext does not match the threshold decryption")]
     PlaintextMismatch,
+    #[error("participant index {0} supplied an invalid secret share")]
+    InvalidSecretShare(u64),
+    #[error("the reconstructed secret does not match the committee encryption key")]
+    ReconstructedKeyMismatch,
 }
 
 /// Create the prototype's fixed 3-of-7 dealer-assisted committee.
@@ -283,6 +287,54 @@ pub fn dealer_setup(
         public,
         secret_shares,
     })
+}
+
+/// Reconstruct the committee ElGamal key from a threshold-sized set of secret
+/// shares and verify it against the registered public configuration.
+///
+/// This is intentionally an offchain-only escape hatch for Token-2022 proof
+/// generation. The returned SDK keypair zeroizes its secret on drop. Callers
+/// should keep its lifetime as short as possible and must not persist the
+/// reconstructed key.
+pub fn reconstruct_elgamal_keypair(
+    config: &ThresholdPublicConfig,
+    shares: &[&ParticipantSecretShare],
+) -> Result<ElGamalKeypair, ThresholdError> {
+    if shares.len() < config.threshold {
+        return Err(ThresholdError::InsufficientShares);
+    }
+
+    let mut seen_indices = BTreeSet::new();
+    for share in shares {
+        if !seen_indices.insert(share.index) {
+            return Err(ThresholdError::DuplicateParticipant(share.index));
+        }
+        let registered = config
+            .participant(share.index)
+            .ok_or(ThresholdError::UnknownParticipant(share.index))?;
+        if registered != &share.public || share.scalar * *H != share.public.point {
+            return Err(ThresholdError::InvalidSecretShare(share.index));
+        }
+    }
+
+    let mut master_secret = Scalar::ZERO;
+    for share in shares {
+        let x_i = Scalar::from(share.index);
+        let coefficient = shares
+            .iter()
+            .filter(|other| other.index != share.index)
+            .fold(Scalar::ONE, |coefficient, other| {
+                let x_j = Scalar::from(other.index);
+                coefficient * (-x_j) * (x_i - x_j).invert()
+            });
+        master_secret += coefficient * share.scalar;
+    }
+
+    let keypair = ElGamalKeypair::new(ElGamalSecretKey::from(master_secret));
+    if keypair.pubkey() != &config.encryption_pubkey {
+        return Err(ThresholdError::ReconstructedKeyMismatch);
+    }
+    Ok(keypair)
 }
 
 impl ThresholdPublicConfig {
@@ -658,6 +710,50 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn every_three_of_seven_subset_reconstructs_the_registered_key() {
+        let setup = dealer_setup_3_of_7(SETUP_CONTEXT);
+
+        for first in 0..5 {
+            for second in (first + 1)..6 {
+                for third in (second + 1)..7 {
+                    let shares = [
+                        &setup.secret_shares[first],
+                        &setup.secret_shares[second],
+                        &setup.secret_shares[third],
+                    ];
+                    let keypair = reconstruct_elgamal_keypair(&setup.public, &shares).unwrap();
+                    assert_eq!(keypair.pubkey(), &setup.public.encryption_pubkey);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reconstruction_rejects_duplicate_and_mismatched_shares() {
+        let setup = dealer_setup_3_of_7(SETUP_CONTEXT);
+        let duplicate = [
+            &setup.secret_shares[0],
+            &setup.secret_shares[0],
+            &setup.secret_shares[2],
+        ];
+        assert!(matches!(
+            reconstruct_elgamal_keypair(&setup.public, &duplicate),
+            Err(ThresholdError::DuplicateParticipant(1))
+        ));
+
+        let other_setup = dealer_setup_3_of_7(b"another-key-epoch");
+        let mixed = [
+            &setup.secret_shares[0],
+            &setup.secret_shares[1],
+            &other_setup.secret_shares[2],
+        ];
+        assert!(matches!(
+            reconstruct_elgamal_keypair(&setup.public, &mixed),
+            Err(ThresholdError::InvalidSecretShare(3))
+        ));
     }
 
     #[test]

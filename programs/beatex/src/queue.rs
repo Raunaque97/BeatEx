@@ -18,9 +18,17 @@ pub const ELGAMAL_CIPHERTEXT_BYTES: usize = 64;
 /// Digest size used to bind ciphertext account data to Groth16 public inputs.
 pub const QUEUE_DIGEST_BYTES: usize = 32;
 pub const QUEUE_CIRCUIT_VERSION: u16 = 1;
+/// Order circuit v1 range-constrains each per-level quantity to four bits.
+pub const MAX_PRIVATE_ORDER_QUANTITY: u64 = 15;
 /// Version 2 replaces per-entry threshold interpolation with one
 /// transcript-randomized batch equation while preserving full curve output.
 pub const AGGREGATE_PUBLICATION_CIRCUIT_VERSION: u16 = 2;
+/// First private-claim circuit version. Its arithmetic and transcript are
+/// intentionally versioned independently from order submission.
+pub const PRIVATE_CLAIM_CIRCUIT_VERSION: u16 = 1;
+/// First cancellation-refund circuit version. A distinct proof kind prevents
+/// a refund proof from being replayed through the settled-auction claim path.
+pub const CANCELLATION_REFUND_CIRCUIT_VERSION: u16 = 1;
 
 pub type EncryptedValue = [u8; ELGAMAL_CIPHERTEXT_BYTES];
 pub type EncryptedOrder = [EncryptedValue; QUEUED_CIPHERTEXT_COUNT];
@@ -35,6 +43,26 @@ pub enum QueuedOrderState {
     Folded = 1,
 }
 
+/// Settlement state is independent from aggregate-fold state. In particular,
+/// a cancelled auction must be able to refund an accepted order that was never
+/// folded before the aggregation timeout.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, Eq, InitSpace, PartialEq)]
+#[borsh(use_discriminant = true)]
+#[repr(u8)]
+pub enum WithdrawalState {
+    Pending = 0,
+    Claimed = 1,
+    Refunded = 2,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, Eq, InitSpace, PartialEq)]
+#[borsh(use_discriminant = true)]
+#[repr(u8)]
+pub enum WithdrawalKind {
+    Claim = 0,
+    Refund = 1,
+}
+
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, Eq, InitSpace, PartialEq)]
 #[borsh(use_discriminant = true)]
 #[repr(u8)]
@@ -45,15 +73,24 @@ pub enum QueueCircuitKind {
     BalanceDeposit = 2,
     /// Publishes the plaintext aggregate curves after threshold decryption.
     ///
-    /// Keep this last: the explicit discriminants are part of the verification
-    /// key PDA namespace and may not be renumbered.
     AggregatePublication = 3,
+    /// Proves one private allocation and binds its confidential payouts.
+    PrivateClaim = 4,
+    /// Proves return of the original reserves after auction cancellation.
+    ///
+    /// Explicit discriminants are part of the verification-key PDA namespace.
+    /// Existing variants must never be renumbered; new variants append here.
+    CancellationRefund = 5,
 }
 
 pub const fn circuit_version(kind: QueueCircuitKind) -> u16 {
     match kind {
         QueueCircuitKind::AggregatePublication => AGGREGATE_PUBLICATION_CIRCUIT_VERSION,
-        _ => QUEUE_CIRCUIT_VERSION,
+        QueueCircuitKind::PrivateClaim => PRIVATE_CLAIM_CIRCUIT_VERSION,
+        QueueCircuitKind::CancellationRefund => CANCELLATION_REFUND_CIRCUIT_VERSION,
+        QueueCircuitKind::OrderSubmission
+        | QueueCircuitKind::AggregateFold
+        | QueueCircuitKind::BalanceDeposit => QUEUE_CIRCUIT_VERSION,
     }
 }
 
@@ -145,6 +182,10 @@ pub struct QueuedOrder {
     pub client_order_nonce: u64,
     pub sequence: u64,
     pub state: QueuedOrderState,
+    pub withdrawal_state: WithdrawalState,
+    /// Circuit-derived terminal nullifier. It remains zero while pending and is
+    /// written atomically with the eventual claim or refund token movement.
+    pub terminal_nullifier: [u8; QUEUE_DIGEST_BYTES],
     #[max_len(2176)]
     pub ciphertexts: Vec<u8>,
     /// Hash of the canonical auction/order metadata and all ciphertext bytes.
@@ -221,7 +262,38 @@ pub enum QueueInvariantError {
     AggregationAlreadyComplete,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WithdrawalInvariantError {
+    ClaimRequiresFoldedOrder,
+    AlreadyWithdrawn,
+}
+
 pub type QueueInvariantResult<T> = core::result::Result<T, QueueInvariantError>;
+pub type WithdrawalInvariantResult<T> = core::result::Result<T, WithdrawalInvariantError>;
+
+/// Return the irreversible settlement state for a queued order.
+///
+/// Claims consume only orders proven to be part of the final aggregate.
+/// Refunds deliberately accept either aggregation state because cancellation
+/// may occur with accepted orders still waiting in the queue.
+pub const fn advance_withdrawal(
+    order_state: QueuedOrderState,
+    withdrawal_state: WithdrawalState,
+    kind: WithdrawalKind,
+) -> WithdrawalInvariantResult<WithdrawalState> {
+    if !matches!(withdrawal_state, WithdrawalState::Pending) {
+        return Err(WithdrawalInvariantError::AlreadyWithdrawn);
+    }
+    match (kind, order_state) {
+        (WithdrawalKind::Claim, QueuedOrderState::Folded) => Ok(WithdrawalState::Claimed),
+        (WithdrawalKind::Claim, QueuedOrderState::Accepted) => {
+            Err(WithdrawalInvariantError::ClaimRequiresFoldedOrder)
+        }
+        (WithdrawalKind::Refund, QueuedOrderState::Accepted | QueuedOrderState::Folded) => {
+            Ok(WithdrawalState::Refunded)
+        }
+    }
+}
 
 /// Authorize submission and return `(sequence, next_accepted_count)`.
 ///
@@ -384,6 +456,24 @@ mod tests {
     }
 
     #[test]
+    fn circuit_kinds_are_append_only_and_independently_versioned() {
+        assert_eq!(QueueCircuitKind::OrderSubmission as u8, 0);
+        assert_eq!(QueueCircuitKind::AggregateFold as u8, 1);
+        assert_eq!(QueueCircuitKind::BalanceDeposit as u8, 2);
+        assert_eq!(QueueCircuitKind::AggregatePublication as u8, 3);
+        assert_eq!(QueueCircuitKind::PrivateClaim as u8, 4);
+        assert_eq!(QueueCircuitKind::CancellationRefund as u8, 5);
+        assert_eq!(
+            circuit_version(QueueCircuitKind::PrivateClaim),
+            PRIVATE_CLAIM_CIRCUIT_VERSION
+        );
+        assert_eq!(
+            circuit_version(QueueCircuitKind::CancellationRefund),
+            CANCELLATION_REFUND_CIRCUIT_VERSION
+        );
+    }
+
+    #[test]
     fn submission_assigns_preincrement_sequence() {
         assert_eq!(
             accept_order(QueuePhase::Open, 99, DEADLINES, 41),
@@ -413,6 +503,54 @@ mod tests {
             fold_order_state(QueuedOrderState::Folded),
             Err(QueueInvariantError::OrderAlreadyFolded)
         );
+    }
+
+    #[test]
+    fn claims_require_a_folded_pending_order() {
+        assert_eq!(
+            advance_withdrawal(
+                QueuedOrderState::Folded,
+                WithdrawalState::Pending,
+                WithdrawalKind::Claim,
+            ),
+            Ok(WithdrawalState::Claimed)
+        );
+        assert_eq!(
+            advance_withdrawal(
+                QueuedOrderState::Accepted,
+                WithdrawalState::Pending,
+                WithdrawalKind::Claim,
+            ),
+            Err(WithdrawalInvariantError::ClaimRequiresFoldedOrder)
+        );
+    }
+
+    #[test]
+    fn cancellation_refunds_accepted_or_folded_orders() {
+        for order_state in [QueuedOrderState::Accepted, QueuedOrderState::Folded] {
+            assert_eq!(
+                advance_withdrawal(
+                    order_state,
+                    WithdrawalState::Pending,
+                    WithdrawalKind::Refund,
+                ),
+                Ok(WithdrawalState::Refunded)
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_withdrawals_cannot_be_replayed_or_changed() {
+        for withdrawal_state in [WithdrawalState::Claimed, WithdrawalState::Refunded] {
+            for order_state in [QueuedOrderState::Accepted, QueuedOrderState::Folded] {
+                for kind in [WithdrawalKind::Claim, WithdrawalKind::Refund] {
+                    assert_eq!(
+                        advance_withdrawal(order_state, withdrawal_state, kind),
+                        Err(WithdrawalInvariantError::AlreadyWithdrawn)
+                    );
+                }
+            }
+        }
     }
 
     #[test]

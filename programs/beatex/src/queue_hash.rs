@@ -2,7 +2,8 @@
 
 use {
     crate::{
-        queue::{EncryptedOrder, EncryptedValue, QUEUED_CIPHERTEXT_COUNT},
+        queue::{EncryptedOrder, EncryptedValue, WithdrawalKind, QUEUED_CIPHERTEXT_COUNT},
+        token2022::TransferProofBinding,
         BeatExError,
     },
     anchor_lang::prelude::*,
@@ -45,8 +46,21 @@ const AGGREGATE_PUBLICATION_DOMAIN: [u8; 32] = [
     127, 140, 212, 251, 15, 85, 102, 242, 234, 78, 218, 28, 27, 68, 89, 72, 136, 155, 32, 56, 121,
     130, 126, 98, 114, 162, 223, 31, 24, 175, 167, 8,
 ];
+const PRIVATE_CLAIM_DOMAIN: [u8; 32] = [
+    66, 101, 97, 116, 69, 120, 32, 112, 114, 105, 118, 97, 116, 101, 32, 99, 108, 97, 105, 109, 32,
+    118, 49, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+];
+const CANCELLATION_REFUND_DOMAIN: [u8; 32] = [
+    66, 101, 97, 116, 69, 120, 32, 99, 97, 110, 99, 101, 108, 108, 97, 116, 105, 111, 110, 32, 114,
+    101, 102, 117, 110, 100, 32, 118, 49, 0, 0, 0,
+];
+const RISTRETTO_BRIDGE_DOMAIN: [u8; 32] = [
+    154, 216, 184, 238, 238, 231, 196, 56, 82, 47, 154, 41, 150, 46, 110, 25, 49, 227, 251, 180,
+    211, 250, 214, 198, 119, 182, 173, 209, 11, 186, 174, 47,
+];
 
 pub const FOLD_BATCH_SIZE: usize = 4;
+pub const PRIVATE_WITHDRAWAL_OPAQUE_FIELDS: usize = 86;
 
 pub struct OrderStatement<'a> {
     pub auction: &'a Pubkey,
@@ -110,6 +124,44 @@ pub struct AggregatePublicationStatement<'a> {
     pub aggregate: &'a [u8],
     pub demand: &'a [u64; 17],
     pub supply: &'a [u64; 17],
+}
+
+/// Public data bound by a private claim or cancellation refund proof. Token
+/// proof contexts are included in full: the Groth16 proof therefore cannot be
+/// replayed with a different transfer ciphertext, destination key, or
+/// post-transfer vault ciphertext.
+pub struct PrivateWithdrawalStatement<'a> {
+    pub kind: WithdrawalKind,
+    pub market: &'a Pubkey,
+    pub auction: &'a Pubkey,
+    pub order: &'a Pubkey,
+    pub owner: &'a Pubkey,
+    pub key_epoch: &'a Pubkey,
+    pub client_order_nonce: u64,
+    pub sequence: u64,
+    pub allocation_rule_version: u16,
+    pub order_circuit_version: u16,
+    pub claim_circuit_version: u16,
+    pub order_commitment: [u8; 32],
+    pub clearing_index: u8,
+    pub clearing_price: u64,
+    pub demand_at_clearing: u64,
+    pub supply_at_clearing: u64,
+    pub clearing_volume: u64,
+    pub terminal_nullifier: [u8; 32],
+    pub base_mint: &'a Pubkey,
+    pub quote_mint: &'a Pubkey,
+    pub base_vault: &'a Pubkey,
+    pub quote_vault: &'a Pubkey,
+    pub base_destination: &'a Pubkey,
+    pub quote_destination: &'a Pubkey,
+    pub base_transfer: &'a TransferProofBinding,
+    pub quote_transfer: &'a TransferProofBinding,
+    pub base_new_decryptable_balance: &'a [u8; 36],
+    pub quote_new_decryptable_balance: &'a [u8; 36],
+    pub base_amount_commitment: [u8; 32],
+    pub quote_amount_commitment: [u8; 32],
+    pub batched_amount_commitment: [u8; 32],
 }
 
 pub fn order_statement_digest(statement: &OrderStatement<'_>) -> Result<[u8; 32]> {
@@ -282,6 +334,125 @@ pub fn aggregate_publication_statement_digest(
     transcript.finish()
 }
 
+pub fn private_withdrawal_statement_digest(
+    statement: &PrivateWithdrawalStatement<'_>,
+) -> Result<[u8; 32]> {
+    validate_field(&statement.order_commitment)?;
+    validate_field(&statement.terminal_nullifier)?;
+    require!(
+        statement.terminal_nullifier != ZERO,
+        BeatExError::InvalidWithdrawalNullifier
+    );
+
+    let mut transcript = TranscriptBuilder::new();
+    transcript.push(match statement.kind {
+        WithdrawalKind::Claim => PRIVATE_CLAIM_DOMAIN,
+        WithdrawalKind::Refund => CANCELLATION_REFUND_DOMAIN,
+    })?;
+    transcript.push(ONE)?;
+    for key in [
+        statement.market,
+        statement.auction,
+        statement.order,
+        statement.owner,
+        statement.key_epoch,
+    ] {
+        transcript.push_raw_32(&key.to_bytes())?;
+    }
+    transcript.push(u64_field(statement.client_order_nonce))?;
+    transcript.push(u64_field(statement.sequence))?;
+    transcript.push(u64_field(u64::from(statement.allocation_rule_version)))?;
+    transcript.push(u64_field(u64::from(statement.order_circuit_version)))?;
+    transcript.push(u64_field(u64::from(statement.claim_circuit_version)))?;
+    transcript.push(statement.order_commitment)?;
+    transcript.push(u64_field(u64::from(statement.clearing_index)))?;
+    transcript.push(u64_field(statement.clearing_price))?;
+    transcript.push(u64_field(statement.demand_at_clearing))?;
+    transcript.push(u64_field(statement.supply_at_clearing))?;
+    transcript.push(u64_field(statement.clearing_volume))?;
+    transcript.push(statement.terminal_nullifier)?;
+    for field in private_withdrawal_opaque_fields(statement)? {
+        transcript.push(field)?;
+    }
+    transcript.push_raw_32(&statement.base_amount_commitment)?;
+    transcript.push_raw_32(&statement.quote_amount_commitment)?;
+    transcript.push_raw_32(&statement.batched_amount_commitment)?;
+    transcript.finish()
+}
+
+/// Return the fixed 86-field public-context portion shared with the exact
+/// claim/refund circuit. Keeping this encoder in the program crate prevents an
+/// offchain coordinator from silently drifting from the onchain transcript.
+pub fn private_withdrawal_opaque_fields(
+    statement: &PrivateWithdrawalStatement<'_>,
+) -> Result<Vec<[u8; 32]>> {
+    let mut fields = Vec::with_capacity(PRIVATE_WITHDRAWAL_OPAQUE_FIELDS);
+    for key in [
+        statement.base_mint,
+        statement.quote_mint,
+        statement.base_vault,
+        statement.quote_vault,
+        statement.base_destination,
+        statement.quote_destination,
+    ] {
+        fields.extend(raw_32_fields(&key.to_bytes()));
+    }
+    append_transfer_binding_fields(&mut fields, statement.base_transfer);
+    append_transfer_binding_fields(&mut fields, statement.quote_transfer);
+    append_raw_fields(&mut fields, statement.base_new_decryptable_balance);
+    append_raw_fields(&mut fields, statement.quote_new_decryptable_balance);
+    require!(
+        fields.len() == PRIVATE_WITHDRAWAL_OPAQUE_FIELDS,
+        BeatExError::InvalidCurveInput
+    );
+    Ok(fields)
+}
+
+fn append_transfer_binding_fields(fields: &mut Vec<[u8; 32]>, binding: &TransferProofBinding) {
+    for key in [
+        binding.source_pubkey,
+        binding.destination_pubkey,
+        binding.auditor_pubkey,
+    ] {
+        fields.extend(raw_32_fields(&key));
+    }
+    append_raw_fields(fields, &binding.new_source_ciphertext);
+    for ciphertext in binding
+        .ciphertexts_lo
+        .iter()
+        .chain(binding.ciphertexts_hi.iter())
+    {
+        append_raw_fields(fields, ciphertext);
+    }
+}
+
+fn append_raw_fields(fields: &mut Vec<[u8; 32]>, bytes: &[u8]) {
+    for chunk in bytes.chunks(16) {
+        let mut field = [0u8; 32];
+        field[..chunk.len()].copy_from_slice(chunk);
+        fields.push(field);
+    }
+}
+
+/// Fiat-Shamir coefficient used to combine the base and quote Token-2022
+/// amount commitments. It is fixed after both commitments and uses only its
+/// low 128 bits so the claim circuit can range-bound the combined amount.
+pub fn ristretto_batching_scalar(
+    base_amount_commitment: [u8; 32],
+    quote_amount_commitment: [u8; 32],
+) -> Result<[u8; 32]> {
+    let mut payload = Vec::with_capacity(6);
+    payload.push(RISTRETTO_BRIDGE_DOMAIN);
+    payload.push(ONE);
+    payload.extend(raw_32_fields(&base_amount_commitment));
+    payload.extend(raw_32_fields(&quote_amount_commitment));
+    let digest = transcript_hash(&payload)?;
+    let mut scalar = [0u8; 32];
+    scalar[..16].copy_from_slice(&digest[..16]);
+    require!(scalar[..16] != [0u8; 16], BeatExError::InvalidCurveInput);
+    Ok(scalar)
+}
+
 fn inactive_order_digest(auction: &Pubkey) -> Result<[u8; 32]> {
     let identity = order_bytes(&identity_order());
     let mut payload = Vec::with_capacity(5 + QUEUED_CIPHERTEXT_COUNT * 4);
@@ -380,7 +551,10 @@ fn point_fields(compressed: &[u8; 32]) -> Result<([u8; 32], [u8; 32])> {
 }
 
 fn pubkey_fields(key: &Pubkey) -> [[u8; 32]; 2] {
-    let bytes = key.to_bytes();
+    raw_32_fields(&key.to_bytes())
+}
+
+fn raw_32_fields(bytes: &[u8; 32]) -> [[u8; 32]; 2] {
     let mut low = [0u8; 32];
     let mut high = [0u8; 32];
     low[..16].copy_from_slice(&bytes[..16]);
@@ -466,6 +640,13 @@ impl TranscriptBuilder {
         self.push_point(second)
     }
 
+    fn push_raw_32(&mut self, bytes: &[u8; 32]) -> Result<()> {
+        for field in raw_32_fields(bytes) {
+            self.push(field)?;
+        }
+        Ok(())
+    }
+
     fn flush(&mut self) -> Result<()> {
         let mut inputs = [[0u8; 32]; 12];
         inputs[0] = self.digest;
@@ -491,6 +672,8 @@ impl TranscriptBuilder {
 mod tests {
     use super::*;
     use crate::{groth16, queue::QueueCircuitKind, queue::QueueVerificationKey};
+    use ark_ff::{BigInteger, PrimeField};
+    use beatex_babyjubjub_groth16_spike::claim::{PrivateWithdrawalKind, PrivateWithdrawalWitness};
 
     #[test]
     fn identity_has_canonical_wire_encoding() {
@@ -511,6 +694,107 @@ mod tests {
         let a = transcript_hash(&[ONE, ZERO]).unwrap();
         let b = transcript_hash(&[ZERO, ONE]).unwrap();
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn private_claim_transcript_matches_exact_circuit_schema() {
+        fn field_bytes<F: PrimeField>(value: F) -> [u8; 32] {
+            let bytes = value.into_bigint().to_bytes_le();
+            let mut result = [0u8; 32];
+            result[..bytes.len()].copy_from_slice(&bytes);
+            result
+        }
+        fn packed_32(cursor: &mut u64) -> [u8; 32] {
+            let mut bytes = [0u8; 32];
+            bytes[..8].copy_from_slice(&cursor.to_le_bytes());
+            *cursor += 1;
+            bytes[16..24].copy_from_slice(&cursor.to_le_bytes());
+            *cursor += 1;
+            bytes
+        }
+        fn packed_64(cursor: &mut u64) -> [u8; 64] {
+            let first = packed_32(cursor);
+            let second = packed_32(cursor);
+            let mut bytes = [0u8; 64];
+            bytes[..32].copy_from_slice(&first);
+            bytes[32..].copy_from_slice(&second);
+            bytes
+        }
+        fn binding(cursor: &mut u64) -> TransferProofBinding {
+            TransferProofBinding {
+                source_pubkey: packed_32(cursor),
+                destination_pubkey: packed_32(cursor),
+                auditor_pubkey: packed_32(cursor),
+                new_source_ciphertext: packed_64(cursor),
+                ciphertexts_lo: std::array::from_fn(|_| packed_64(cursor)),
+                ciphertexts_hi: std::array::from_fn(|_| packed_64(cursor)),
+            }
+        }
+        fn ae(cursor: &mut u64) -> [u8; 36] {
+            let mut bytes = [0u8; 36];
+            for chunk in bytes.chunks_mut(16) {
+                let copied = chunk.len().min(8);
+                chunk[..copied].copy_from_slice(&cursor.to_le_bytes()[..copied]);
+                *cursor += 1;
+            }
+            bytes
+        }
+        fn pubkey(low: u64, high: u64) -> Pubkey {
+            let mut bytes = [0u8; 32];
+            bytes[..8].copy_from_slice(&low.to_le_bytes());
+            bytes[16..24].copy_from_slice(&high.to_le_bytes());
+            Pubkey::new_from_array(bytes)
+        }
+
+        let witness = PrivateWithdrawalWitness::deterministic(PrivateWithdrawalKind::Claim);
+        let mut cursor = 100u64;
+        let base_mint = Pubkey::new_from_array(packed_32(&mut cursor));
+        let quote_mint = Pubkey::new_from_array(packed_32(&mut cursor));
+        let base_vault = Pubkey::new_from_array(packed_32(&mut cursor));
+        let quote_vault = Pubkey::new_from_array(packed_32(&mut cursor));
+        let base_destination = Pubkey::new_from_array(packed_32(&mut cursor));
+        let quote_destination = Pubkey::new_from_array(packed_32(&mut cursor));
+        let base_transfer = binding(&mut cursor);
+        let quote_transfer = binding(&mut cursor);
+        let base_ae = ae(&mut cursor);
+        let quote_ae = ae(&mut cursor);
+        assert_eq!(cursor, 186);
+
+        let digest = private_withdrawal_statement_digest(&PrivateWithdrawalStatement {
+            kind: WithdrawalKind::Claim,
+            market: &pubkey(11, 12),
+            auction: &pubkey(21, 22),
+            order: &pubkey(31, 32),
+            owner: &pubkey(41, 42),
+            key_epoch: &pubkey(51, 52),
+            client_order_nonce: witness.client_order_nonce,
+            sequence: witness.sequence,
+            allocation_rule_version: witness.allocation_rule_version,
+            order_circuit_version: witness.order_circuit_version,
+            claim_circuit_version: witness.claim_circuit_version,
+            order_commitment: field_bytes(witness.order_commitment()),
+            clearing_index: witness.clearing_index,
+            clearing_price: witness.clearing_price,
+            demand_at_clearing: witness.demand,
+            supply_at_clearing: witness.supply,
+            clearing_volume: witness.clearing_volume,
+            terminal_nullifier: field_bytes(witness.nullifier()),
+            base_mint: &base_mint,
+            quote_mint: &quote_mint,
+            base_vault: &base_vault,
+            quote_vault: &quote_vault,
+            base_destination: &base_destination,
+            quote_destination: &quote_destination,
+            base_transfer: &base_transfer,
+            quote_transfer: &quote_transfer,
+            base_new_decryptable_balance: &base_ae,
+            quote_new_decryptable_balance: &quote_ae,
+            base_amount_commitment: witness.bridge.base_commitment,
+            quote_amount_commitment: witness.bridge.quote_commitment,
+            batched_amount_commitment: witness.bridge.batched_commitment,
+        })
+        .unwrap();
+        assert_eq!(digest, field_bytes(witness.digest()));
     }
 
     #[test]

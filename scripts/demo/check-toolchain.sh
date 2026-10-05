@@ -24,7 +24,7 @@ check_command solana 'Solana/Agave CLI 3.1.10'
 check_command solana-keygen 'bundled with Solana/Agave CLI 3.1.10'
 check_command solana-test-validator 'bundled with Solana/Agave CLI 3.1.10'
 check_command cargo-build-sbf 'platform tools installed by Solana/Agave CLI'
-check_command spl-token 'SPL Token CLI 5.5.0 or newer'
+check_command spl-token 'SPL Token CLI 5.6.1 or newer (required for current Devnet ZK proofs)'
 
 if (( failures > 0 )); then
   printf '\n%d required command(s) are missing. No tools were installed.\n' "$failures"

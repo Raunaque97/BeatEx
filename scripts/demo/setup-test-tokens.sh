@@ -106,6 +106,17 @@ for required_command in solana solana-keygen spl-token; do
   fi
 done
 
+token_cli_version="$(spl-token --version | awk '{print $2}')"
+if [[ ! "$token_cli_version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+) ]] \
+  || (( BASH_REMATCH[1] < 5 )) \
+  || (( BASH_REMATCH[1] == 5 && BASH_REMATCH[2] < 6 )) \
+  || (( BASH_REMATCH[1] == 5 && BASH_REMATCH[2] == 6 && BASH_REMATCH[3] < 1 )); then
+  printf 'SPL Token CLI 5.6.1 or newer is required; found %s.\n' \
+    "$token_cli_version" >&2
+  printf 'Older clients generate confidential-account proofs rejected by current Devnet.\n' >&2
+  exit 1
+fi
+
 umask 077
 mkdir -p "$state_dir"
 config_file="$state_dir/solana-cli.yml"
