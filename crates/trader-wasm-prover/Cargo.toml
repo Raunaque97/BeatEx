@@ -1,0 +1,43 @@
+[package]
+name = "beatex-trader-wasm-prover"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+license = "Apache-2.0"
+publish = false
+description = "Browser WASM Groth16 prover for BeatEx trader operations"
+
+# This package is built and published independently from the host workspace.
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+doctest = false
+
+[[bin]]
+name = "export-devnet-keys"
+path = "src/bin/export-devnet-keys.rs"
+required-features = ["devnet-key-export"]
+
+[features]
+default = []
+devnet-key-export = ["dep:serde_json", "dep:sha2"]
+
+[dependencies]
+beatex-babyjubjub-groth16-spike = { path = "../babyjubjub-groth16-spike" }
+getrandom = { version = "=0.2.17", features = ["js"] }
+js-sys = "=0.3.77"
+rand = "=0.8.6"
+serde = { version = "=1.0.228", features = ["derive"] }
+serde-wasm-bindgen = "=0.6.5"
+serde_bytes = "=0.11.19"
+serde_json = { version = "=1.0.145", optional = true }
+sha2 = { version = "=0.10.9", optional = true }
+wasm-bindgen = "=0.2.100"
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+opt-level = 3
+panic = "abort"
+strip = "symbols"

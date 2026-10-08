@@ -983,6 +983,37 @@ fn decode_ciphertext_order(
 }
 
 impl OrderProver {
+    /// Load ceremony or environment-specific parameters outside the browser
+    /// setup path. Compressed Arkworks serialization is validated strictly.
+    pub fn from_compressed_bytes(bytes: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
+        Ok(Self {
+            proving_key: deserialize_proving_key(bytes)?,
+        })
+    }
+
+    pub fn to_compressed_bytes(&self) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        serialize_proving_key(&self.proving_key)
+    }
+
+    pub fn from_uncompressed_bytes(bytes: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
+        Ok(Self {
+            proving_key: deserialize_uncompressed_proving_key(bytes)?,
+        })
+    }
+
+    /// Loads an uncompressed proving key whose bytes were authenticated by the caller.
+    pub fn from_trusted_uncompressed_bytes(
+        bytes: &[u8],
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Ok(Self {
+            proving_key: deserialize_trusted_uncompressed_proving_key(bytes)?,
+        })
+    }
+
+    pub fn to_uncompressed_bytes(&self) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        serialize_uncompressed_proving_key(&self.proving_key)
+    }
+
     /// Deterministic setup for Devnet testing only. Production must replace
     /// this with ceremony-generated parameters loaded from an artifact.
     pub fn deterministic_devnet() -> Result<Self, Box<dyn std::error::Error>> {

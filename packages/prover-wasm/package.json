@@ -1,0 +1,38 @@
+{
+  "name": "@beatex/prover-wasm",
+  "version": "0.1.0",
+  "description": "Web Worker hosted WASM prover for BeatEx trader proofs",
+  "type": "module",
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./worker": "./dist/worker.js"
+  },
+  "scripts": {
+    "build:runtime": "bash ../../scripts/build-trader-wasm.sh",
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "test:wasm": "npm run build && node --test test/*.integration.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "peerDependencies": {
+    "@beatex/sdk": "^0.1.0"
+  },
+  "devDependencies": {
+    "@beatex/sdk": "file:../sdk",
+    "typescript": "5.9.3"
+  },
+  "license": "Apache-2.0"
+}

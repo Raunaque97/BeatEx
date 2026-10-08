@@ -60,7 +60,7 @@ export interface OrderProofRequest {
 export interface OrderProofResult extends ProofMetadata {
   readonly proof: Groth16Proof;
   readonly orderCommitment: Bytes32;
-  /** buy ciphertexts followed by sell ciphertexts in canonical grid order. */
+  /** Canonical interleaved order: buy[0], sell[0], buy[1], sell[1], ... */
   readonly ciphertexts: readonly Ciphertext[];
   readonly newEncryptedBase: Ciphertext;
   readonly newEncryptedQuote: Ciphertext;

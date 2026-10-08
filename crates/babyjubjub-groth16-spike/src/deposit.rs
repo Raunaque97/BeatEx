@@ -315,6 +315,37 @@ pub struct DepositProver {
 }
 
 impl DepositProver {
+    /// Load ceremony or environment-specific parameters outside the browser
+    /// setup path. Compressed Arkworks serialization is validated strictly.
+    pub fn from_compressed_bytes(bytes: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
+        Ok(Self {
+            proving_key: deserialize_proving_key(bytes)?,
+        })
+    }
+
+    pub fn to_compressed_bytes(&self) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        serialize_proving_key(&self.proving_key)
+    }
+
+    pub fn from_uncompressed_bytes(bytes: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
+        Ok(Self {
+            proving_key: deserialize_uncompressed_proving_key(bytes)?,
+        })
+    }
+
+    /// Loads an uncompressed proving key whose bytes were authenticated by the caller.
+    pub fn from_trusted_uncompressed_bytes(
+        bytes: &[u8],
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Ok(Self {
+            proving_key: deserialize_trusted_uncompressed_proving_key(bytes)?,
+        })
+    }
+
+    pub fn to_uncompressed_bytes(&self) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        serialize_uncompressed_proving_key(&self.proving_key)
+    }
+
     /// Deterministic setup for Devnet testing only. Production must replace
     /// this with ceremony-generated parameters loaded from an artifact.
     pub fn deterministic_devnet() -> Result<Self, Box<dyn std::error::Error>> {
@@ -678,6 +709,30 @@ mod tests {
         };
         let cs = ConstraintSystem::<Fq>::new_ref();
         assert!(circuit.generate_constraints(cs).is_err());
+    }
+
+    #[test]
+    #[ignore = "generates and round-trips deterministic proving parameters"]
+    fn compressed_proving_key_roundtrips_and_rejects_trailing_bytes() {
+        let prover = DepositProver::deterministic_devnet().unwrap();
+        let mut bytes = prover.to_compressed_bytes().unwrap();
+        let expected = prover.verification_key().unwrap();
+        let loaded = DepositProver::from_compressed_bytes(&bytes).unwrap();
+        let actual = loaded.verification_key().unwrap();
+        assert_eq!(actual.alpha_g1, expected.alpha_g1);
+        assert_eq!(actual.beta_g2, expected.beta_g2);
+        assert_eq!(actual.gamma_g2, expected.gamma_g2);
+        assert_eq!(actual.delta_g2, expected.delta_g2);
+        assert_eq!(actual.ic, expected.ic);
+
+        bytes.push(0);
+        assert!(DepositProver::from_compressed_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn malformed_compressed_proving_key_is_rejected() {
+        assert!(DepositProver::from_compressed_bytes(&[]).is_err());
+        assert!(DepositProver::from_compressed_bytes(&[0u8; 32]).is_err());
     }
 
     #[test]

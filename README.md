@@ -222,6 +222,12 @@ replacement, cancellation, internal settlement/refund, rollover, withdrawal,
 read, transaction, prover, and crash-safe private-state APIs. The frontend does
 not need to encode Anchor instructions or manage balance revisions directly.
 
+Trader proof generation is implemented by the companion package at
+[`packages/prover-wasm`](./packages/prover-wasm/). One Web Worker owns a single
+WASM runtime and lazily loads only the balance, order, release, and settlement
+proving keys needed by the current action. Folding and aggregate publication
+remain infrastructure provers and are not shipped to traders.
+
 Create or reuse the test assets, deploy the program, initialize the custody
 vaults, 3-of-7 key epoch and all eight versioned verification-key PDAs, and fund
 the two persistent market-maker identities with one command:
@@ -388,6 +394,18 @@ the aggregation deadline. See
 [`crates/babyjubjub-groth16-spike/RESULTS.md`](./crates/babyjubjub-groth16-spike/RESULTS.md)
 and
 [`crates/babyjub-sbf-spike/README.md`](./crates/babyjub-sbf-spike/README.md).
+
+The production-shaped trader prover now compiles the actual four circuit
+families into a 1.6 MiB `wasm-bindgen` runtime. A real single-threaded Node WASM
+integration generated valid proofs in 1.87 seconds for deposit, 1.95 seconds
+for public withdrawal, 15.21 seconds for a 17-level order, 2.32 seconds for
+collateral release, and 2.63 seconds for
+internal settlement; composed replacement and rollover took 16.00 and 16.29
+seconds. Content-addressed canonical-uncompressed proving keys load in roughly
+22 ms for balance/release/settlement and 174 ms for orders after their SHA-256
+integrity checks; their respective asset sizes are 9.8 MiB, 83.8 MiB, 10.4 MiB,
+and 11.3 MiB. These are WASM integration measurements, not a browser latency
+claim; Chrome memory and latency still need measurement in the final frontend.
 
 The Anchor program stores circuit-specific Groth16 verification keys in
 authority-initialized PDAs seeded by market, proof purpose, and circuit version.

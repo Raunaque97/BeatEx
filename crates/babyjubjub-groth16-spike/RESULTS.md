@@ -48,14 +48,15 @@ instructions and other transaction framing.
 
 ## What remains
 
-- Browser-WASM proving time and peak memory have not been measured for this
-  172k-constraint proving key.
+- Chrome proving time and peak memory have not been measured for this circuit.
+  The production wrapper has been exercised in single-threaded Node WASM; its
+  final 234k-constraint queued-order result is recorded below.
 - The direct onchain path was benchmarked separately in
   `crates/babyjub-sbf-spike`. Sixty-eight additions alone exceed the 1.4M CU
   transaction cap, and syscall-assisted compressed-point recovery costs about
   499k CU for one representative point. Direct Baby Jubjub aggregation is
   therefore rejected for the one-transaction order path.
-- Browser-WASM time and peak memory for the final 234k-constraint queued-order
+- Real-browser time and peak memory for the final 234k-constraint queued-order
   circuit remain to be measured.
 - Compression and subgroup-validation rules must become protocol constants;
   they must not depend implicitly on a future Arkworks serialization change.
@@ -216,3 +217,30 @@ The ordinary 234,166-constraint order proof remains the latency-dominant part
 of rollover at roughly 2.2 seconds. Replacement composes the smaller collateral
 release proof with that same order proof; cancellation needs only the release
 proof.
+
+## Trader WebAssembly integration
+
+`crates/trader-wasm-prover` wraps the four trader circuit families in one
+single-threaded `wasm-bindgen` runtime. `packages/prover-wasm` loads that runtime
+in a worker and fetches content-addressed proving keys on demand. An actual Node
+WebAssembly integration on the development Apple M4 measured:
+
+| Operation | WASM proving time |
+| --- | ---: |
+| Deposit | 1.87 s |
+| Public withdrawal | 1.95 s |
+| Queued order | 15.21 s |
+| Collateral release | 2.32 s |
+| Internal settlement | 2.63 s |
+| Replacement | 16.00 s |
+| Rollover | 16.29 s |
+
+The generated runtime is 1,715,928 bytes. Canonical-uncompressed Devnet keys are
+10,255,792 bytes for balance transitions, 87,865,136 bytes for orders,
+10,941,872 bytes for release, and 11,847,792 bytes for settlement. Key decoding
+is a separate one-time session cost and is intentionally lazy. After SHA-256
+asset authentication, unchecked decoding took 21.6 ms for balance, 173.9 ms for
+order, 21.8 ms for release, and 22.4 ms for settlement. This replaces the
+canonical-compressed format, whose order key was half the size but took 52.87
+seconds to decode. These Node WASM results prove the production boundary works,
+but they do not replace Chrome latency and peak-memory measurements.

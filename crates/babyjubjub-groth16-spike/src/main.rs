@@ -20,7 +20,7 @@ use ark_r1cs_std::{
 use ark_relations::r1cs::{
     ConstraintSynthesizer, ConstraintSystem, ConstraintSystemRef, SynthesisError,
 };
-use ark_serialize::CanonicalSerialize;
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_snark::SNARK;
 use light_poseidon::{parameters::bn254_x5, Poseidon, PoseidonHasher, PoseidonParameters};
 use rand::{CryptoRng, RngCore, SeedableRng};
@@ -45,6 +45,61 @@ pub const ORDER_CIPHERTEXTS: usize = LEVELS * 2;
 const CIPHERTEXTS: usize = ORDER_CIPHERTEXTS + 2;
 const TRANSCRIPT_WIDTH: u8 = 13;
 const TRANSCRIPT_PAYLOAD_PER_FRAME: usize = TRANSCRIPT_WIDTH as usize - 2;
+
+fn deserialize_proving_key(
+    bytes: &[u8],
+) -> Result<ark_groth16::ProvingKey<Bn254>, Box<dyn std::error::Error>> {
+    let mut reader = bytes;
+    let proving_key = ark_groth16::ProvingKey::<Bn254>::deserialize_compressed(&mut reader)?;
+    if !reader.is_empty() {
+        return Err(std::io::Error::other("proving-key artifact contains trailing bytes").into());
+    }
+    Ok(proving_key)
+}
+
+fn serialize_proving_key(
+    proving_key: &ark_groth16::ProvingKey<Bn254>,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut bytes = Vec::with_capacity(proving_key.compressed_size());
+    proving_key.serialize_compressed(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn deserialize_uncompressed_proving_key(
+    bytes: &[u8],
+) -> Result<ark_groth16::ProvingKey<Bn254>, Box<dyn std::error::Error>> {
+    let mut reader = bytes;
+    let proving_key = ark_groth16::ProvingKey::<Bn254>::deserialize_uncompressed(&mut reader)?;
+    if !reader.is_empty() {
+        return Err(std::io::Error::other("proving-key artifact contains trailing bytes").into());
+    }
+    Ok(proving_key)
+}
+
+/// Deserializes a content-addressed proving key without repeating curve checks.
+///
+/// The caller must authenticate `bytes` against a trusted digest before using
+/// this path. This avoids validating hundreds of thousands of immutable curve
+/// points every time a browser restores the same proving key from its cache.
+fn deserialize_trusted_uncompressed_proving_key(
+    bytes: &[u8],
+) -> Result<ark_groth16::ProvingKey<Bn254>, Box<dyn std::error::Error>> {
+    let mut reader = bytes;
+    let proving_key =
+        ark_groth16::ProvingKey::<Bn254>::deserialize_uncompressed_unchecked(&mut reader)?;
+    if !reader.is_empty() {
+        return Err(std::io::Error::other("proving-key artifact contains trailing bytes").into());
+    }
+    Ok(proving_key)
+}
+
+fn serialize_uncompressed_proving_key(
+    proving_key: &ark_groth16::ProvingKey<Bn254>,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut bytes = Vec::with_capacity(proving_key.uncompressed_size());
+    proving_key.serialize_uncompressed(&mut bytes)?;
+    Ok(bytes)
+}
 
 #[derive(Clone, Copy, Debug)]
 struct Ciphertext {

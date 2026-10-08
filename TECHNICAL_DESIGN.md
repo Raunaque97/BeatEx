@@ -1426,7 +1426,7 @@ The Devnet run should also include negative tests: corrupted publication proof, 
 
 - Serialized source-proof generation for confidential transfers from a shared vault.
 - Committee-independent refund liveness.
-- Browser-WASM memory and latency for the 234k order and 311k fold circuits.
+- Final Chrome memory and latency validation for the trader WASM circuits.
 
 ### 22.3 Parameters selected by measurement
 
@@ -1463,6 +1463,34 @@ settlement/refund, atomic rollover, and public withdrawal methods plus market,
 auction, queue, order, and private-balance reads. A pluggable `BeatExProver`
 keeps browser WASM, worker, native bridge, and proving-service implementations
 behind the same typed interface.
+
+`@beatex/prover-wasm` is the official trader implementation of that interface.
+It ships a generated `wasm-bindgen` worker runtime but keeps large proving keys
+as integrity-checked external assets. The balance, order, collateral-release,
+and settlement keys are loaded lazily and cover all seven trader operations by
+composition. Queue folding and aggregate publication are deliberately excluded
+because they are performed by bots and committee infrastructure.
+
+The WASM runtime cannot run trusted setup. It accepts only content-addressed
+Arkworks canonical-uncompressed proving keys. The Devnet asset builder exports
+parameters matching the verification-key PDAs, SHA-256 hashes every artifact,
+pins the serialization format in its manifest, and emits that manifest for the
+browser package. The official loader verifies byte length and digest before the
+runtime skips redundant per-point curve checks. Mainnet requires a separate
+setup and corresponding onchain verification keys.
+
+The first actual-circuit integration in single-threaded Node WebAssembly
+measured approximately 1.87 seconds for deposit, 1.95 seconds for public
+withdrawal, 15.21 seconds for order submission, 2.32 seconds for collateral
+release, and 2.63 seconds for internal
+settlement. Replacement and rollover took 16.00 and 16.29 seconds. The runtime
+is 1,715,928 bytes. The canonical-uncompressed Devnet keys are 10,255,792 bytes
+for balance, 87,865,136 for order, 10,941,872 for release, and 11,847,792 for
+settlement. Their measured decode times were 21.6 ms, 173.9 ms, 21.8 ms, and
+22.4 ms. This encoding intentionally trades download size for eliminating the
+previous 53-second compressed order-key decode. Real Chrome measurements remain
+mandatory because Node WASM timings do not establish browser latency or peak
+memory.
 
 Private state uses a two-phase journal. The SDK compiles, signs, and simulates
 the transaction before staging the next private opening; it records the
