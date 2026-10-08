@@ -3,28 +3,42 @@
 Confidential frequent batch auctions on Solana.
 
 The repository now contains the Anchor program, Baby Jubjub order/fold,
-deposit, aggregate-publication, private-claim, and cancellation-refund Groth16 circuits, Token-2022 confidential
-vault integration, LiteSVM/SBF benchmarks, and local demo-token/deployment
-tooling described in [`TECHNICAL_DESIGN.md`](./TECHNICAL_DESIGN.md).
+deposit, aggregate-publication, settlement, refund, and withdrawal Groth16
+circuits, Token-2022 custody integration, LiteSVM/SBF benchmarks, and local
+test-token/deployment tooling described in
+[`TECHNICAL_DESIGN.md`](./TECHNICAL_DESIGN.md).
+
+The default account model is deposit once, trade repeatedly, and withdraw on
+demand. Public Token-2022 deposits are credited to a private Baby Jubjub
+balance. Settlements and cancellation refunds return value to that encrypted
+balance without token transfers. A later public withdrawal proves the exact
+encrypted-balance debit and transfers both assets from the market vaults in one
+transaction. Individual orders, fills, proceeds, and running balances remain
+private; deposits and public withdrawal amounts are visible. The current
+balance is scoped to one market pair and key epoch. A future shared asset pool
+would require common vault-authority and encryption-key domains across markets;
+it is not implied by this release.
 
 ## Auction FAQ
 
 ### Can one wallet submit more than one order in an auction?
 
-The current program accepts multiple immutable orders: every submission gets a
-new sequence-based PDA, and submitting again does not cancel the earlier order.
-There is no order-cancel or order-replace instruction yet.
-
-The intended replacement design will keep one private `ActiveOrder` per
-`(auction, owner)` without rejecting later submissions. A replace proof will
-release the previous private reserve, lock the replacement reserve, and enqueue
-an encrypted delta `new_order - old_order`. A cancel proof will enqueue
-`-old_order` and return its reserve to the trader's encrypted balance. Folding
+The program keeps one private `ActiveOrder` per `(auction, owner)`. A later
+submission uses `replace_queued_order`: a collateral-release proof restores the
+previous reserve, the ordinary order proof locks the replacement reserve, and
+one immutable queue event records the encrypted transition `new_order -
+old_order`. `cancel_active_order` proves the same reserve release and records
+`-old_order`. Both operations are atomic single transactions. Folding
 all accepted delta events therefore leaves exactly the latest order in the
 aggregate while still allowing bots to fold during collection. The final active
 revision, rather than every historical event, will be claimable. Observers can
 see that an authority submitted, changed, or cancelled an order, but not its
 private quantities.
+
+Each replacement stores a pointer to the immutable prior event rather than
+duplicating its ciphertext curve. Fold bots follow that pointer for the private
+subtraction witness, while the onchain event digest remains bound to both
+curves.
 
 This preserves ordinary cancel/replace UX. It also prevents one signing
 authority from leaving simultaneous opposite orders in the auction, although a
@@ -33,18 +47,25 @@ wallets.
 
 ### Can a market maker claim auction N and place auction N+1's order atomically?
 
-Not by merely packing the existing claim and submission instructions together.
-The claim pays confidential Token-2022 accounts, while submission spends the
-trader's separate Baby Jubjub encrypted balance; the combined payload would
-also be too close to or beyond the transaction-size budget.
+Yes. One version-1 user transaction carries six BeatEx instructions:
+`prepare_rollover`, settlement-proof verification, settlement-statement
+binding, order-proof verification, order-statement binding, and the final
+`rollover_order` mutation. The first proof credits auction N's private settled
+payout directly into the trader's Baby Jubjub encrypted balance; the ordinary
+order proof immediately deducts auction N+1's reserves. The final instruction
+terminally claims the old order and creates the new queue event and active-order
+pointer atomically, with no Token-2022 transfer proof contexts.
 
-The intended optimization is a dedicated `rollover_order` path. One proof
-would settle the old private order into the trader's encrypted balance, deduct
-the next order's reserves, create the new queued order, and terminally mark the
-old order, without withdrawing and redepositing tokens. It should require one
-Groth16 verification and no Token-2022 transfer proof contexts. The prototype
-should initially permit rollover only when both auctions use the same key
-epoch; key-rotation cases can use the existing claim/deposit path.
+The preparation and binding instructions inspect the instructions sysvar to
+require the exact proof/binding/mutation sequence and account mapping in the
+same transaction. They do not leave reusable proof receipts or partially
+prepared rollover state: if any instruction fails, Solana rolls the complete
+transaction back. Splitting the work gives each Groth16 verification and each
+statement-hash reconstruction a fresh SBF heap while preserving one-signature,
+one-transaction UX. The two proofs are independent once their intermediate
+ciphertexts are chosen, so clients can generate them concurrently. Rollover is
+limited to auctions using the same key epoch; key rotation uses the ordinary
+claim and deposit path.
 
 ### How is an auction's reference price selected?
 
@@ -58,7 +79,7 @@ excessive confidence interval, or arithmetic overflow makes initialization fail
 closed. The auction records the chosen reference price and its source.
 
 Pyth already runs its receiver on Solana Devnet, and its sponsored shard-zero
-BTC/USD feed is available there. BeatEx therefore does not need to deploy a demo
+BTC/USD feed is available there. BeatEx therefore does not need to deploy a test
 oracle for tBTC/tUSD. The Devnet account is
 `4cSM2e6rvbGQUFiJbqytoVMi5GgghSMr8LwVrT9VPSPo`, for feed ID
 `e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43`.
@@ -109,9 +130,9 @@ There are seven phases, numbered 0 through 6:
 - **Phase 1 — Plaintext auction core (complete in host and SBF tests)**
 - **Phase 2 — Encrypted queue and proof-backed folding (Anchor + host proofs complete; clean SBF build complete)**
 - **Phase 3 — Committee decryption (Baby Jubjub publication circuit and SBF verification complete)**
-- **Phase 4 — Confidential collateral (proved public deposits and Token-2022 vault linkage complete)**
-- **Phase 5 — Private claims and cancellation fallback (complete in host and SBF tests)**
-- **Phase 6 — Devnet demo hardening (program and named confidential demo assets deployed; scripted full-auction run pending)**
+- **Phase 4 — Custody and encrypted trading balances (complete)**
+- **Phase 5 — Private settlement, cancellation fallback, and public withdrawal (complete in host and SBF tests)**
+- **Phase 6 — Devnet integration (deployed; full fast-ledger lifecycle verified live)**
 
 The completed Phase 0 checkpoint currently provides:
 
@@ -145,10 +166,16 @@ The completed Phase 0 checkpoint currently provides:
   program-bound claim/refund witness;
 - a full production SBF claim using the 2.9-million-constraint Groth16 proof
   and two Token-2022 confidential-transfer CPIs at 265,954 CU;
+- current-SDK Token-2022 proof-context generation using Solana ZK SDK v7;
+  v4 proofs are rejected because the current native proof program applies the
+  newer global transcript domain separator;
 - native two-handle grouped-ciphertext validity and strict four-bit range-proof
   benchmarks in Rust and browser WebAssembly;
 - a clean default-stack SBF build with a measured monolithic grid cap of 17
-  price levels (19 is the first failing account layout).
+  price levels (19 is the first failing account layout);
+- full production-SBF execution of a 17-level order submission at 514,651 CU,
+  a replacement-aware three-order fold at 614,480 CU, and an active-order
+  cancellation at 419,817 CU.
 
 Run the checks with:
 
@@ -160,26 +187,107 @@ cargo clippy --workspace --all-targets -- -D warnings
 Run the current encrypted multi-trader simulation with:
 
 ```sh
-cargo run -p beatex-demo-sim
+cargo run -p beatex-auction-sim
 ```
 
 It encrypts three private order curves, homomorphically aggregates every grid
 entry, verifies participant-specific 3-of-7 decryption-share proofs, publishes
 only the aggregate curves, and applies the deterministic clearing rule.
 
-The current exact private-claim prover is committee-side, not browser-side. On
+The ordinary settlement path uses the 31,880-constraint encrypted-balance
+relation and takes about 0.53 seconds per proof on an Apple M4. The public
+withdrawal reuses the 26,885-constraint deposit relation in reverse and its
+release test, including deterministic setup, completes in under 0.7 seconds.
+Both are single user transactions. The exact Token-2022 confidential-claim
+prover is an optional committee-side path, not the normal trading path. On
 an Apple M4 its Arkworks release benchmark takes 40.833 seconds per proof after
 the one-time setup; host verification is 1.331 ms. The circuit is deliberately
-kept exact while faster proving is treated as demo-hardening work.
+retained for confidential Token-2022 exits. The direct encrypted-balance
+rollover proof and the next order proof can run concurrently.
 
-The hackathon environment uses named Token-2022 test assets `tBTC` and `tUSD`.
+The Devnet environment uses named Token-2022 test assets `tBTC` and `tUSD`.
 The idempotent local-validator/Devnet mint workflow and current toolchain
 requirements are documented in
-[`docs/DEMO_ENVIRONMENT.md`](./docs/DEMO_ENVIRONMENT.md).
+[`docs/DEVNET_ENVIRONMENT.md`](./docs/DEVNET_ENVIRONMENT.md).
 
-The current SBF program is deployed on Devnet at
-`2P37xv7CzDv7pSet6LaXJDq4m1auW3pZ8PzPLtErfsVd`; the retained Devnet tBTC and
-tUSD addresses are recorded in `docs/DEMO_ENVIRONMENT.md`.
+The current 972,376-byte SBF program is deployed on Devnet at
+`2P37xv7CzDv7pSet6LaXJDq4m1auW3pZ8PzPLtErfsVd`; its SHA-256 digest is
+`e8d377290afe956253ba747375977c8ba2e0392239bb8121443085c70725a3e7`.
+The retained Devnet tBTC and tUSD addresses are recorded in
+`docs/DEVNET_ENVIRONMENT.md`.
+
+Create or reuse the test assets, deploy the program, initialize the custody
+vaults, 3-of-7 key epoch and all eight versioned verification-key PDAs, and fund
+the two persistent market-maker identities with one command:
+
+```sh
+scripts/devnet/devnetSetup.sh --wallet /absolute/path/to/devnet-wallet.json
+```
+
+The market-maker process supports either the configured onchain Pyth Devnet
+BTC/USD account or Binance BTC/USDT, applies the same lot-price normalization as
+the program, and generates non-crossed 17-level V-shaped curves. The runner
+starts one process for each source:
+
+```sh
+scripts/devnet/run-market-makers.sh \
+  --reference-price 855 \
+  --tick-size 5
+```
+
+The default executor reads the live slot-derived auction, initializes and funds
+the maker's encrypted balance, generates deposit/order/replacement proofs,
+persists the private opening, and sends a version-1 transaction. Use
+`--print-only` to inspect intents without sending them, or `--executor` to
+replace the built-in adapter.
+
+The reusable `OrderProver` API accepts arbitrary 17-level curves, a canonical
+committee key, and the trader's private encrypted-balance opening. It returns
+all 34 ciphertexts, the updated encrypted balance and opening, order commitment,
+reserve amounts, and a self-verified Solana-format Groth16 proof.
+`ReplacementProver` atomically chains collateral release into that order proof,
+while `MarketMakerRolloverProver` chains the exact settled payout into the next
+auction's order. Cancellation uses the standalone `CollateralReleaseProver`.
+These APIs reject non-canonical points/scalars and private state that does not
+reopen the onchain order commitment.
+`DepositProver` performs the preceding public-token-to-encrypted-balance
+transition for arbitrary amounts and openings. `AggregatePublicationProver`
+accepts a live folded aggregate and committee quorum instead of a fixed fixture.
+The generic [`clients/v1-transaction`](./clients/v1-transaction/) sender handles
+the 4,096-byte version-1 signing and confirmation layer, including multiple
+instructions and additional signers. The stateful adapter in
+`crates/devnet-client` also exposes permissionless `fold`, `publish`, and
+`cancel` commands. `settle-balance` and `refund-balance` credit the encrypted
+ledger, and `withdraw` proves a ledger debit and transfers public Token-2022
+funds. The optional `claim` and `refund` commands retain the slower confidential
+Token-2022 bridge. The adapter also assembles the six-instruction atomic
+rollover transaction used by recurring market makers.
+
+The default fast lifecycle was executed live in auction 1007. Deposit, order,
+fold, aggregate publication, internal settlement, and public withdrawal all
+finalized with zero priority fees. The internal settlement used 154,806 CU;
+the two-asset public withdrawal used 134,005 CU in a 1,031-byte transaction.
+
+The first live Devnet private claim settled auction 18 at 267,107 CU in a
+1,510-byte v1 transaction. The timeout-refund run cancelled auction 14
+permissionlessly and executed its refund at 267,105 CU in 1,510 bytes. Each
+proof-context transaction paid 10,000 lamports because it has two signatures;
+the withdrawal and cleanup transactions paid 5,000 lamports each. Priority fees
+are zero, and all context-account rent is returned during cleanup.
+
+The live recurring-liquidity path rolled the Pyth maker from auction 528 into
+auction 819 in one 4,093-byte transaction. It privately credited a payout of
+9 base units and 7,155 quote units, then placed the next order. The successful
+transaction is
+`3C1j93M4Hc85T5NpzmfJbCCBcyL9wuJ5AgRoYrqH4B8iBcQ8VV5iNCBxme1MAjPLLW2LmBMCLkDu92CVQq49Ck2c`.
+The path was then repeated from a freshly submitted, folded, and settled
+auction 822 into auction 823. That second 4,093-byte rollover consumed 694,958
+CU, paid the 5,000-lamport base fee with zero priority fee, and finalized as
+`4UGNJtAXKwEHFFUKTPtw29LeZrjU73BGfzLinKhPXHArPWY1KySYUBhscWgq9XNXtTkTLxe1tXnsgsh1Ym8sLJfC`.
+The maker then replaced that auction 823 order in one 3,618-byte transaction;
+the two initial/replacement queue deltas folded together and the auction
+settled normally. This verifies that order edits do not require a withdrawal
+or a new auction.
 
 Build the SBF v0 test artifact and run the ignored LiteSVM suite with:
 
@@ -209,12 +317,13 @@ TOKEN_2022_SBF_SO="$PWD/target/deploy-v0/spl_token_2022-11.0.0.so" \
   --test sbf_token2022 -- --ignored --nocapture
 ```
 
-The vault tests exercise PDA signing, Token-2022 `ApplyPendingBalance`, two
-confidential `Transfer` CPIs, and the full proved-deposit path. The latter
-performs two public `TransferChecked` CPIs followed by two confidential
-`Deposit` CPIs, then commits the same amounts to the trader's encrypted
-balance. Measured costs are 15,601 CU for apply-pending, 51,258 CU for two
-transfers, and 157,151 CU for the complete two-asset deposit instruction.
+The vault tests exercise PDA signing, the optional Token-2022 confidential
+bridge, and the default public-custody path. The default proved deposit performs
+two public `TransferChecked` CPIs and commits the same amounts to the trader's
+encrypted balance; the proved withdrawal performs the reverse encrypted
+transition and two signed public transfers. Current SBF measurements are
+132,113 CU for deposit, 132,157 CU for withdrawal, and 121,209 CU for an
+internal cancellation refund.
 
 Run the expensive exact production-claim fixture separately in release mode:
 

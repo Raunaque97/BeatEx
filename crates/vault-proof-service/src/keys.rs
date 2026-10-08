@@ -3,7 +3,7 @@ use {
     beatex_threshold_crypto::{
         reconstruct_elgamal_keypair, ParticipantSecretShare, ThresholdPublicConfig,
     },
-    solana_zk_sdk_v4::encryption::{
+    solana_zk_sdk::encryption::{
         auth_encryption::AeKey,
         elgamal::{ElGamalKeypair, ElGamalSecretKey},
     },
@@ -32,9 +32,9 @@ impl VaultElGamalKeypair {
         let reconstructed = reconstruct_elgamal_keypair(config, &shares)
             .map_err(|error| VaultProofError::ThresholdReconstruction(error.to_string()))?;
 
-        // Token-2022 v11's proof-generation crate is pinned to solana-zk-sdk
-        // v4, while the committee crate uses v7. The canonical scalar encoding
-        // is the compatibility boundary. Keep the copied bytes zeroizing.
+        // The committee and current Token-2022 proof generator both use the
+        // current SDK. Reconstruct through the canonical scalar encoding and
+        // keep the copied secret bytes zeroizing.
         let secret_bytes = Zeroizing::new(*reconstructed.secret().as_bytes());
         let secret = ElGamalSecretKey::try_from(secret_bytes.as_slice()).map_err(|_| {
             VaultProofError::ThresholdReconstruction(

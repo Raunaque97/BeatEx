@@ -23,21 +23,25 @@ use ark_relations::r1cs::{
 use ark_serialize::CanonicalSerialize;
 use ark_snark::SNARK;
 use light_poseidon::{parameters::bn254_x5, Poseidon, PoseidonHasher, PoseidonParameters};
-use rand::SeedableRng;
+use rand::{CryptoRng, RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 
 pub mod claim;
 pub mod decryption;
 pub mod deposit;
+pub mod release;
 pub mod ristretto_bridge;
+pub mod rollover;
 pub mod transition;
 
-const LEVELS: usize = 17;
+pub type SolanaProofBytes = ([u8; 64], [u8; 128], [u8; 64], [u8; 32]);
+
+pub const LEVELS: usize = 17;
 const QUANTITY_BITS: usize = 4;
 const PRICE_BITS: usize = 64;
 const QUOTE_COLLATERAL_BITS: usize = PRICE_BITS + QUANTITY_BITS;
 const RANDOMNESS_BITS: usize = JubjubScalar::MODULUS_BIT_SIZE as usize;
-const ORDER_CIPHERTEXTS: usize = LEVELS * 2;
+pub const ORDER_CIPHERTEXTS: usize = LEVELS * 2;
 const CIPHERTEXTS: usize = ORDER_CIPHERTEXTS + 2;
 const TRANSCRIPT_WIDTH: u8 = 13;
 const TRANSCRIPT_PAYLOAD_PER_FRAME: usize = TRANSCRIPT_WIDTH as usize - 2;

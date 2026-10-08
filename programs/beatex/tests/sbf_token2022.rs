@@ -6,12 +6,17 @@ use {
         AccountSerialize, InstructionData,
     },
     beatex::{
-        Auction, AuctionState, ConfidentialTransferArgs, DepositCollateralArgs, DleqProofInput,
-        EncryptedPrivateBalance, Groth16ProofInput, KeyEpoch, Market, Order, OrderState,
-        PrivateWithdrawalArgs, QueueCircuitKind, QueueVerificationKey, QueuedOrder,
-        QueuedOrderState, WithdrawalState,
+        ActiveOrder, Auction, AuctionState, ConfidentialTransferArgs, DepositCollateralArgs,
+        DleqProofInput, EncryptedPrivateBalance, Groth16ProofInput, KeyEpoch, Market, Order,
+        OrderState, PrivateWithdrawalArgs, QueueCircuitKind, QueueVerificationKey, QueuedOrder,
+        QueuedOrderState, WithdrawPublicBalanceArgs, WithdrawalState,
+    },
+    beatex_babyjubjub_groth16_spike::{
+        deposit::{DepositProofRequest, DepositProver, PublicWithdrawalProofRequest},
+        transition::{self, PrivateBalanceOpening},
     },
     litesvm::LiteSVM,
+    rand_chacha::{rand_core::SeedableRng, ChaCha20Rng},
     solana_account::Account,
     solana_compute_budget_interface::ComputeBudgetInstruction,
     solana_instruction::{AccountMeta, Instruction},
@@ -584,7 +589,7 @@ fn vault_pda_transfers_with_preverified_context_accounts() {
 
 #[test]
 #[ignore = "requires BeatEx and official Token-2022 v11 SBF artifacts"]
-fn public_deposit_is_proved_and_moved_into_confidential_pending_balance() {
+fn public_deposit_is_proved_and_kept_in_the_public_custody_balance() {
     let mut svm = svm_with_program();
     let owner = Keypair::new();
     svm.airdrop(&owner.pubkey(), 2_000_000_000).unwrap();
@@ -737,15 +742,200 @@ fn public_deposit_is_proved_and_moved_into_confidential_pending_balance() {
         assert_eq!(source_state.base.amount, 10);
         let vault_account = svm.get_account(&vault).unwrap();
         let vault_state = StateWithExtensions::<TokenAccount>::unpack(&vault_account.data).unwrap();
-        assert_eq!(vault_state.base.amount, 0);
+        assert_eq!(vault_state.base.amount, amount);
         let confidential = vault_state
             .get_extension::<ConfidentialTransferAccount>()
             .unwrap();
-        assert_eq!(u64::from(confidential.pending_balance_credit_counter), 1);
-        assert!(amount > 0);
+        assert_eq!(u64::from(confidential.pending_balance_credit_counter), 0);
     }
     eprintln!(
-        "proved public deposit plus two confidential Deposit CPIs consumed {} CU",
+        "proved public deposit plus two public TransferChecked CPIs consumed {} CU",
+        metadata.compute_units_consumed
+    );
+}
+
+#[test]
+#[ignore = "requires BeatEx and official Token-2022 v11 SBF artifacts"]
+fn public_withdrawal_debits_encrypted_balance_and_public_vaults_atomically() {
+    let mut svm = svm_with_program();
+    let owner = Keypair::new();
+    svm.airdrop(&owner.pubkey(), 2_000_000_000).unwrap();
+
+    let market = Pubkey::new_unique();
+    let key_epoch = Pubkey::new_unique();
+    let private_balance = Pubkey::new_unique();
+    let deposit_vk = Pubkey::new_unique();
+    let base_mint = Pubkey::new_unique();
+    let quote_mint = Pubkey::new_unique();
+    let base_vault = Pubkey::new_unique();
+    let quote_vault = Pubkey::new_unique();
+    let base_destination = Pubkey::new_unique();
+    let quote_destination = Pubkey::new_unique();
+    let (market_state, mut key_epoch_state, vault_authority) = fixture_market(
+        owner.pubkey(),
+        market,
+        key_epoch,
+        base_mint,
+        base_vault,
+        quote_mint,
+        quote_vault,
+    );
+    key_epoch_state.babyjub_encryption_pubkey = transition::deterministic_committee_key_bytes();
+
+    let prover = DepositProver::deterministic_devnet().unwrap();
+    let mut deposit_rng = ChaCha20Rng::from_seed([0xa1; 32]);
+    let deposited = prover
+        .prove(
+            DepositProofRequest {
+                market: market.to_bytes(),
+                owner: owner.pubkey().to_bytes(),
+                key_epoch: key_epoch.to_bytes(),
+                committee_key: key_epoch_state.babyjub_encryption_pubkey,
+                old_revision: 0,
+                base_amount: 20,
+                quote_amount: 50_000_000,
+                old_balance: PrivateBalanceOpening {
+                    base_value: 0,
+                    quote_value: 0,
+                    base_randomness: [0; 32],
+                    quote_randomness: [0; 32],
+                },
+            },
+            &mut deposit_rng,
+        )
+        .unwrap();
+    let mut withdrawal_rng = ChaCha20Rng::from_seed([0xa2; 32]);
+    let withdrawal = prover
+        .prove_public_withdrawal(
+            PublicWithdrawalProofRequest {
+                market: market.to_bytes(),
+                owner: owner.pubkey().to_bytes(),
+                key_epoch: key_epoch.to_bytes(),
+                committee_key: key_epoch_state.babyjub_encryption_pubkey,
+                current_revision: 1,
+                base_amount: 3,
+                quote_amount: 125_000,
+                current_balance: deposited.new_balance,
+            },
+            &mut withdrawal_rng,
+        )
+        .unwrap();
+    let key = prover.verification_key().unwrap();
+    let balance_state = EncryptedPrivateBalance {
+        version: 1,
+        market,
+        owner: owner.pubkey(),
+        key_epoch,
+        encrypted_base: deposited.new_encrypted_base,
+        encrypted_quote: deposited.new_encrypted_quote,
+        deposited_base: 20,
+        deposited_quote: 50_000_000,
+        balance_digest: [0; 32],
+        revision: 1,
+        bump: 0,
+    };
+    let vk_state = QueueVerificationKey {
+        version: 1,
+        market,
+        circuit_kind: QueueCircuitKind::BalanceDeposit,
+        circuit_version: 1,
+        alpha_g1: key.alpha_g1,
+        beta_g2: key.beta_g2,
+        gamma_g2: key.gamma_g2,
+        delta_g2: key.delta_g2,
+        ic: key.ic,
+        bump: 0,
+    };
+    put_anchor_account(&mut svm, market, &market_state);
+    put_anchor_account(&mut svm, key_epoch, &key_epoch_state);
+    put_anchor_account(&mut svm, private_balance, &balance_state);
+    put_anchor_account(&mut svm, deposit_vk, &vk_state);
+    put_system_account(&mut svm, vault_authority);
+    for mint in [base_mint, quote_mint] {
+        put_token_2022_account(&mut svm, mint, confidential_mint_data());
+    }
+    for (address, mint, authority, amount) in [
+        (base_vault, base_mint, vault_authority, 20),
+        (quote_vault, quote_mint, vault_authority, 50_000_000),
+        (base_destination, base_mint, owner.pubkey(), 0),
+        (quote_destination, quote_mint, owner.pubkey(), 0),
+    ] {
+        put_token_2022_account(
+            &mut svm,
+            address,
+            confidential_token_account_data(
+                mint,
+                authority,
+                key_epoch_state.encryption_pubkey,
+                0,
+                amount,
+            ),
+        );
+    }
+
+    let instruction = Instruction {
+        program_id: beatex::ID,
+        accounts: vec![
+            AccountMeta::new(owner.pubkey(), true),
+            AccountMeta::new_readonly(market, false),
+            AccountMeta::new_readonly(key_epoch, false),
+            AccountMeta::new_readonly(deposit_vk, false),
+            AccountMeta::new(private_balance, false),
+            AccountMeta::new_readonly(base_mint, false),
+            AccountMeta::new_readonly(quote_mint, false),
+            AccountMeta::new(base_vault, false),
+            AccountMeta::new(quote_vault, false),
+            AccountMeta::new(base_destination, false),
+            AccountMeta::new(quote_destination, false),
+            AccountMeta::new_readonly(vault_authority, false),
+            AccountMeta::new_readonly(spl_token_2022_interface::id(), false),
+        ],
+        data: beatex::instruction::WithdrawPublicBalance {
+            args: WithdrawPublicBalanceArgs {
+                base_amount: 3,
+                quote_amount: 125_000,
+                remaining_encrypted_base: withdrawal.remaining_encrypted_base,
+                remaining_encrypted_quote: withdrawal.remaining_encrypted_quote,
+                proof: Groth16ProofInput {
+                    proof_a: withdrawal.proof_a,
+                    proof_b: withdrawal.proof_b,
+                    proof_c: withdrawal.proof_c,
+                    public_input: withdrawal.public_input,
+                },
+            },
+        }
+        .data(),
+    };
+    let transaction = Transaction::new(
+        &[&owner],
+        Message::new(&[instruction], Some(&owner.pubkey())),
+        svm.latest_blockhash(),
+    );
+    let metadata = svm.send_transaction(transaction).unwrap();
+    let updated: EncryptedPrivateBalance = {
+        let account = svm.get_account(&private_balance).unwrap();
+        EncryptedPrivateBalance::try_deserialize(&mut account.data.as_slice()).unwrap()
+    };
+    assert_eq!(updated.encrypted_base, withdrawal.remaining_encrypted_base);
+    assert_eq!(
+        updated.encrypted_quote,
+        withdrawal.remaining_encrypted_quote
+    );
+    assert_eq!(updated.revision, 2);
+    for (vault, destination, vault_amount, destination_amount) in [
+        (base_vault, base_destination, 17, 3),
+        (quote_vault, quote_destination, 49_875_000, 125_000),
+    ] {
+        let vault_account = svm.get_account(&vault).unwrap();
+        let vault_state = StateWithExtensions::<TokenAccount>::unpack(&vault_account.data).unwrap();
+        assert_eq!(vault_state.base.amount, vault_amount);
+        let destination_account = svm.get_account(&destination).unwrap();
+        let destination_state =
+            StateWithExtensions::<TokenAccount>::unpack(&destination_account.data).unwrap();
+        assert_eq!(destination_state.base.amount, destination_amount);
+    }
+    eprintln!(
+        "proved public withdrawal plus two TransferChecked CPIs consumed {} CU",
         metadata.compute_units_consumed
     );
 }
@@ -761,6 +951,7 @@ fn production_private_claim_reaches_groth16_verification_before_any_token_cpi() 
     let key_epoch = Pubkey::new_unique();
     let auction = Pubkey::new_unique();
     let order = Pubkey::new_unique();
+    let active_order = Pubkey::new_unique();
     let claim_vk = Pubkey::new_unique();
     let base_mint = Pubkey::new_unique();
     let quote_mint = Pubkey::new_unique();
@@ -822,10 +1013,21 @@ fn production_private_claim_reaches_groth16_verification_before_any_token_cpi() 
         state: QueuedOrderState::Folded,
         withdrawal_state: WithdrawalState::Pending,
         terminal_nullifier: [0; 32],
+        previous_event: Pubkey::default(),
         ciphertexts: vec![0; beatex::queue::QUEUED_CIPHERTEXT_COUNT * 64],
         ciphertext_digest: [0; 32],
         order_commitment,
         order_circuit_version: 1,
+        bump: 0,
+    };
+    let active_order_state = ActiveOrder {
+        version: 1,
+        market,
+        auction,
+        owner: payer.pubkey(),
+        latest_event: order,
+        revision: 0,
+        active: true,
         bump: 0,
     };
     let valid_fixture =
@@ -846,6 +1048,7 @@ fn production_private_claim_reaches_groth16_verification_before_any_token_cpi() 
     put_anchor_account(&mut svm, key_epoch, &key_epoch_state);
     put_anchor_account(&mut svm, auction, &auction_state);
     put_anchor_account(&mut svm, order, &order_state);
+    put_anchor_account(&mut svm, active_order, &active_order_state);
     put_anchor_account(&mut svm, claim_vk, &vk_state);
     put_system_account(&mut svm, vault_authority);
     for mint in [base_mint, quote_mint] {
@@ -932,6 +1135,7 @@ fn production_private_claim_reaches_groth16_verification_before_any_token_cpi() 
             AccountMeta::new_readonly(auction, false),
             AccountMeta::new_readonly(key_epoch, false),
             AccountMeta::new(order, false),
+            AccountMeta::new(active_order, false),
             AccountMeta::new_readonly(claim_vk, false),
             AccountMeta::new_readonly(base_mint, false),
             AccountMeta::new(base_vault, false),

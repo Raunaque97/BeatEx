@@ -1,0 +1,11 @@
+{
+  "name": "beatex-v1-transaction",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "node --check send.mjs"
+  },
+  "dependencies": {
+    "@solana/kit": "8.4.0"
+  }
+}

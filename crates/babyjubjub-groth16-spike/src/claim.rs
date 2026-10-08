@@ -29,11 +29,11 @@ use rand::{CryptoRng, RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use std::ops::Neg;
 
-const ORDER_COMMITMENT_DOMAIN: &[u8] = b"BeatEx private contingent order v1";
+pub(super) const ORDER_COMMITMENT_DOMAIN: &[u8] = b"BeatEx private contingent order v1";
 const CLAIM_DOMAIN: &[u8] = b"BeatEx private claim v1";
 const REFUND_DOMAIN: &[u8] = b"BeatEx cancellation refund v1";
-const NULLIFIER_DOMAIN: &[u8] = b"BeatEx withdrawal nullifier v1";
-const OPAQUE_WITHDRAWAL_FIELDS: usize = 86;
+pub(super) const NULLIFIER_DOMAIN: &[u8] = b"BeatEx withdrawal nullifier v1";
+pub(super) const OPAQUE_WITHDRAWAL_FIELDS: usize = 86;
 const AMOUNT_BITS: usize = 48;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -315,6 +315,23 @@ pub fn deterministic_private_withdrawal_solana_fixture(
     })
 }
 
+/// Export a deterministic Devnet claim/refund verification key without
+/// generating a proof. Production deployments must use ceremony output.
+pub fn deterministic_private_withdrawal_verification_key(
+    kind: PrivateWithdrawalKind,
+) -> Result<crate::transition::SolanaVerificationKey, Box<dyn std::error::Error>> {
+    let setup_seed = match kind {
+        PrivateWithdrawalKind::Claim => [0xc1; 32],
+        PrivateWithdrawalKind::Refund => [0xc2; 32],
+    };
+    let mut setup_rng = ChaCha20Rng::from_seed(setup_seed);
+    let (_, key) = Groth16::<Bn254>::circuit_specific_setup(
+        PrivateWithdrawalCircuit::blank(kind),
+        &mut setup_rng,
+    )?;
+    crate::transition::verification_key_bytes(&key, "private withdrawal")
+}
+
 impl PrivateWithdrawalCircuit {
     pub const fn blank(kind: PrivateWithdrawalKind) -> Self {
         Self {
@@ -580,7 +597,7 @@ impl ConstraintSynthesizer<Fq> for PrivateWithdrawalCircuit {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn enforce_claim_allocation(
+pub(super) fn enforce_claim_allocation(
     cs: ConstraintSystemRef<Fq>,
     witness: Option<&PrivateWithdrawalWitness>,
     buy: &FpVar<Fq>,
@@ -685,7 +702,9 @@ fn gated_eq(gate: &FpVar<Fq>, left: &FpVar<Fq>, right: &FpVar<Fq>) -> Result<(),
     (gate * (left - right)).enforce_equal(&FpVar::zero())
 }
 
-fn expected_payouts(witness: &PrivateWithdrawalWitness) -> Result<(u64, u64), SynthesisError> {
+pub(super) fn expected_payouts(
+    witness: &PrivateWithdrawalWitness,
+) -> Result<(u64, u64), SynthesisError> {
     if witness.kind == PrivateWithdrawalKind::Refund {
         return Ok((witness.base_reserve, witness.quote_reserve));
     }

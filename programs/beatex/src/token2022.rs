@@ -246,6 +246,46 @@ pub fn invoke_public_transfer_checked<'info>(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn invoke_public_transfer_checked_signed<'info>(
+    token_program: &AccountInfo<'info>,
+    source: &AccountInfo<'info>,
+    mint: &AccountInfo<'info>,
+    destination: &AccountInfo<'info>,
+    authority: &AccountInfo<'info>,
+    amount: u64,
+    decimals: u8,
+    signer_seeds: &[&[&[u8]]],
+) -> Result<()> {
+    require_keys_eq!(
+        *token_program.key,
+        spl_token_2022_interface::id(),
+        BeatExError::InvalidTokenProgram
+    );
+    let instruction = transfer_checked(
+        token_program.key,
+        source.key,
+        mint.key,
+        destination.key,
+        authority.key,
+        &[],
+        amount,
+        decimals,
+    )?;
+    invoke_signed(
+        &instruction,
+        &[
+            source.clone(),
+            mint.clone(),
+            destination.clone(),
+            authority.clone(),
+            token_program.clone(),
+        ],
+        signer_seeds,
+    )?;
+    Ok(())
+}
+
 pub fn invoke_confidential_deposit<'info>(
     token_program: &AccountInfo<'info>,
     token_account: &AccountInfo<'info>,

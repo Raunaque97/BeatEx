@@ -2,11 +2,11 @@
 
 ## Technical Design
 
-**Status:** Draft for prototype implementation
+**Status:** Implemented Devnet reference design
 
 **Milestone:** Working prototype on test chain
 
-**Last updated:** 2026-10-04
+**Last updated:** 2026-10-08
 
 **Companion document:** [`fbaWithSol.md`](./fbaWithSol.md)
 
@@ -20,16 +20,16 @@ The prototype is intentionally designed so that individual orders remain confide
 
 ### 1.1 Goals
 
-The milestone must demonstrate an end-to-end auction on Solana:
+The milestone must validate an end-to-end auction on Solana:
 
 1. A market opens an auction with an odd-sized public price grid.
-2. Traders confidentially submit two-sided curves and lock confidential Token-2022 collateral.
+2. Traders deposit public Token-2022 collateral into market vaults and receive an equivalent private Baby Jubjub balance.
 3. The program homomorphically aggregates encrypted demand and supply.
 4. After collection ends, a 3-of-7 committee produces a proof-backed threshold decryption of the aggregate curves.
 5. Anyone can verify the published plaintext aggregate curves and relay the proof onchain.
 6. The program deterministically selects and stores the uniform clearing price.
-7. A trader proves a claim without publishing the trader's original curve.
-8. The trader receives the resulting assets and unused collateral through confidential Token-2022 transfers.
+7. A trader proves the private settlement and credits the result back into the encrypted trading balance without publishing the original curve.
+8. The trader may reuse that balance in later auctions or prove a debit and withdraw public Token-2022 assets in one transaction.
 9. If settlement does not complete before a deadline, the auction moves to a cancellation/refund state.
 
 The first implementation effort is the Solana programs, cryptographic harnesses, and automated tests.
@@ -43,14 +43,14 @@ The prototype does not attempt to provide:
 - production DKG with distributed inversion;
 - protocol trading fees;
 - protection against transaction censorship or general Solana liveness failures;
-- compatibility with arbitrary existing SPL mints in the first demo;
+- compatibility with arbitrary existing SPL mints in the first Devnet release;
 - a polished trading UI.
 
 ### 1.3 Prototype assumptions
 
-- The demo uses base and quote mints created with the Token-2022 Confidential Transfer extension enabled at mint creation.
+- The Devnet release uses base and quote mints created with the Token-2022 Confidential Transfer extension enabled at mint creation.
 - Traders pay Solana transaction fees and rent for their accounts. There is no additional protocol fee.
-- An accepted order is immutable.
+- A queue event is immutable. A trader may atomically replace or cancel the active order by appending a proved encrypted delta.
 - Committee members provide decryption shares to a committee proof coordinator. Shares, DLEQ transcripts, private setup material, and secret shares never go onchain.
 - A threshold of three committee members is trusted not to collude before sealing. A threshold collusion can reveal private order data but cannot move escrowed tokens without authorization from the auction program PDA.
 - Grid size is a benchmarked parameter rather than a hard-coded design claim. The first SBF account-layout benchmark tested 17, 19, 21, 25, and 33 levels. With boxed Anchor accounts and the standard 4 KiB stack frame, 17 levels builds cleanly while 19 is the first monolithic layout whose `Auction` deserializer exceeds the frame. The prototype therefore caps the grid at 17 levels; larger grids require sharded curve accounts.
@@ -98,7 +98,12 @@ Committee encryption keys are not token-account signing authorities. Escrow toke
 
 Threshold-share withholding is a liveness failure. The onchain state machine responds by moving the auction to `Cancelled` after a configured deadline.
 
-There is a separate Token-2022 constraint: producing an outgoing confidential transfer from a shared vault requires source-side proof material derived from the vault's confidential balance keys. A committee-independent refund from a shared confidential vault is not automatically provided by Token-2022. The prototype must resolve this through the vault-proof service described in Section 13. This is a feasibility gate, not a solved production property.
+The default vault balance is public Token-2022 custody, while every trader's
+logical balance and all auction activity remain Baby Jubjub encrypted. A
+cancelled order can therefore be credited back to the private ledger using only
+the trader's release proof; it does not depend on committee-held Token-2022
+source proof material. The optional confidential Token-2022 exit described in
+Section 13 retains that additional liveness dependency.
 
 ---
 
@@ -107,29 +112,27 @@ There is a separate Token-2022 constraint: producing an outgoing confidential tr
 ```mermaid
 flowchart LR
     Trader[Trader / test harness]
-    Prover[Groth16 and Token proof generation]
+    Prover[Groth16 proof generation]
     Program[FBA Solana program]
     Token[Token-2022 program]
-    ZkProgram[ZK ElGamal Proof program]
     Committee[3-of-7 committee]
-    Vaults[Base and quote confidential vaults]
+    Vaults[Base and quote custody vaults]
 
     Trader --> Prover
     Prover -->|encrypted curve + proofs| Program
-    Prover -->|confidential transfer proofs| ZkProgram
     Program -->|CPI| Token
     Token <--> Vaults
     Committee -->|private shares| Prover
     Program -->|aggregate curves + clearing result| Trader
-    Trader -->|claim proof| Program
+    Trader -->|settlement or withdrawal proof| Program
 ```
 
 The implementation has four logical components:
 
 1. **FBA program:** owns canonical market, auction, order, decryption, clearing, claim, and cancellation state.
-2. **Token-2022 and ZK ElGamal Proof programs:** custody confidential collateral and verify standard confidential-transfer proofs.
-3. **Committee tools:** create threshold shares, monitor sealed auctions, coordinate the aggregate-publication proof, and assist with vault proof generation.
-4. **Rust test/proving harness:** creates curves, ciphertexts, Groth16 witnesses, Token-2022 proof contexts, transactions, and assertions. This is not a production trading client.
+2. **Token-2022:** holds public base and quote custody balances and executes proved deposits and withdrawals.
+3. **Committee tools:** create threshold shares, monitor sealed auctions, and coordinate the aggregate-publication proof.
+4. **Rust client and proving harness:** creates curves, ciphertexts, Groth16 witnesses, transactions, and assertions.
 
 ---
 
@@ -138,7 +141,7 @@ The implementation has four logical components:
 The selected design deliberately uses two encryption domains:
 
 1. Auction orders and aggregate curves use exponential ElGamal on Baby Jubjub. Its base field is the BN254 Groth16 scalar field, so order encryption, private validity, balance deductions, and aggregate additions can be constrained directly and efficiently.
-2. Custodied token balances and transfers use Solana Token-2022 Confidential Balances and its Ristretto twisted-ElGamal format.
+2. Custodied assets use public Token-2022 balances. The optional confidential-exit compatibility path uses Token-2022 Confidential Balances and its Ristretto twisted-ElGamal format.
 
 The Groth16 order and claim statements are the bridge between these domains. The program must never reinterpret a Baby Jubjub auction ciphertext as a Token-2022 ciphertext.
 
@@ -189,7 +192,7 @@ Custom nonlinear order and claim relations use Groth16 over BN254:
 - proof `A`: negated exactly as required by the verifier;
 - every circuit version has a distinct domain and verifying key.
 
-The prototype may use an insecure deterministic setup for local development only. Demo artifacts must clearly identify the setup as non-production. A production deployment would require an appropriate trusted-setup process or a different proof system.
+The prototype may use an insecure deterministic setup for local development only. Devnet artifacts must clearly identify the setup as non-production. A production deployment would require an appropriate trusted-setup process or a different proof system.
 
 The current program includes a deterministic one-constraint Groth16 fixture and a versioned Anchor verification endpoint. It is a pipeline test only: it continuously checks verifying-key conversion, proof-A negation, public-input endianness, malformed-proof rejection, and the native BN254 syscalls. LiteSVM executes this verifier at 80,298 CU.
 
@@ -276,7 +279,7 @@ This work is outside this milestone.
 
 A market references a `KeyEpoch` rather than embedding permanent committee configuration. An auction records the key epoch used for its ciphertexts and claims. Key rotation creates a new epoch; it does not mutate historical auctions.
 
-The prototype may use one key epoch for all demo auctions.
+The prototype may use one key epoch for all Devnet auctions.
 
 ---
 
@@ -481,7 +484,7 @@ The order proof must bind all of the following:
 
 The selected Arkworks circuit constrains all 34 Baby Jubjub order ciphertexts, four old/new encrypted balance ciphertexts, 17 no-wash products, exact base/quote collateral maxima, the fixed price grid, owner, auction, nonce, key, and salted private-order commitment. It exposes one Poseidon digest as its only public input. The program reconstructs that digest from account and instruction bytes before invoking the BN254 verifier. Golden tests prove that circuit and program transcript construction match byte-for-byte.
 
-The exact BN254/Ristretto and native ZK ElGamal approaches remain documented as rejected feasibility branches. The authority-gated legacy demo instructions must never be presented as the selected untrusted order path.
+The exact BN254/Ristretto and native ZK ElGamal approaches remain documented as rejected feasibility branches. The authority-gated legacy test instructions must never be presented as the selected untrusted order path.
 
 ### 8.5 Independent queued-order submission
 
@@ -489,17 +492,56 @@ Solana v1 permits a 4,096-byte transaction. The measured 17-level order, two upd
 
 `submit_queued_order` verifies the order/balance proof, creates an immutable `QueuedOrder` PDA in `Accepted` state, applies the encrypted balance transition, and increments `accepted_order_count` atomically. It does not read the aggregate accumulator. The proof statement is consequently unaffected by folds or other traders' submissions; only Solana's normal writable lock on the small counter can delay execution.
 
-The current implementation treats every submission as an independent immutable
-order and has no cancel/replace instruction. The planned revision replaces this
-with one private active-order account per trader and immutable queue events.
-Replacing an order proves and enqueues the encrypted delta `new - old`; cancelling
-proves and enqueues `-old`. It also releases the old private reserve and locks the
-new reserve in the same proof-backed balance transition. Once every accepted
+Replacement events store a `previous_event` pointer instead of duplicating the
+prior 2,176-byte ciphertext curve. The prior event is immutable, so a fold bot
+can follow that pointer to obtain the subtraction witness. The event digest
+still commits to both the previous and current ciphertexts. The SBF fold handler
+reads only the fixed account header and digest and changes the state byte in
+place after proof verification; it does not allocate copies of the ciphertext
+vectors.
+
+The implementation keeps one private active-order account per trader and
+immutable queue events. Replacing an order verifies a reserve-release proof and
+an ordinary order proof in one transaction, then enqueues the encrypted delta
+`new - old`; cancelling verifies the release and enqueues `-old`. Once every accepted
 event is folded, the aggregate contains exactly the final active orders even if
 some deltas were folded before the corresponding positive event. Only the final
 active revision is eligible for claim or cancellation refund.
 
-The older `initialize_order` / `write_order_chunk` / authority-gated `finalize_test_order` instructions remain only as a legacy demo harness and are not the selected untrusted order path.
+For recurring liquidity, one version-1 user transaction atomically credits a
+settled private payout into the Baby Jubjub encrypted balance and places the
+next auction's order. It composes a 31,880-constraint rollover proof with the
+ordinary order proof, uses no Token-2022 proof contexts, and requires the same
+key epoch on both auctions. The proofs can be generated concurrently. On an
+Apple M4 the measured rollover proof takes about 0.53 seconds after setup, so
+the combined latency is bounded by the roughly 2.2-second order proof rather
+than the 40.8-second exact Token-2022 withdrawal bridge.
+
+The transaction contains six BeatEx instructions in a fixed order:
+
+1. `prepare_rollover` allocates the next queued-order and active-order accounts.
+2. `verify_rollover_proof` verifies the settled-payout Groth16 proof.
+3. `bind_rollover_settlement` reconstructs and binds its settlement statement.
+4. `verify_rollover_proof` verifies the next-order Groth16 proof.
+5. `bind_rollover_order` reconstructs and binds its order statement.
+6. `rollover_order` performs the terminal old-order claim, private-balance
+   transition, and next-order queue mutation.
+
+The preparation and binding handlers inspect the instructions sysvar and
+require the exact later or immediately preceding instruction discriminators,
+account mappings, and public inputs. The final mutation likewise authenticates
+the two preceding binding instructions. There is no persistent proof receipt
+and no intermediate state can survive a failed transaction. This split is an
+SBF memory boundary: both pairing checks and both Poseidon statement hashes run
+with fresh heaps while the protocol remains one atomic user transaction.
+
+Reusable host APIs generate arbitrary order, collateral-release, replacement,
+rollover-credit, and rollover-plus-next-order proofs while carrying the exact
+private encrypted-balance opening between relations. Every public prover
+self-verifies before returning Solana wire bytes and rejects private order data
+that does not reopen the commitment already stored onchain.
+
+The older `initialize_order` / `write_order_chunk` / authority-gated `finalize_test_order` instructions remain only as a legacy test harness and are not the selected untrusted order path.
 
 ---
 
@@ -664,23 +706,37 @@ each private payout to Token-2022's 48-bit confidential-transfer range.
 
 ---
 
-## 13. Claim and confidential settlement
+## 13. Private settlement and custody exits
 
-### 13.1 Claim proof statement
+The default path keeps tokens in public Token-2022 market vault balances and
+keeps each trader's spendable balance encrypted under the active Baby Jubjub
+key epoch. Deposits bridge public tokens into that ledger. A settled order or
+cancelled-order refund updates only the encrypted ledger. A public withdrawal
+bridges value back to the trader's Token-2022 accounts. This removes native
+Token-2022 proof contexts and committee coordination from the recurring trading
+loop.
 
-The claim proof demonstrates, without revealing the order, that:
+The current private balance contains the base and quote assets for one market
+and one key epoch. It is deliberately not a global per-mint balance. A shared
+cross-market asset pool requires global vault authority, key-rotation rules,
+and transaction account compression such as address lookup tables; those are a
+separate protocol revision.
+
+### 13.1 Settlement proof statement
+
+The settlement proof establishes, without revealing the order, that:
 
 1. the prover reopens the salted private-order commitment already authenticated by the submission proof;
 2. the order is bound to the specified market, auction, owner, and key epoch;
 3. the public clearing result is the one stored by the program;
 4. the claimed fill follows the allocation and rounding rules;
 5. the purchased asset, proceeds, unfilled collateral, and residual treatment are correct;
-6. the confidential Token-2022 transfer commitments encode those correct outputs;
+6. the resulting base and quote ciphertexts encode the correct updated private balance;
 7. the claim nullifier is derived from the finalized order and cannot be reused.
 
 The proof does not reveal the order quantities, fill, refund, or transfer amounts.
 
-### 13.2 Claim state
+### 13.2 Terminal order state
 
 For the prototype, each queued order PDA contains a terminal withdrawal status:
 
@@ -690,18 +746,41 @@ Claimed
 Refunded
 ```
 
-The program changes `Pending` to `Claimed` or `Refunded` in the same transaction that authorizes the relevant token movement. This prevents replay and double withdrawal.
+The program changes `Pending` to `Claimed` or `Refunded` in the same transaction
+that credits the private balance. This prevents replay and double credit.
 
 Once an auction reaches `Settled`, claims remain available until consumed.
 The program does not later convert a cleared auction into full-reserve refunds,
 because counterparties may already have claimed and such a transition could
 make the shared vault insolvent.
 
-### 13.3 Token-2022 source proof requirement
+### 13.3 Default deposit and public withdrawal
+
+`deposit_collateral` publicly transfers the declared amounts into the two
+market vaults and verifies that the same amounts were added to the trader's
+encrypted balance. Exact source and vault deltas reject fee-on-transfer or
+otherwise non-exact deposits.
+
+`withdraw_public_balance` verifies the same 26,885-constraint balance relation
+in reverse: `remaining + withdrawal = current`. It advances the balance
+revision, stores the remaining ciphertexts, and uses the vault-authority PDA to
+transfer the exact public base and quote amounts to owner-controlled token
+accounts. The owner signs, both destinations must have the correct mint and
+owner, and an all-zero withdrawal is rejected. Public withdrawal amounts are
+visible; prior orders, fills, and total private balance history are not.
+
+`settle_order_to_balance` is a three-instruction atomic transaction: verify the
+rollover settlement proof, bind its statement, then credit the encrypted
+balance and mark the order claimed. `refund_order_to_balance` verifies the
+collateral-release proof, restores the encrypted reserves, and marks a
+cancelled-auction order refunded in one transaction.
+
+### 13.4 Optional confidential Token-2022 exit
 
 Token-2022 confidential transfers require source-side proofs against the vault's current encrypted available balance. The trader does not possess the shared vault's ElGamal/AES proof material.
 
-The prototype therefore includes an offchain **vault-proof service**, initially operated alongside the committee:
+The repository retains an offchain **vault-proof service** for users who need a
+confidential Token-2022 exit:
 
 1. The trader supplies the private order opening and confidential destination accounts to the committee-side coordinator.
 2. The vault-proof service validates the onchain order and clearing state and derives the exact private allocation.
@@ -710,17 +789,27 @@ The prototype therefore includes an offchain **vault-proof service**, initially 
 5. The trader or any relayer submits the final claim transaction.
 6. The FBA program verifies the claim proof and signs the Token-2022 CPI with PDA seeds.
 
-The vault-proof service cannot move tokens by itself because it cannot sign for the vault authority PDA. It is nevertheless a privacy and liveness component and must be described honestly in the demo.
+The vault-proof service cannot move tokens by itself because it cannot sign for the vault authority PDA. It is nevertheless a privacy and liveness component and must be described honestly in the Devnet documentation.
 
-### 13.4 Pending and available balances
+### 13.5 Optional pending and available balances
 
-Incoming Token-2022 collateral is public in the prototype: `deposit_collateral` moves the declared base/quote amounts from the trader's public token accounts to the vaults and immediately converts them to confidential pending balances. The Groth16 deposit proof binds those same public amounts to additions in the trader's Baby Jubjub encrypted balance. Deposit amounts are therefore not private, while the later order quantities and individual settlement remain confidential.
+The default deposit leaves funds in the vaults' public balances. The Groth16
+deposit proof binds those same public amounts to additions in the trader's
+Baby Jubjub encrypted balance. Deposit amounts are therefore not private, while
+later order quantities and individual settlement remain confidential.
 
-Funds in confidential pending balances must be applied into the available balance before they can fund outgoing claims. The program and test harness track pending-balance counters and include an explicit vault-apply step in the auction pipeline.
+Only the optional confidential exit uses confidential pending and available
+balances. Those funds must be applied before they can fund outgoing
+confidential claims.
 
-Implementation status: `deposit_collateral` verifies the 26,885-constraint encrypted-balance transition and completes both public transfers and confidential-deposit CPIs atomically. `apply_vault_pending_balance` validates the selected market vault, mint, vault-authority PDA, active key epoch, confidential extension, approval flag, and ElGamal public key before invoking Token-2022. The production `claim_queued_order` and `refund_queued_order` handlers extract and bind both standard Token-2022 proof-context bundles, verify a circuit-specific one-input Groth16 proof, execute both confidential transfers atomically, and only then mark the queued order terminal. The exact claim circuit is 2,924,068 constraints; the refund circuit is 2,923,244 constraints. The vault-proof library reconstructs any valid 3-of-7 vault key, generates and host-verifies the standard equality/validity/range bundles, and retains the zeroized combined Pedersen opening required by the Groth16 bridge.
+Implementation status: the default deposit, internal settlement, internal
+refund, and public withdrawal handlers are implemented and exercised in SBF
+and on Devnet. The optional `claim_queued_order`, `refund_queued_order`, and
+`apply_vault_pending_balance` handlers remain implemented for the confidential
+bridge. Its exact claim circuit is 2,924,068 constraints and its refund circuit
+is 2,923,244 constraints.
 
-### 13.5 Timeout refund
+### 13.6 Timeout refund
 
 After a settlement-stage timeout moves the auction to `Cancelled`:
 
@@ -728,11 +817,11 @@ After a settlement-stage timeout moves the auction to `Cancelled`:
 - an accepted or folded queued order may be refunded at most once;
 - the refund is the full base and quote collateral originally deposited for that order;
 - the refund proof binds to the original collateral-transfer commitments and order PDA;
-- the order becomes `Refunded` atomically with token authorization.
+- the order becomes `Refunded` atomically with the private-balance credit.
 
-A shared confidential vault still requires valid Token-2022 source proofs for the refund. A truly committee-independent refund mechanism is unresolved. The prototype fallback guarantees an onchain cancellation state and program-authorized refunds when the vault-proof service is available; it does not yet guarantee cryptographic refund liveness if all offchain holders of vault proof material disappear.
-
-This limitation is a mandatory item for the demo threat-model disclosure and a priority for a post-hackathon design.
+The default refund does not require a vault transfer or committee material.
+After the order is refunded internally, the owner may continue trading or use
+the ordinary public withdrawal instruction.
 
 ---
 
@@ -881,7 +970,7 @@ Suggested seeds:
 - One base and one quote Token-2022 account per market in the prototype.
 - Token-account owner: market vault-authority PDA.
 - Confidential encryption key: key-epoch twisted ElGamal public key.
-- Mints: confidential transfers enabled and automatically approved for the demo.
+- Mints: confidential transfers enabled and automatically approved for Devnet testing.
 
 `Market` stores the fixed vault addresses. Deposit, apply-pending, and settlement handlers validate those addresses, the mint/account ownership, the vault-authority PDA, and the active key epoch's confidential-transfer key before every CPI. A future per-key-epoch vault migration may provide cleaner rotation isolation, but it is not the implemented prototype layout.
 
@@ -939,7 +1028,7 @@ Suggested seeds:
 
 - verifies a Groth16 transition from the old encrypted base/quote balances to balances increased by the exact public deposit amounts;
 - transfers those amounts from the trader's Token-2022 accounts into the configured market vaults;
-- immediately invokes Token-2022 confidential `Deposit` for both vault assets, leaving no public vault balance from the operation;
+- verifies exact source and vault balance deltas and leaves custody in the vaults' public balances;
 - advances the encrypted-balance revision and public audit totals only after every proof and CPI succeeds atomically.
 
 `submit_queued_order`
@@ -969,6 +1058,27 @@ Suggested seeds:
 The existing `finalize_decrypted_entry` / `finalize_decryption` Ristretto instructions are retained only for the earlier threshold feasibility harness. They are not the selected Baby Jubjub queue path.
 
 ### 15.5 Settlement
+
+`settle_order_to_balance`
+
+- requires a settled auction and the immediately preceding verified and bound settlement statement;
+- credits the correct private payout into the trader's encrypted balance;
+- stores the terminal nullifier and marks the order `Claimed` atomically.
+
+`refund_order_to_balance`
+
+- requires auction state `Cancelled`;
+- verifies the release proof and restores the order's base and quote reserves to the encrypted balance;
+- marks the order `Refunded` atomically.
+
+`withdraw_public_balance`
+
+- verifies a reverse balance-deposit proof for the exact public withdrawal amounts;
+- transfers base and quote from the PDA-owned public vault balances to token accounts owned by the signer;
+- stores the remaining encrypted balances and advances the revision atomically.
+
+The following instructions are retained for the optional confidential
+Token-2022 exit:
 
 `claim_queued_order`
 
@@ -1000,11 +1110,13 @@ The existing `finalize_decrypted_entry` / `finalize_decryption` Ristretto instru
 | Token grouped ciphertext validity proof | Trader or vault-proof service | ZK ElGamal Proof + Token-2022 | Same transfer amount is correctly encrypted for required parties |
 | Token range proof | Trader or vault-proof service | ZK ElGamal Proof + Token-2022 | Non-negative balances and bounded transfer amount |
 | Balance-deposit Groth16 proof | Trader | FBA program via BN254 verifier | Exact public Token-2022 deposits are credited to the Baby Jubjub encrypted balance |
+| Public-withdrawal Groth16 proof | Trader | FBA program via BN254 verifier | Exact encrypted balance debit funds the declared public Token-2022 withdrawal |
 | Order-validity Groth16 proof | Trader | FBA program via BN254 verifier | Ciphertext openings, curve rules, bounds, and collateral linkage |
 | Aggregate-fold Groth16 proof | Permissionless bot | FBA program via BN254 verifier | Exact addition of 1–4 accepted orders into the encrypted aggregate |
 | Aggregate-publication Groth16 proof | Committee coordinator; permissionless relay | FBA program via BN254 verifier | Three valid private Baby Jubjub shares and correct public aggregate curves |
-| Claim Groth16 proof | Trader/test prover | FBA program via BN254 verifier | Correct private fill, refund, proceeds, and output commitments |
-| Refund proof | Trader plus vault-proof service | FBA program and Token-2022 | Full collateral return after cancellation |
+| Settlement Groth16 proof | Trader | FBA program via BN254 verifier | Correct private fill, refund, proceeds, and encrypted-balance credit |
+| Collateral-release proof | Trader | FBA program via BN254 verifier | Full encrypted reserve restoration after cancellation |
+| Confidential-exit claim/refund proof | Trader plus vault-proof service | FBA program and Token-2022 | Optional private Token-2022 payout |
 
 Proof context accounts must be checked for:
 
@@ -1098,7 +1210,7 @@ Property-based tests should compare the encrypted pipeline against a plaintext r
 The standard `solana-test-validator` does not enable the ZK ElGamal Proof program used by Confidential Balances. Integration tests that exercise real proof-context and confidential-transfer behavior should run against:
 
 - a supported local environment such as a Surfpool mainnet/devnet fork; and
-- Solana devnet before the demo.
+- Solana Devnet before public testing.
 
 Tests must cover:
 
@@ -1127,7 +1239,7 @@ For grid sizes `N = 5, 9, 17, 33`, record:
 - clearing CU;
 - Token-2022 proof-generation and end-to-end settlement latency.
 
-The supported demo grid is selected from measured results.
+The supported Devnet grid is selected from measured results.
 
 ### 19.5 Current SBF measurements
 
@@ -1143,9 +1255,20 @@ Measured results:
 - default-stack SBF builds: 17 monolithic price levels pass cleanly, while 19 levels fail in `Auction` deserialization;
 - encrypted order initialization, two chunk writes, immutable aggregation, threshold publication of aggregate curves, clearing, and permissionless timeout cancellation all pass in LiteSVM.
 
-The Token-2022 CPI layer also passes a dedicated LiteSVM integration harness against the official v11.0.0 SBF artifact: PDA-signed `ApplyPendingBalance` consumes 15,966 CU, an atomic two-asset settlement containing two confidential `Transfer` CPIs consumes 52,094 CU, and the complete proved two-asset public-deposit path consumes 159,533 CU. The transfer harness supplies correctly encoded, ZK-program-owned preverified equality, ciphertext-validity, and range-proof context accounts, so it tests context extraction, cross-account consistency, PDA signing, state mutation, and CPI wiring. It does not re-run native ZK ElGamal proof verification. LiteSVM 0.10's bundled Token-2022 v10 omits `zk-ops` and rejects these confidential instructions with `InvalidInstructionData`; the harness therefore overrides it with the official v11 artifact.
+The default Token-2022 custody path passes dedicated LiteSVM integration tests:
+the proved two-asset public deposit consumes 132,113 CU, the proved two-asset
+public withdrawal consumes 132,157 CU, and a cancelled-order refund into the
+encrypted ledger consumes 121,209 CU. The optional confidential CPI layer also
+passes against the official v11.0.0 SBF artifact. LiteSVM 0.10's bundled
+Token-2022 v10 omits `zk-ops`, so those compatibility tests override it with
+the official v11 artifact.
 
-The exact claim relation has 2,924,068 constraints and the cancellation-refund relation has 2,923,244. On an Apple M4 using the current Arkworks release prover, deterministic claim setup took 43.838 seconds, recurring proof generation took 40.833 seconds, and host verification took 1.331 milliseconds. This is correct but too slow for browser-side claim proving; the demo should run claim/refund proving in the committee-side service and treat prover optimization or a different cross-curve proof backend as post-prototype work.
+The default settlement relation has 31,880 constraints and takes about 0.53
+seconds per proof on an Apple M4. The 26,885-constraint reverse deposit relation
+used for public withdrawal completed its release test, including deterministic
+setup and proving, in under 0.7 seconds. The optional confidential claim
+relation has 2,924,068 constraints and takes 40.833 seconds per recurring proof;
+it is not on the default trading path.
 
 ---
 
@@ -1181,7 +1304,7 @@ Checkpoint: complete in pure Rust and LiteSVM SBF tests.
 - exact accepted/folded completeness gate and aggregation timeout;
 - v1 transaction-size and SBF CU benchmarks.
 
-Checkpoint: the Anchor state machine, onchain Poseidon statement reconstruction, authority-installed versioned verification keys, 234,166-constraint order circuit, and 310,870-constraint fold circuit are implemented with host golden tests. The refactored flat ciphertext storage builds cleanly under the SBF 4 KiB stack-frame limit; full LiteSVM instruction execution of the real order and fold proofs remains open.
+Checkpoint: the Anchor state machine, onchain Poseidon statement reconstruction, authority-installed versioned verification keys, 234,166-constraint order circuit, and 310,870-constraint fold circuit are implemented. Exact host transcript tests and full LiteSVM instruction execution pass on the default 4 KiB SBF stack. Against the production SBF artifact, a real 17-level order submission consumes 514,651 CU, a replacement-aware three-order fold consumes 614,480 CU, and active-order cancellation consumes 419,817 CU with a 256 KiB heap request.
 
 ### Phase 3: committee decryption
 
@@ -1192,40 +1315,33 @@ Checkpoint: the Anchor state machine, onchain Poseidon statement reconstruction,
 
 Checkpoint: the earlier Ristretto feasibility path remains tested, and the selected Baby Jubjub path is now implemented. A committee coordinator supplies three private share vectors to the 518,852-constraint v2 circuit. The circuit accepts any sorted 3-of-7 subset, binds the selected registered public keys, verifies batched DLEQ relations and one batched plaintext equation, and publishes all curves atomically in one SBF transaction at 266,074 CU.
 
-### Phase 4: collateral
+### Phase 4: custody and encrypted trading balances
 
-- Token-2022 mints and confidential vaults;
+- Token-2022 mints and public custody vault balances;
 - trader collateral transfers;
-- pending-balance management;
 - order/collateral proof binding.
 
-Checkpoint: Token-2022 validation, pending-balance CPI, outgoing confidential-transfer helpers, named demo-mint tooling, and proved incoming public collateral are implemented. PDA signing, two public `TransferChecked` CPIs, two confidential `Deposit` CPIs, and preverified proof-context consumption pass in LiteSVM; the full deposit instruction consumes 157,151 CU. Native proof-program execution for outgoing confidential transfers remains a Devnet integration boundary.
+Checkpoint: Token-2022 validation, named test-mint tooling, and proved incoming
+public collateral are implemented. Two public `TransferChecked` CPIs and the
+encrypted credit execute atomically at 132,113 CU in LiteSVM. The optional
+confidential-transfer compatibility layer remains tested separately.
 
-### Phase 5: claims and fallback
+### Phase 5: settlement, withdrawal, and fallback
 
 - freeze allocation and rounding rule;
 - claim circuit and verifier;
-- vault-proof service harness;
-- confidential payouts and refunds;
+- settlement and cancellation-refund credits to the encrypted ledger;
+- one-transaction public withdrawal;
+- optional confidential-exit vault-proof service harness;
 - cancellation path.
 
-Checkpoint: the exact-index allocation rule, separate claim/refund circuits,
-terminal nullifier, full onchain transcript reconstruction, real batched
-Ristretto-to-Token-2022 commitment bridge, permissionless relay handlers,
-claim/refund mutual exclusion, atomic two-asset transfers, and threshold vault
-proof-generation library are implemented. Host circuit satisfaction,
-onchain/circuit transcript parity, batching parity, standard Token-2022 proof
-verification, workspace tests, and strict Clippy pass. The coordinator now
-builds exact create/verify/close instructions for all six proof-context
-accounts, checks their program transcript against the circuit transcript,
-constructs the private claim/refund witness, and exposes Groth16 proof
-generation from a loaded proving key. A real 2.9-million-constraint claim proof
-and two independently generated Token-2022 transfer bundles execute atomically
-through the production SBF handler at 265,954 CU. Both destination pending
-balances advance, the queued order becomes terminal, and the invalid-proof path
-leaves it unchanged.
+Checkpoint: the exact-index allocation rule, terminal nullifier, internal
+settlement/refund handlers, reverse balance-transition withdrawal proof, and
+PDA-signed public withdrawals are implemented. The complete default path passes
+host and SBF tests. The older confidential claim/refund bridge and its
+vault-proof service remain available as an optional exit.
 
-### Phase 6: demo hardening
+### Phase 6: Devnet integration
 
 - devnet deployment;
 - scripted multi-trader auction;
@@ -1234,17 +1350,51 @@ leaves it unchanged.
 - explicit prototype threat-model disclosure.
 
 Checkpoint: the local encrypted auction script and LiteSVM SBF flows pass. The
-801,152-byte BeatEx program is deployed on Devnet at
-`2P37xv7CzDv7pSet6LaXJDq4m1auW3pZ8PzPLtErfsVd`. Named tBTC/tUSD Token-2022
+current 972,376-byte BeatEx program is deployed on Devnet at
+`2P37xv7CzDv7pSet6LaXJDq4m1auW3pZ8PzPLtErfsVd`, with SHA-256
+`e8d377290afe956253ba747375977c8ba2e0392239bb8121443085c70725a3e7`
+and a 973,368-byte ProgramData capacity. The deployment transaction is
+`B5jApY1XGShb3JUmFVXMUHjqH8DZM4i9wd6PTaW9RdcMrGthbMXXFCWiJuhti5ihzAA7UqmhzACpKdWBQ1AEJnZ`.
+Named tBTC/tUSD Token-2022
 mints and confidential owner accounts were created on Devnet with
-`spl-token` 5.6.1; 5.5.0 was rejected by the current Devnet proof program. A
-scripted multi-trader auction against those live accounts remains required.
+`spl-token`. The
+live market now has PDA-owned custody vaults, an acknowledged and active
+3-of-7 epoch, and all eight circuit-versioned Groth16 verification keys. The
+stateful client performs permissionless auction materialization, initial proved
+deposits, queued submission, atomic same-auction replacement, one-to-four event
+folding, aggregate decryption/publication, clearing, timeout cancellation, and
+internal settlement/refund credits and public withdrawals. The recurring market-maker path also rolled
+auction 528 into auction 819 in one 4,093-byte transaction, privately credited
+9 base and 7,155 quote units, and installed the next order. Auction 18's live
+claim consumed 267,107 CU;
+auction 14's live refund consumed 267,105 CU. Both 1,510-byte transactions paid
+the 5,000-lamport base fee with zero priority fee. Six two-signature context
+transactions cost 60,000 lamports per withdrawal, and the cleanup transaction
+returned all context-account rent.
+
+The default fast path subsequently completed auction 1007 end to end on
+Devnet. Deposit used 133,989 CU, order submission 512,747 CU, one-order fold
+1,113,367 CU, publication and clearing 267,487 CU, internal settlement 154,806
+CU, and public withdrawal 134,005 CU. Each transaction paid only the 5,000
+lamport base fee with zero priority fee.
+
+The complete recurring path was subsequently repeated from fresh state:
+auction 822 accepted a 3,136-byte encrypted order, folded its event in a
+2,869-byte permissionless transaction, published and cleared at price 835 in a
+963-byte transaction, and atomically rolled into auction 823 in a 4,093-byte
+transaction. The four transactions consumed 512,745, 1,113,365, 267,485, and
+694,958 CU respectively; each paid only the 5,000-lamport base fee.
+
+The resulting auction 823 order was replaced in place in one 3,618-byte,
+628,662-CU transaction. A subsequent 2,902-byte fold consumed both the original
+and replacement deltas at 862,979 CU, after which aggregate publication settled
+normally. This validates the latest-order-wins UX on the same deployed build.
 
 ---
 
-## 21. Demo flow
+## 21. Devnet validation flow
 
-The scripted hackathon demonstration should show:
+The scripted Devnet run should validate:
 
 1. Creation of confidential base and quote Token-2022 mints and accounts.
 2. Initialization of one market and a dealer-assisted 3-of-7 key epoch.
@@ -1260,7 +1410,7 @@ The scripted hackathon demonstration should show:
 11. At least two private claims settling through confidential transfers.
 12. A separate auction timing out and entering the refund path.
 
-The demo should also show negative tests: corrupted publication proof, invalid participant set, corrupted claim proof, and double claim must fail.
+The Devnet run should also include negative tests: corrupted publication proof, invalid participant set, corrupted claim proof, and double claim must fail.
 
 ---
 
@@ -1280,7 +1430,7 @@ The demo should also show negative tests: corrupted publication proof, invalid p
 
 ### 22.3 Parameters selected by measurement
 
-- whether a post-demo version should exceed the selected 17-level grid;
+- whether a later version should exceed the selected 17-level grid;
 - per-order and aggregate quantity bounds;
 - auction submission duration;
 - aggregation timeout duration;

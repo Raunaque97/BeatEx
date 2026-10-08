@@ -19,8 +19,9 @@ pub mod token2022;
 
 pub use groth16::Groth16ProofInput;
 pub use queue::{
-    AggregateAccumulator, EncryptedPrivateBalance, QueueCircuitKind, QueueVerificationKey,
-    QueuedOrder, QueuedOrderState, SubmissionCounter, WithdrawalKind, WithdrawalState,
+    ActiveOrder, AggregateAccumulator, EncryptedPrivateBalance, QueueCircuitKind,
+    QueueVerificationKey, QueuedOrder, QueuedOrderState, SubmissionCounter, WithdrawalKind,
+    WithdrawalState,
 };
 pub use state::{Auction, AuctionState, Market, Order, OrderState};
 pub use threshold::{DecryptionShareInput, DleqProofInput, VerifyThresholdDecryptionArgs};
@@ -405,9 +406,9 @@ pub mod beatex {
         Ok(())
     }
 
-    /// Deposit public demo collateral (for example tBTC/tUSD) and credit the
-    /// exact amounts to the trader's encrypted balances. The Token-2022 CPIs,
-    /// Groth16 proof, counters and ciphertext update are one atomic operation.
+    /// Deposit public collateral and credit the exact amounts to the trader's
+    /// encrypted balances. Tokens remain in the vault's ordinary public
+    /// balance; order activity and the trader's resulting balance stay private.
     pub fn deposit_collateral(
         ctx: Context<DepositCollateral>,
         args: DepositCollateralArgs,
@@ -440,7 +441,7 @@ pub mod beatex {
             })?;
         groth16::verify_queue_proof(&args.proof, &digest, &ctx.accounts.deposit_verification_key)?;
 
-        transfer_demo_deposit_asset(
+        transfer_public_deposit_asset(
             args.base_amount,
             &ctx.accounts.owner.to_account_info(),
             &ctx.accounts.base_source.to_account_info(),
@@ -452,9 +453,8 @@ pub mod beatex {
             &ctx.accounts.market.base_vault,
             &ctx.accounts.market.key(),
             ctx.accounts.market.vault_authority_bump,
-            &ctx.accounts.key_epoch.encryption_pubkey,
         )?;
-        transfer_demo_deposit_asset(
+        transfer_public_deposit_asset(
             args.quote_amount,
             &ctx.accounts.owner.to_account_info(),
             &ctx.accounts.quote_source.to_account_info(),
@@ -466,7 +466,6 @@ pub mod beatex {
             &ctx.accounts.market.quote_vault,
             &ctx.accounts.market.key(),
             ctx.accounts.market.vault_authority_bump,
-            &ctx.accounts.key_epoch.encryption_pubkey,
         )?;
 
         let balance = &mut ctx.accounts.private_balance;
@@ -480,6 +479,79 @@ pub mod beatex {
             .deposited_quote
             .checked_add(args.quote_amount)
             .ok_or_else(|| error!(BeatExError::ArithmeticOverflow))?;
+        balance.balance_digest = digest;
+        balance.revision = balance
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| error!(BeatExError::ArithmeticOverflow))?;
+        Ok(())
+    }
+
+    /// Debit the private balance and return public amounts from the custody
+    /// vaults in one transaction. The deposit circuit is deliberately reused
+    /// in reverse: it proves `remaining + withdrawal = current`, while the
+    /// handler applies `current -> remaining` under the current revision.
+    pub fn withdraw_public_balance(
+        ctx: Context<WithdrawPublicBalance>,
+        args: WithdrawPublicBalanceArgs,
+    ) -> Result<()> {
+        require!(
+            args.base_amount != 0 || args.quote_amount != 0,
+            BeatExError::EmptyWithdrawal
+        );
+        require!(
+            ctx.accounts.deposit_verification_key.circuit_kind == QueueCircuitKind::BalanceDeposit
+                && ctx.accounts.deposit_verification_key.circuit_version
+                    == queue::QUEUE_CIRCUIT_VERSION,
+            BeatExError::InvalidCircuitVersion
+        );
+        let balance = &ctx.accounts.private_balance;
+        let digest =
+            queue_hash::balance_deposit_statement_digest(&queue_hash::BalanceDepositStatement {
+                market: &ctx.accounts.market.key(),
+                owner: &ctx.accounts.owner.key(),
+                key_epoch: &ctx.accounts.key_epoch.key(),
+                committee_key: ctx.accounts.key_epoch.babyjub_encryption_pubkey,
+                old_revision: balance.revision,
+                base_amount: args.base_amount,
+                quote_amount: args.quote_amount,
+                old_base: &args.remaining_encrypted_base,
+                old_quote: &args.remaining_encrypted_quote,
+                new_base: &balance.encrypted_base,
+                new_quote: &balance.encrypted_quote,
+            })?;
+        groth16::verify_queue_proof(&args.proof, &digest, &ctx.accounts.deposit_verification_key)?;
+
+        transfer_public_withdrawal_asset(
+            args.base_amount,
+            &ctx.accounts.owner.to_account_info(),
+            &ctx.accounts.base_destination.to_account_info(),
+            &ctx.accounts.base_mint.to_account_info(),
+            &ctx.accounts.base_vault.to_account_info(),
+            &ctx.accounts.vault_authority.to_account_info(),
+            &ctx.accounts.token_program.to_account_info(),
+            &ctx.accounts.market.base_mint,
+            &ctx.accounts.market.base_vault,
+            &ctx.accounts.market.key(),
+            ctx.accounts.market.vault_authority_bump,
+        )?;
+        transfer_public_withdrawal_asset(
+            args.quote_amount,
+            &ctx.accounts.owner.to_account_info(),
+            &ctx.accounts.quote_destination.to_account_info(),
+            &ctx.accounts.quote_mint.to_account_info(),
+            &ctx.accounts.quote_vault.to_account_info(),
+            &ctx.accounts.vault_authority.to_account_info(),
+            &ctx.accounts.token_program.to_account_info(),
+            &ctx.accounts.market.quote_mint,
+            &ctx.accounts.market.quote_vault,
+            &ctx.accounts.market.key(),
+            ctx.accounts.market.vault_authority_bump,
+        )?;
+
+        let balance = &mut ctx.accounts.private_balance;
+        balance.encrypted_base = args.remaining_encrypted_base;
+        balance.encrypted_quote = args.remaining_encrypted_quote;
         balance.balance_digest = digest;
         balance.revision = balance
             .revision
@@ -556,12 +628,26 @@ pub mod beatex {
         order.state = QueuedOrderState::Accepted;
         order.withdrawal_state = WithdrawalState::Pending;
         order.terminal_nullifier = [0; queue::QUEUE_DIGEST_BYTES];
+        order.previous_event = Pubkey::default();
         order.ciphertexts = args.ciphertexts;
-        order.ciphertext_digest =
-            queue_hash::order_ciphertext_digest(&auction.key(), &order.key(), &order.ciphertexts)?;
+        order.ciphertext_digest = queue_hash::initial_order_event_ciphertext_digest(
+            &auction.key(),
+            &order.key(),
+            &order.ciphertexts,
+        )?;
         order.order_commitment = args.order_commitment;
         order.order_circuit_version = auction.order_circuit_version;
         order.bump = ctx.bumps.order;
+
+        let active_order = &mut ctx.accounts.active_order;
+        active_order.version = state::PROTOCOL_VERSION;
+        active_order.market = queue_accounts.market.key();
+        active_order.auction = auction.key();
+        active_order.owner = ctx.accounts.owner.key();
+        active_order.latest_event = order.key();
+        active_order.revision = 0;
+        active_order.active = true;
+        active_order.bump = ctx.bumps.active_order;
 
         let balance = &mut ctx.accounts.queue_accounts.private_balance;
         balance.encrypted_base = args.new_encrypted_base;
@@ -574,6 +660,647 @@ pub mod beatex {
         ctx.accounts
             .queue_accounts
             .submission_counter
+            .accepted_order_count = next_count;
+        Ok(())
+    }
+
+    /// Replace the wallet's active order without depending on fold ordering.
+    /// The release proof restores the previous private reserves to an
+    /// intermediate encrypted balance; the ordinary order proof then locks the
+    /// replacement reserves. Both proofs and the immutable replacement event
+    /// are committed atomically.
+    pub fn replace_queued_order(
+        ctx: Context<ModifyActiveOrder>,
+        args: ReplaceQueuedOrderArgs,
+    ) -> Result<()> {
+        validate_active_order_context(&ctx.accounts.identity, &ctx.accounts.state)?;
+        require!(
+            ctx.accounts.state.active_order.active,
+            BeatExError::NoActiveOrder
+        );
+        require!(
+            args.replacement.ciphertexts.len()
+                == queue::QUEUED_CIPHERTEXT_COUNT * queue::ELGAMAL_CIPHERTEXT_BYTES,
+            BeatExError::UnsupportedQueueGrid
+        );
+        let slot = Clock::get()?.slot;
+        let auction = &ctx.accounts.identity.auction;
+        require!(
+            auction.state == AuctionState::Pending,
+            BeatExError::AuctionState
+        );
+        let (sequence, next_count) = queue::accept_order(
+            slot,
+            queue_deadlines(auction),
+            ctx.accounts.state.submission_counter.accepted_order_count,
+        )
+        .map_err(|_| error!(BeatExError::QueueInvariant))?;
+        require!(
+            ctx.accounts
+                .identity
+                .release_verification_key
+                .circuit_version
+                == queue::ORDER_MODIFICATION_CIRCUIT_VERSION
+                && ctx.accounts.order_verification_key.circuit_version
+                    == auction.order_circuit_version,
+            BeatExError::InvalidCircuitVersion
+        );
+
+        let release_digest = queue_hash::collateral_release_statement_digest(
+            &queue_hash::CollateralReleaseStatement {
+                market: &ctx.accounts.identity.market.key(),
+                auction: &auction.key(),
+                active_order: &ctx.accounts.state.active_order.key(),
+                owner: &ctx.accounts.identity.owner.key(),
+                balance_revision: ctx.accounts.state.private_balance.revision,
+                client_order_nonce: ctx.accounts.state.previous_event.client_order_nonce,
+                order_commitment: ctx.accounts.state.previous_event.order_commitment,
+                committee_key: ctx.accounts.identity.key_epoch.babyjub_encryption_pubkey,
+                old_base: &ctx.accounts.state.private_balance.encrypted_base,
+                old_quote: &ctx.accounts.state.private_balance.encrypted_quote,
+                released_base: &args.release.released_encrypted_base,
+                released_quote: &args.release.released_encrypted_quote,
+            },
+        )?;
+        groth16::verify_queue_proof(
+            &args.release.proof,
+            &release_digest,
+            &ctx.accounts.identity.release_verification_key,
+        )?;
+
+        let order_digest = queue_hash::order_statement_digest(&queue_hash::OrderStatement {
+            auction: &auction.key(),
+            owner: &ctx.accounts.identity.owner.key(),
+            client_order_nonce: args.replacement.client_order_nonce,
+            order_commitment: args.replacement.order_commitment,
+            committee_key: ctx.accounts.identity.key_epoch.babyjub_encryption_pubkey,
+            reference_price: auction.reference_price,
+            tick_size: auction.tick_size,
+            ciphertexts: &args.replacement.ciphertexts,
+            old_base: &args.release.released_encrypted_base,
+            old_quote: &args.release.released_encrypted_quote,
+            new_base: &args.replacement.new_encrypted_base,
+            new_quote: &args.replacement.new_encrypted_quote,
+        })?;
+        groth16::verify_queue_proof(
+            &args.replacement.proof,
+            &order_digest,
+            &ctx.accounts.order_verification_key,
+        )?;
+
+        let event = &mut ctx.accounts.event;
+        event.version = state::PROTOCOL_VERSION;
+        event.market = ctx.accounts.identity.market.key();
+        event.auction = auction.key();
+        event.owner = ctx.accounts.identity.owner.key();
+        event.funder = ctx.accounts.identity.owner.key();
+        event.client_order_nonce = args.replacement.client_order_nonce;
+        event.sequence = sequence;
+        event.state = QueuedOrderState::Accepted;
+        event.withdrawal_state = WithdrawalState::Pending;
+        event.terminal_nullifier = [0; queue::QUEUE_DIGEST_BYTES];
+        event.previous_event = ctx.accounts.state.previous_event.key();
+        event.ciphertexts = args.replacement.ciphertexts;
+        event.ciphertext_digest = queue_hash::order_event_ciphertext_digest(
+            &auction.key(),
+            &event.key(),
+            &ctx.accounts.state.previous_event.ciphertexts,
+            &event.ciphertexts,
+        )?;
+        event.order_commitment = args.replacement.order_commitment;
+        event.order_circuit_version = auction.order_circuit_version;
+        event.bump = ctx.bumps.event;
+
+        let active_order = &mut ctx.accounts.state.active_order;
+        active_order.latest_event = event.key();
+        active_order.revision = active_order
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| error!(BeatExError::ArithmeticOverflow))?;
+        active_order.active = true;
+
+        let balance = &mut ctx.accounts.state.private_balance;
+        balance.encrypted_base = args.replacement.new_encrypted_base;
+        balance.encrypted_quote = args.replacement.new_encrypted_quote;
+        balance.balance_digest = order_digest;
+        balance.revision = balance
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| error!(BeatExError::ArithmeticOverflow))?;
+        ctx.accounts.state.submission_counter.accepted_order_count = next_count;
+        Ok(())
+    }
+
+    /// Cancel the wallet's active order during collection. The immutable event
+    /// replaces its ciphertexts with encrypted zero, and the release proof
+    /// returns its reserves to the trader's encrypted balance.
+    pub fn cancel_active_order(
+        ctx: Context<CancelQueuedOrder>,
+        args: CancelActiveOrderArgs,
+    ) -> Result<()> {
+        validate_active_order_context(&ctx.accounts.identity, &ctx.accounts.state)?;
+        require!(
+            ctx.accounts.state.active_order.active,
+            BeatExError::NoActiveOrder
+        );
+        let slot = Clock::get()?.slot;
+        let auction = &ctx.accounts.identity.auction;
+        require!(
+            auction.state == AuctionState::Pending,
+            BeatExError::AuctionState
+        );
+        let (sequence, next_count) = queue::accept_order(
+            slot,
+            queue_deadlines(auction),
+            ctx.accounts.state.submission_counter.accepted_order_count,
+        )
+        .map_err(|_| error!(BeatExError::QueueInvariant))?;
+        require!(
+            ctx.accounts
+                .identity
+                .release_verification_key
+                .circuit_version
+                == queue::ORDER_MODIFICATION_CIRCUIT_VERSION,
+            BeatExError::InvalidCircuitVersion
+        );
+        let release_digest = queue_hash::collateral_release_statement_digest(
+            &queue_hash::CollateralReleaseStatement {
+                market: &ctx.accounts.identity.market.key(),
+                auction: &auction.key(),
+                active_order: &ctx.accounts.state.active_order.key(),
+                owner: &ctx.accounts.identity.owner.key(),
+                balance_revision: ctx.accounts.state.private_balance.revision,
+                client_order_nonce: ctx.accounts.state.previous_event.client_order_nonce,
+                order_commitment: ctx.accounts.state.previous_event.order_commitment,
+                committee_key: ctx.accounts.identity.key_epoch.babyjub_encryption_pubkey,
+                old_base: &ctx.accounts.state.private_balance.encrypted_base,
+                old_quote: &ctx.accounts.state.private_balance.encrypted_quote,
+                released_base: &args.release.released_encrypted_base,
+                released_quote: &args.release.released_encrypted_quote,
+            },
+        )?;
+        groth16::verify_queue_proof(
+            &args.release.proof,
+            &release_digest,
+            &ctx.accounts.identity.release_verification_key,
+        )?;
+
+        let event = &mut ctx.accounts.event;
+        event.version = state::PROTOCOL_VERSION;
+        event.market = ctx.accounts.identity.market.key();
+        event.auction = auction.key();
+        event.owner = ctx.accounts.identity.owner.key();
+        event.funder = ctx.accounts.identity.owner.key();
+        event.client_order_nonce = ctx.accounts.state.previous_event.client_order_nonce;
+        event.sequence = sequence;
+        event.state = QueuedOrderState::Accepted;
+        event.withdrawal_state = WithdrawalState::Refunded;
+        event.terminal_nullifier = [0; queue::QUEUE_DIGEST_BYTES];
+        event.previous_event = ctx.accounts.state.previous_event.key();
+        event.ciphertexts = queue_hash::order_bytes(&queue_hash::identity_order());
+        event.ciphertext_digest = queue_hash::order_event_ciphertext_digest(
+            &auction.key(),
+            &event.key(),
+            &ctx.accounts.state.previous_event.ciphertexts,
+            &event.ciphertexts,
+        )?;
+        event.order_commitment = [0; queue::QUEUE_DIGEST_BYTES];
+        event.order_circuit_version = auction.order_circuit_version;
+        event.bump = ctx.bumps.event;
+
+        let active_order = &mut ctx.accounts.state.active_order;
+        active_order.latest_event = event.key();
+        active_order.revision = active_order
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| error!(BeatExError::ArithmeticOverflow))?;
+        active_order.active = false;
+        let balance = &mut ctx.accounts.state.private_balance;
+        balance.encrypted_base = args.release.released_encrypted_base;
+        balance.encrypted_quote = args.release.released_encrypted_quote;
+        balance.balance_digest = release_digest;
+        balance.revision = balance
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| error!(BeatExError::ArithmeticOverflow))?;
+        ctx.accounts.state.submission_counter.accepted_order_count = next_count;
+        Ok(())
+    }
+
+    /// Allocate rollover output accounts in a small instruction immediately
+    /// before the proof-heavy rollover instruction. The instruction-sysvar
+    /// check makes the pair atomic and prevents a standalone preparation from
+    /// occupying the next global queue-sequence PDA.
+    pub fn prepare_rollover(ctx: Context<PrepareRollover>) -> Result<()> {
+        let slot = Clock::get()?.slot;
+        require!(
+            ctx.accounts.next_auction.state == AuctionState::Pending
+                && queue_deadlines(&ctx.accounts.next_auction).collection_is_open(slot),
+            BeatExError::AuctionState
+        );
+        require!(
+            ctx.accounts.next_auction.market == ctx.accounts.market.key()
+                && ctx.accounts.next_submission_counter.auction == ctx.accounts.next_auction.key(),
+            BeatExError::OrderState
+        );
+
+        let current_index = solana_instructions_sysvar::load_current_index_checked(
+            &ctx.accounts.instructions.to_account_info(),
+        )?;
+        let settlement_verification = solana_instructions_sysvar::load_instruction_at_checked(
+            usize::from(current_index) + 1,
+            &ctx.accounts.instructions.to_account_info(),
+        )?;
+        let settlement_binding = solana_instructions_sysvar::load_instruction_at_checked(
+            usize::from(current_index) + 2,
+            &ctx.accounts.instructions.to_account_info(),
+        )?;
+        let order_verification = solana_instructions_sysvar::load_instruction_at_checked(
+            usize::from(current_index) + 3,
+            &ctx.accounts.instructions.to_account_info(),
+        )?;
+        let order_binding = solana_instructions_sysvar::load_instruction_at_checked(
+            usize::from(current_index) + 4,
+            &ctx.accounts.instructions.to_account_info(),
+        )?;
+        let rollover_instruction = solana_instructions_sysvar::load_instruction_at_checked(
+            usize::from(current_index) + 5,
+            &ctx.accounts.instructions.to_account_info(),
+        )?;
+        require!(
+            settlement_verification.program_id == crate::ID
+                && settlement_verification
+                    .data
+                    .starts_with(crate::instruction::VerifyRolloverProof::DISCRIMINATOR)
+                && settlement_binding.program_id == crate::ID
+                && settlement_binding
+                    .data
+                    .starts_with(crate::instruction::BindRolloverSettlement::DISCRIMINATOR)
+                && order_verification.program_id == crate::ID
+                && order_verification
+                    .data
+                    .starts_with(crate::instruction::VerifyRolloverProof::DISCRIMINATOR)
+                && order_binding.program_id == crate::ID
+                && order_binding
+                    .data
+                    .starts_with(crate::instruction::BindRolloverOrder::DISCRIMINATOR)
+                && rollover_instruction.program_id == crate::ID
+                && rollover_instruction
+                    .data
+                    .starts_with(crate::instruction::RolloverOrder::DISCRIMINATOR)
+                && rollover_instruction.accounts.len() > 13
+                && rollover_instruction.accounts[0].pubkey == ctx.accounts.owner.key()
+                && rollover_instruction.accounts[3].pubkey == ctx.accounts.next_auction.key()
+                && rollover_instruction.accounts[7].pubkey
+                    == ctx.accounts.next_submission_counter.key()
+                && rollover_instruction.accounts[11].pubkey == ctx.accounts.next_order.key()
+                && rollover_instruction.accounts[12].pubkey == ctx.accounts.next_active_order.key()
+                && rollover_instruction.accounts[13].pubkey == solana_instructions_sysvar::ID,
+            BeatExError::OrderState
+        );
+
+        let next_order = &mut ctx.accounts.next_order;
+        next_order.version = 0;
+        next_order.market = ctx.accounts.market.key();
+        next_order.auction = ctx.accounts.next_auction.key();
+        next_order.owner = ctx.accounts.owner.key();
+        next_order.funder = ctx.accounts.owner.key();
+        next_order.client_order_nonce = 0;
+        next_order.sequence = ctx.accounts.next_submission_counter.accepted_order_count;
+        next_order.state = QueuedOrderState::Accepted;
+        next_order.withdrawal_state = WithdrawalState::Pending;
+        next_order.terminal_nullifier = [0; queue::QUEUE_DIGEST_BYTES];
+        next_order.previous_event = Pubkey::default();
+        next_order.ciphertexts = Vec::new();
+        next_order.ciphertext_digest = [0; queue::QUEUE_DIGEST_BYTES];
+        next_order.order_commitment = [0; queue::QUEUE_DIGEST_BYTES];
+        next_order.order_circuit_version = 0;
+        next_order.bump = ctx.bumps.next_order;
+
+        let next_active_order = &mut ctx.accounts.next_active_order;
+        next_active_order.version = 0;
+        next_active_order.market = ctx.accounts.market.key();
+        next_active_order.auction = ctx.accounts.next_auction.key();
+        next_active_order.owner = ctx.accounts.owner.key();
+        next_active_order.latest_event = Pubkey::default();
+        next_active_order.revision = 0;
+        next_active_order.active = false;
+        next_active_order.bump = ctx.bumps.next_active_order;
+        Ok(())
+    }
+
+    /// Verify one of the two rollover proofs in its own instruction heap. The
+    /// final rollover instruction authenticates this successful call and its
+    /// exact public input through the instructions sysvar.
+    pub fn verify_rollover_proof(
+        ctx: Context<VerifyRolloverProof>,
+        args: VerifyRolloverProofArgs,
+    ) -> Result<()> {
+        require!(
+            matches!(
+                args.circuit_kind,
+                QueueCircuitKind::RolloverSettlement | QueueCircuitKind::OrderSubmission
+            ) && ctx.accounts.verification_key.circuit_kind == args.circuit_kind
+                && ctx.accounts.verification_key.circuit_version
+                    == queue::circuit_version(args.circuit_kind),
+            BeatExError::InvalidCircuitVersion
+        );
+        groth16::verify_queue_proof(
+            &args.proof,
+            &args.expected_public_input,
+            &ctx.accounts.verification_key,
+        )
+    }
+
+    pub fn bind_rollover_settlement(
+        ctx: Context<BindRolloverSettlement>,
+        args: BindRolloverSettlementArgs,
+    ) -> Result<()> {
+        let auction = &ctx.accounts.old_auction;
+        let clearing_index = usize::from(auction.clearing_index);
+        require!(
+            auction.state == AuctionState::Settled
+                && clearing_index < auction.active_grid_size()
+                && ctx.accounts.old_order.auction == auction.key()
+                && ctx.accounts.old_active_order.auction == auction.key()
+                && ctx.accounts.old_active_order.latest_event == ctx.accounts.old_order.key()
+                && ctx.accounts.old_active_order.active,
+            BeatExError::OrderState
+        );
+        let digest = queue_hash::rollover_settlement_statement_digest(
+            &queue_hash::RolloverSettlementStatement {
+                market: &ctx.accounts.market.key(),
+                auction: &auction.key(),
+                order: &ctx.accounts.old_order.key(),
+                active_order: &ctx.accounts.old_active_order.key(),
+                owner: &ctx.accounts.owner.key(),
+                key_epoch: &ctx.accounts.key_epoch.key(),
+                client_order_nonce: ctx.accounts.old_order.client_order_nonce,
+                sequence: ctx.accounts.old_order.sequence,
+                allocation_rule_version: auction.allocation_rule_version,
+                order_circuit_version: auction.order_circuit_version,
+                claim_circuit_version: auction.claim_circuit_version,
+                order_commitment: ctx.accounts.old_order.order_commitment,
+                clearing_index: auction.clearing_index,
+                clearing_price: auction.clearing_price,
+                demand_at_clearing: auction.decrypted_demand[clearing_index],
+                supply_at_clearing: auction.decrypted_supply[clearing_index],
+                clearing_volume: auction.clearing_volume,
+                terminal_nullifier: args.settlement.terminal_nullifier,
+                balance_revision: ctx.accounts.private_balance.revision,
+                committee_key: ctx.accounts.key_epoch.babyjub_encryption_pubkey,
+                old_base: &ctx.accounts.private_balance.encrypted_base,
+                old_quote: &ctx.accounts.private_balance.encrypted_quote,
+                credited_base: &args.settlement.credited_encrypted_base,
+                credited_quote: &args.settlement.credited_encrypted_quote,
+            },
+        )?;
+        require!(
+            digest == args.expected_public_input
+                && verified_rollover_public_input(
+                    &ctx.accounts.instructions.to_account_info(),
+                    1,
+                    &ctx.accounts.rollover_verification_key.key(),
+                    QueueCircuitKind::RolloverSettlement,
+                )? == digest,
+            BeatExError::Groth16PublicInputMismatch
+        );
+        Ok(())
+    }
+
+    pub fn bind_rollover_order(
+        ctx: Context<BindRolloverOrder>,
+        args: BindRolloverOrderArgs,
+    ) -> Result<()> {
+        require!(
+            args.next_order.ciphertexts.len()
+                == queue::QUEUED_CIPHERTEXT_COUNT * queue::ELGAMAL_CIPHERTEXT_BYTES,
+            BeatExError::UnsupportedQueueGrid
+        );
+        let auction = &ctx.accounts.next_auction;
+        let digest = queue_hash::order_statement_digest(&queue_hash::OrderStatement {
+            auction: &auction.key(),
+            owner: &ctx.accounts.owner.key(),
+            client_order_nonce: args.next_order.client_order_nonce,
+            order_commitment: args.next_order.order_commitment,
+            committee_key: ctx.accounts.key_epoch.babyjub_encryption_pubkey,
+            reference_price: auction.reference_price,
+            tick_size: auction.tick_size,
+            ciphertexts: &args.next_order.ciphertexts,
+            old_base: &args.credited_encrypted_base,
+            old_quote: &args.credited_encrypted_quote,
+            new_base: &args.next_order.new_encrypted_base,
+            new_quote: &args.next_order.new_encrypted_quote,
+        })?;
+        require!(
+            digest == args.expected_public_input
+                && verified_rollover_public_input(
+                    &ctx.accounts.instructions.to_account_info(),
+                    1,
+                    &ctx.accounts.order_verification_key.key(),
+                    QueueCircuitKind::OrderSubmission,
+                )? == digest,
+            BeatExError::Groth16PublicInputMismatch
+        );
+        Ok(())
+    }
+
+    /// Credit one settled order into the trader's encrypted market balance
+    /// without withdrawing tokens or placing another order. The immediately
+    /// preceding binding instruction authenticates the already-verified
+    /// rollover-settlement proof and all credited ciphertexts.
+    pub fn settle_order_to_balance(ctx: Context<SettleOrderToBalance>) -> Result<()> {
+        let binding =
+            bound_settlement_arguments(&ctx.accounts.instructions.to_account_info(), ctx.accounts)?;
+        let next_state = queue::advance_withdrawal(
+            ctx.accounts.order.state,
+            ctx.accounts.order.withdrawal_state,
+            WithdrawalKind::Claim,
+        )
+        .map_err(|_| error!(BeatExError::WithdrawalNotAllowed))?;
+        require!(
+            ctx.accounts.auction.state == AuctionState::Settled
+                && ctx.accounts.active_order.active
+                && ctx.accounts.active_order.latest_event == ctx.accounts.order.key(),
+            BeatExError::OrderState
+        );
+
+        ctx.accounts.order.withdrawal_state = next_state;
+        ctx.accounts.order.terminal_nullifier = binding.settlement.terminal_nullifier;
+        ctx.accounts.active_order.active = false;
+        ctx.accounts.private_balance.encrypted_base = binding.settlement.credited_encrypted_base;
+        ctx.accounts.private_balance.encrypted_quote = binding.settlement.credited_encrypted_quote;
+        ctx.accounts.private_balance.balance_digest = binding.expected_public_input;
+        ctx.accounts.private_balance.revision = ctx
+            .accounts
+            .private_balance
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| error!(BeatExError::ArithmeticOverflow))?;
+        Ok(())
+    }
+
+    /// Return a cancelled order's private reserves to the internal encrypted
+    /// balance. This is the timeout fallback for traders who do not want to
+    /// cross the Token-2022 boundary.
+    pub fn refund_order_to_balance(
+        ctx: Context<RefundOrderToBalance>,
+        args: ReleaseOrderCollateralArgs,
+    ) -> Result<()> {
+        require!(
+            ctx.accounts.auction.state == AuctionState::Cancelled
+                && ctx.accounts.active_order.active
+                && ctx.accounts.active_order.latest_event == ctx.accounts.order.key(),
+            BeatExError::OrderState
+        );
+        let next_state = queue::advance_withdrawal(
+            ctx.accounts.order.state,
+            ctx.accounts.order.withdrawal_state,
+            WithdrawalKind::Refund,
+        )
+        .map_err(|_| error!(BeatExError::WithdrawalNotAllowed))?;
+        require!(
+            ctx.accounts.release_verification_key.circuit_version
+                == queue::ORDER_MODIFICATION_CIRCUIT_VERSION,
+            BeatExError::InvalidCircuitVersion
+        );
+        let digest = queue_hash::collateral_release_statement_digest(
+            &queue_hash::CollateralReleaseStatement {
+                market: &ctx.accounts.market.key(),
+                auction: &ctx.accounts.auction.key(),
+                active_order: &ctx.accounts.active_order.key(),
+                owner: &ctx.accounts.owner.key(),
+                balance_revision: ctx.accounts.private_balance.revision,
+                client_order_nonce: ctx.accounts.order.client_order_nonce,
+                order_commitment: ctx.accounts.order.order_commitment,
+                committee_key: ctx.accounts.key_epoch.babyjub_encryption_pubkey,
+                old_base: &ctx.accounts.private_balance.encrypted_base,
+                old_quote: &ctx.accounts.private_balance.encrypted_quote,
+                released_base: &args.released_encrypted_base,
+                released_quote: &args.released_encrypted_quote,
+            },
+        )?;
+        groth16::verify_queue_proof(&args.proof, &digest, &ctx.accounts.release_verification_key)?;
+
+        ctx.accounts.order.withdrawal_state = next_state;
+        ctx.accounts.active_order.active = false;
+        ctx.accounts.private_balance.encrypted_base = args.released_encrypted_base;
+        ctx.accounts.private_balance.encrypted_quote = args.released_encrypted_quote;
+        ctx.accounts.private_balance.balance_digest = digest;
+        ctx.accounts.private_balance.revision = ctx
+            .accounts
+            .private_balance
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| error!(BeatExError::ArithmeticOverflow))?;
+        Ok(())
+    }
+
+    /// Settle the latest private order from one auction directly into the
+    /// encrypted balance and place the next auction's order atomically. This
+    /// path avoids Token-2022 proof contexts and requires both auctions to use
+    /// the same active key epoch.
+    pub fn rollover_order(ctx: Context<RolloverOrder>) -> Result<()> {
+        let (settlement_binding, order_binding) =
+            bound_rollover_arguments(&ctx.accounts.instructions.to_account_info(), ctx.accounts)?;
+        let args = RolloverOrderArgs {
+            settlement: settlement_binding.settlement.clone(),
+            next_order: order_binding.next_order,
+        };
+        require!(
+            settlement_binding.settlement.credited_encrypted_base
+                == order_binding.credited_encrypted_base
+                && settlement_binding.settlement.credited_encrypted_quote
+                    == order_binding.credited_encrypted_quote,
+            BeatExError::OrderState
+        );
+        validate_rollover_context(&ctx.accounts.identity, &ctx.accounts.state)?;
+        let slot = Clock::get()?.slot;
+        require!(
+            ctx.accounts.identity.old_auction.state == AuctionState::Settled
+                && ctx.accounts.identity.next_auction.state == AuctionState::Pending,
+            BeatExError::AuctionState
+        );
+        require!(
+            ctx.accounts.state.old_active_order.active,
+            BeatExError::NoActiveOrder
+        );
+        let next_withdrawal_state = queue::advance_withdrawal(
+            ctx.accounts.state.old_order.state,
+            ctx.accounts.state.old_order.withdrawal_state,
+            WithdrawalKind::Claim,
+        )
+        .map_err(|_| error!(BeatExError::WithdrawalNotAllowed))?;
+        require!(
+            ctx.accounts.rollover_verification_key.circuit_version
+                == queue::ROLLOVER_SETTLEMENT_CIRCUIT_VERSION
+                && ctx.accounts.order_verification_key.circuit_version
+                    == ctx.accounts.identity.next_auction.order_circuit_version,
+            BeatExError::InvalidCircuitVersion
+        );
+        require!(
+            args.next_order.ciphertexts.len()
+                == queue::QUEUED_CIPHERTEXT_COUNT * queue::ELGAMAL_CIPHERTEXT_BYTES,
+            BeatExError::UnsupportedQueueGrid
+        );
+        let (sequence, next_count) = queue::accept_order(
+            slot,
+            queue_deadlines(&ctx.accounts.identity.next_auction),
+            ctx.accounts
+                .state
+                .next_submission_counter
+                .accepted_order_count,
+        )
+        .map_err(|_| error!(BeatExError::QueueInvariant))?;
+
+        let next_auction = &ctx.accounts.identity.next_auction;
+
+        let next_order = &mut ctx.accounts.next_order;
+        next_order.version = state::PROTOCOL_VERSION;
+        next_order.market = ctx.accounts.identity.market.key();
+        next_order.auction = next_auction.key();
+        next_order.owner = ctx.accounts.identity.owner.key();
+        next_order.funder = ctx.accounts.identity.owner.key();
+        next_order.client_order_nonce = args.next_order.client_order_nonce;
+        next_order.sequence = sequence;
+        next_order.state = QueuedOrderState::Accepted;
+        next_order.withdrawal_state = WithdrawalState::Pending;
+        next_order.terminal_nullifier = [0; queue::QUEUE_DIGEST_BYTES];
+        next_order.previous_event = Pubkey::default();
+        next_order.ciphertexts = args.next_order.ciphertexts;
+        next_order.ciphertext_digest = queue_hash::initial_order_event_ciphertext_digest(
+            &next_auction.key(),
+            &next_order.key(),
+            &next_order.ciphertexts,
+        )?;
+        next_order.order_commitment = args.next_order.order_commitment;
+        next_order.order_circuit_version = next_auction.order_circuit_version;
+
+        let next_active_order = &mut ctx.accounts.next_active_order;
+        next_active_order.version = state::PROTOCOL_VERSION;
+        next_active_order.market = ctx.accounts.identity.market.key();
+        next_active_order.auction = next_auction.key();
+        next_active_order.owner = ctx.accounts.identity.owner.key();
+        next_active_order.latest_event = next_order.key();
+        next_active_order.revision = 0;
+        next_active_order.active = true;
+
+        ctx.accounts.state.old_order.withdrawal_state = next_withdrawal_state;
+        ctx.accounts.state.old_order.terminal_nullifier = args.settlement.terminal_nullifier;
+        ctx.accounts.state.old_active_order.active = false;
+        ctx.accounts.state.private_balance.encrypted_base = args.next_order.new_encrypted_base;
+        ctx.accounts.state.private_balance.encrypted_quote = args.next_order.new_encrypted_quote;
+        ctx.accounts.state.private_balance.balance_digest = order_binding.expected_public_input;
+        ctx.accounts.state.private_balance.revision = ctx
+            .accounts
+            .state
+            .private_balance
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| error!(BeatExError::ArithmeticOverflow))?;
+        ctx.accounts
+            .state
+            .next_submission_counter
             .accepted_order_count = next_count;
         Ok(())
     }
@@ -593,7 +1320,7 @@ pub mod beatex {
         require!(
             ctx.accounts.fold_verification_key.circuit_kind == QueueCircuitKind::AggregateFold
                 && ctx.accounts.fold_verification_key.circuit_version
-                    == queue::QUEUE_CIRCUIT_VERSION,
+                    == queue::AGGREGATE_FOLD_CIRCUIT_VERSION,
             BeatExError::InvalidCircuitVersion
         );
         let batch_size = ctx.remaining_accounts.len();
@@ -610,7 +1337,8 @@ pub mod beatex {
             if let Some(previous) = previous {
                 require!(previous < *info.key, BeatExError::InvalidFoldBatch);
             }
-            let order = Account::<QueuedOrder>::try_from(info)?;
+            let order = queue::fold_order_metadata(&info.try_borrow_data()?)
+                .ok_or_else(|| error!(BeatExError::InvalidFoldBatch))?;
             require_keys_eq!(
                 order.auction,
                 ctx.accounts.auction.key(),
@@ -650,10 +1378,8 @@ pub mod beatex {
         groth16::verify_queue_proof(&args.proof, &digest, &ctx.accounts.fold_verification_key)?;
 
         for info in ctx.remaining_accounts {
-            let mut order = Account::<QueuedOrder>::try_from(info)?;
-            order.state = queue::fold_order_state(order.state)
+            queue::mark_order_folded(&mut info.try_borrow_mut_data()?)
                 .map_err(|_| error!(BeatExError::OrderAlreadyAggregated))?;
-            order.exit(&crate::ID)?;
         }
         let accumulator = &mut ctx.accounts.accumulator;
         accumulator.ciphertexts = args.new_aggregate;
@@ -876,7 +1602,7 @@ pub mod beatex {
 
     /// Temporary authority-gated finalization endpoint. It exercises immutable
     /// ciphertext aggregation while the Groth16 order-validity verifier is
-    /// still being integrated; it must be removed before an untrusted demo.
+    /// still being integrated; it must be removed before untrusted deployment.
     pub fn finalize_test_order(ctx: Context<FinalizeTestOrder>) -> Result<()> {
         let auction = &mut ctx.accounts.auction;
         let order = &mut ctx.accounts.order;
@@ -1177,21 +1903,6 @@ pub mod beatex {
             &args,
         )
     }
-
-    /// Phase-0 BN254/Groth16 syscall and serialization feasibility endpoint.
-    /// This fixture circuit is intentionally unable to authorize any state
-    /// change or token movement.
-    pub fn verify_groth16_pipeline(
-        _ctx: Context<VerifyGroth16Pipeline>,
-        circuit_version: u16,
-        proof: Groth16ProofInput,
-    ) -> Result<()> {
-        require!(
-            circuit_version == groth16::PIPELINE_CIRCUIT_VERSION,
-            BeatExError::InvalidCircuitVersion
-        );
-        groth16::verify_pipeline_proof(&proof)
-    }
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
@@ -1221,6 +1932,15 @@ pub struct DepositCollateralArgs {
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct WithdrawPublicBalanceArgs {
+    pub base_amount: u64,
+    pub quote_amount: u64,
+    pub remaining_encrypted_base: queue::EncryptedValue,
+    pub remaining_encrypted_quote: queue::EncryptedValue,
+    pub proof: Groth16ProofInput,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
 pub struct SubmitQueuedOrderArgs {
     pub client_order_nonce: u64,
     pub order_commitment: [u8; 32],
@@ -1228,6 +1948,67 @@ pub struct SubmitQueuedOrderArgs {
     pub new_encrypted_base: queue::EncryptedValue,
     pub new_encrypted_quote: queue::EncryptedValue,
     pub proof: Groth16ProofInput,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct ReleaseOrderCollateralArgs {
+    pub released_encrypted_base: queue::EncryptedValue,
+    pub released_encrypted_quote: queue::EncryptedValue,
+    pub proof: Groth16ProofInput,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct ReplaceQueuedOrderArgs {
+    pub release: ReleaseOrderCollateralArgs,
+    pub replacement: SubmitQueuedOrderArgs,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct CancelActiveOrderArgs {
+    pub release: ReleaseOrderCollateralArgs,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct RolloverSettlementArgs {
+    pub terminal_nullifier: [u8; 32],
+    pub credited_encrypted_base: queue::EncryptedValue,
+    pub credited_encrypted_quote: queue::EncryptedValue,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct RolloverNextOrderArgs {
+    pub client_order_nonce: u64,
+    pub order_commitment: [u8; 32],
+    pub ciphertexts: Vec<u8>,
+    pub new_encrypted_base: queue::EncryptedValue,
+    pub new_encrypted_quote: queue::EncryptedValue,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct RolloverOrderArgs {
+    pub settlement: RolloverSettlementArgs,
+    pub next_order: RolloverNextOrderArgs,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct VerifyRolloverProofArgs {
+    pub circuit_kind: QueueCircuitKind,
+    pub expected_public_input: [u8; 32],
+    pub proof: Groth16ProofInput,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct BindRolloverSettlementArgs {
+    pub settlement: RolloverSettlementArgs,
+    pub expected_public_input: [u8; 32],
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct BindRolloverOrderArgs {
+    pub next_order: RolloverNextOrderArgs,
+    pub credited_encrypted_base: queue::EncryptedValue,
+    pub credited_encrypted_quote: queue::EncryptedValue,
+    pub expected_public_input: [u8; 32],
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
@@ -1384,14 +2165,60 @@ pub struct DepositCollateral<'info> {
     /// CHECK: Token account mint and owner are checked before the CPI.
     #[account(mut, owner = token_program.key())]
     pub quote_source: UncheckedAccount<'info>,
-    /// CHECK: Address, authority, mint and confidential extension are checked.
+    /// CHECK: Address, authority and mint are checked before the CPI.
     #[account(mut, owner = token_program.key())]
     pub base_vault: UncheckedAccount<'info>,
-    /// CHECK: Address, authority, mint and confidential extension are checked.
+    /// CHECK: Address, authority and mint are checked before the CPI.
     #[account(mut, owner = token_program.key())]
     pub quote_vault: UncheckedAccount<'info>,
-    /// CHECK: PDA authority for both market vaults; seeds are checked here and
-    /// it signs the confidential-deposit CPIs.
+    /// CHECK: PDA authority for both market vaults; seeds are checked here.
+    #[account(
+        seeds = [b"vault-authority", market.key().as_ref()],
+        bump = market.vault_authority_bump,
+    )]
+    pub vault_authority: UncheckedAccount<'info>,
+    /// CHECK: The handler requires the canonical Token-2022 program id.
+    #[account(executable)]
+    pub token_program: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct WithdrawPublicBalance<'info> {
+    #[account(mut)]
+    pub owner: Signer<'info>,
+    pub market: Box<Account<'info, Market>>,
+    #[account(
+        constraint = key_epoch.key() == market.current_key_epoch @ BeatExError::InvalidKeyEpoch,
+        has_one = market,
+        constraint = !key_epoch.retired @ BeatExError::RetiredKeyEpoch,
+    )]
+    pub key_epoch: Box<Account<'info, KeyEpoch>>,
+    #[account(
+        has_one = market,
+        constraint = deposit_verification_key.circuit_kind == QueueCircuitKind::BalanceDeposit,
+    )]
+    pub deposit_verification_key: Box<Account<'info, QueueVerificationKey>>,
+    #[account(mut, has_one = market, has_one = owner, has_one = key_epoch)]
+    pub private_balance: Box<Account<'info, EncryptedPrivateBalance>>,
+    /// CHECK: Token-2022 ownership and mint data are checked in the handler.
+    #[account(owner = token_program.key())]
+    pub base_mint: UncheckedAccount<'info>,
+    /// CHECK: Token-2022 ownership and mint data are checked in the handler.
+    #[account(owner = token_program.key())]
+    pub quote_mint: UncheckedAccount<'info>,
+    /// CHECK: Vault address, authority and mint are checked in the handler.
+    #[account(mut, owner = token_program.key())]
+    pub base_vault: UncheckedAccount<'info>,
+    /// CHECK: Vault address, authority and mint are checked in the handler.
+    #[account(mut, owner = token_program.key())]
+    pub quote_vault: UncheckedAccount<'info>,
+    /// CHECK: Destination owner and mint are checked in the handler.
+    #[account(mut, owner = token_program.key())]
+    pub base_destination: UncheckedAccount<'info>,
+    /// CHECK: Destination owner and mint are checked in the handler.
+    #[account(mut, owner = token_program.key())]
+    pub quote_destination: UncheckedAccount<'info>,
+    /// CHECK: PDA signs both public vault transfers.
     #[account(
         seeds = [b"vault-authority", market.key().as_ref()],
         bump = market.vault_authority_bump,
@@ -1419,6 +2246,18 @@ pub struct SubmitQueuedOrder<'info> {
         bump,
     )]
     pub order: Box<Account<'info, QueuedOrder>>,
+    #[account(
+        init,
+        payer = owner,
+        space = 8 + ActiveOrder::INIT_SPACE,
+        seeds = [
+            b"active-order",
+            queue_accounts.auction.key().as_ref(),
+            owner.key().as_ref(),
+        ],
+        bump,
+    )]
+    pub active_order: Box<Account<'info, ActiveOrder>>,
     pub system_program: Program<'info, System>,
 }
 
@@ -1437,6 +2276,319 @@ pub struct SubmitQueueAccounts<'info> {
     #[account(mut, has_one = auction)]
     pub submission_counter: Box<Account<'info, SubmissionCounter>>,
     #[account(mut, has_one = market, has_one = key_epoch)]
+    pub private_balance: Box<Account<'info, EncryptedPrivateBalance>>,
+}
+
+#[derive(Accounts)]
+pub struct ModifyActiveOrder<'info> {
+    pub identity: ActiveOrderIdentity<'info>,
+    pub state: ActiveOrderState<'info>,
+    #[account(
+        constraint = order_verification_key.market == identity.market.key()
+            @ BeatExError::OrderState,
+        constraint = order_verification_key.circuit_kind
+            == QueueCircuitKind::OrderSubmission,
+    )]
+    pub order_verification_key: Box<Account<'info, QueueVerificationKey>>,
+    #[account(
+        init,
+        payer = identity.owner,
+        space = 8 + QueuedOrder::INIT_SPACE,
+        seeds = [
+            b"queued-order",
+            identity.auction.key().as_ref(),
+            &state.submission_counter.accepted_order_count.to_le_bytes(),
+        ],
+        bump,
+    )]
+    pub event: Box<Account<'info, QueuedOrder>>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct ActiveOrderIdentity<'info> {
+    #[account(mut)]
+    pub owner: Signer<'info>,
+    pub market: Box<Account<'info, Market>>,
+    #[account(has_one = market, has_one = key_epoch)]
+    pub auction: Box<Account<'info, Auction>>,
+    #[account(has_one = market)]
+    pub key_epoch: Box<Account<'info, KeyEpoch>>,
+    #[account(
+        has_one = market,
+        constraint = release_verification_key.circuit_kind
+            == QueueCircuitKind::OrderModification,
+    )]
+    pub release_verification_key: Box<Account<'info, QueueVerificationKey>>,
+}
+
+#[derive(Accounts)]
+pub struct ActiveOrderState<'info> {
+    #[account(mut)]
+    pub submission_counter: Box<Account<'info, SubmissionCounter>>,
+    #[account(mut)]
+    pub private_balance: Box<Account<'info, EncryptedPrivateBalance>>,
+    #[account(mut)]
+    pub active_order: Box<Account<'info, ActiveOrder>>,
+    pub previous_event: Box<Account<'info, QueuedOrder>>,
+}
+
+#[derive(Accounts)]
+pub struct CancelQueuedOrder<'info> {
+    pub identity: ActiveOrderIdentity<'info>,
+    pub state: ActiveOrderState<'info>,
+    #[account(
+        init,
+        payer = identity.owner,
+        space = 8 + QueuedOrder::INIT_SPACE,
+        seeds = [
+            b"queued-order",
+            identity.auction.key().as_ref(),
+            &state.submission_counter.accepted_order_count.to_le_bytes(),
+        ],
+        bump,
+    )]
+    pub event: Box<Account<'info, QueuedOrder>>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct RolloverOrder<'info> {
+    pub identity: RolloverIdentity<'info>,
+    pub state: RolloverState<'info>,
+    #[account(
+        constraint = rollover_verification_key.market == identity.market.key()
+            @ BeatExError::OrderState,
+        constraint = rollover_verification_key.circuit_kind
+            == QueueCircuitKind::RolloverSettlement,
+    )]
+    pub rollover_verification_key: Box<Account<'info, QueueVerificationKey>>,
+    #[account(
+        constraint = order_verification_key.market == identity.market.key()
+            @ BeatExError::OrderState,
+        constraint = order_verification_key.circuit_kind
+            == QueueCircuitKind::OrderSubmission,
+    )]
+    pub order_verification_key: Box<Account<'info, QueueVerificationKey>>,
+    #[account(
+        mut,
+        seeds = [
+            b"queued-order",
+            identity.next_auction.key().as_ref(),
+            &state.next_submission_counter.accepted_order_count.to_le_bytes(),
+        ],
+        bump = next_order.bump,
+        constraint = next_order.version == 0
+            && next_order.market == identity.market.key()
+            && next_order.auction == identity.next_auction.key()
+            && next_order.owner == identity.owner.key()
+            && next_order.sequence == state.next_submission_counter.accepted_order_count
+            @ BeatExError::OrderState,
+    )]
+    pub next_order: Box<Account<'info, QueuedOrder>>,
+    #[account(
+        mut,
+        seeds = [
+            b"active-order",
+            identity.next_auction.key().as_ref(),
+            identity.owner.key().as_ref(),
+        ],
+        bump = next_active_order.bump,
+        constraint = next_active_order.version == 0
+            && next_active_order.market == identity.market.key()
+            && next_active_order.auction == identity.next_auction.key()
+            && next_active_order.owner == identity.owner.key()
+            && !next_active_order.active
+            @ BeatExError::OrderState,
+    )]
+    pub next_active_order: Box<Account<'info, ActiveOrder>>,
+    /// CHECK: used to authenticate the two immediately preceding proof calls.
+    #[account(address = solana_instructions_sysvar::ID)]
+    pub instructions: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct VerifyRolloverProof<'info> {
+    pub market: Box<Account<'info, Market>>,
+    #[account(
+        has_one = market,
+        constraint = verification_key.circuit_kind
+            == QueueCircuitKind::RolloverSettlement
+            || verification_key.circuit_kind == QueueCircuitKind::OrderSubmission,
+    )]
+    pub verification_key: Box<Account<'info, QueueVerificationKey>>,
+}
+
+#[derive(Accounts)]
+pub struct BindRolloverSettlement<'info> {
+    pub owner: Signer<'info>,
+    pub market: Box<Account<'info, Market>>,
+    #[account(has_one = market, has_one = key_epoch)]
+    pub old_auction: Box<Account<'info, Auction>>,
+    #[account(has_one = market)]
+    pub key_epoch: Box<Account<'info, KeyEpoch>>,
+    #[account(has_one = market, has_one = owner)]
+    pub old_order: Box<Account<'info, QueuedOrder>>,
+    #[account(has_one = market, has_one = owner)]
+    pub old_active_order: Box<Account<'info, ActiveOrder>>,
+    #[account(has_one = market, has_one = owner, has_one = key_epoch)]
+    pub private_balance: Box<Account<'info, EncryptedPrivateBalance>>,
+    #[account(
+        has_one = market,
+        constraint = rollover_verification_key.circuit_kind
+            == QueueCircuitKind::RolloverSettlement,
+    )]
+    pub rollover_verification_key: Box<Account<'info, QueueVerificationKey>>,
+    /// CHECK: authenticates the immediately preceding proof instruction.
+    #[account(address = solana_instructions_sysvar::ID)]
+    pub instructions: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct SettleOrderToBalance<'info> {
+    pub owner: Signer<'info>,
+    pub market: Box<Account<'info, Market>>,
+    #[account(has_one = market, has_one = key_epoch)]
+    pub auction: Box<Account<'info, Auction>>,
+    #[account(has_one = market)]
+    pub key_epoch: Box<Account<'info, KeyEpoch>>,
+    #[account(
+        mut,
+        has_one = market,
+        has_one = owner,
+        constraint = order.auction == auction.key() @ BeatExError::OrderState,
+    )]
+    pub order: Box<Account<'info, QueuedOrder>>,
+    #[account(
+        mut,
+        has_one = market,
+        has_one = owner,
+        constraint = active_order.auction == auction.key() @ BeatExError::OrderState,
+    )]
+    pub active_order: Box<Account<'info, ActiveOrder>>,
+    #[account(mut, has_one = market, has_one = owner, has_one = key_epoch)]
+    pub private_balance: Box<Account<'info, EncryptedPrivateBalance>>,
+    #[account(
+        has_one = market,
+        constraint = rollover_verification_key.circuit_kind
+            == QueueCircuitKind::RolloverSettlement,
+    )]
+    pub rollover_verification_key: Box<Account<'info, QueueVerificationKey>>,
+    /// CHECK: authenticates the immediately preceding settlement binding.
+    #[account(address = solana_instructions_sysvar::ID)]
+    pub instructions: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct RefundOrderToBalance<'info> {
+    pub owner: Signer<'info>,
+    pub market: Box<Account<'info, Market>>,
+    #[account(has_one = market, has_one = key_epoch)]
+    pub auction: Box<Account<'info, Auction>>,
+    #[account(has_one = market)]
+    pub key_epoch: Box<Account<'info, KeyEpoch>>,
+    #[account(
+        has_one = market,
+        constraint = release_verification_key.circuit_kind
+            == QueueCircuitKind::OrderModification,
+    )]
+    pub release_verification_key: Box<Account<'info, QueueVerificationKey>>,
+    #[account(mut, has_one = market, has_one = owner, has_one = key_epoch)]
+    pub private_balance: Box<Account<'info, EncryptedPrivateBalance>>,
+    #[account(
+        mut,
+        has_one = market,
+        has_one = owner,
+        constraint = active_order.auction == auction.key() @ BeatExError::OrderState,
+    )]
+    pub active_order: Box<Account<'info, ActiveOrder>>,
+    #[account(
+        mut,
+        has_one = market,
+        has_one = owner,
+        constraint = order.auction == auction.key() @ BeatExError::OrderState,
+    )]
+    pub order: Box<Account<'info, QueuedOrder>>,
+}
+
+#[derive(Accounts)]
+pub struct BindRolloverOrder<'info> {
+    pub owner: Signer<'info>,
+    pub market: Box<Account<'info, Market>>,
+    #[account(has_one = market, has_one = key_epoch)]
+    pub next_auction: Box<Account<'info, Auction>>,
+    #[account(has_one = market)]
+    pub key_epoch: Box<Account<'info, KeyEpoch>>,
+    #[account(
+        has_one = market,
+        constraint = order_verification_key.circuit_kind
+            == QueueCircuitKind::OrderSubmission,
+    )]
+    pub order_verification_key: Box<Account<'info, QueueVerificationKey>>,
+    /// CHECK: authenticates the immediately preceding proof instruction.
+    #[account(address = solana_instructions_sysvar::ID)]
+    pub instructions: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct PrepareRollover<'info> {
+    #[account(mut)]
+    pub owner: Signer<'info>,
+    pub market: Box<Account<'info, Market>>,
+    pub next_auction: Box<Account<'info, Auction>>,
+    pub next_submission_counter: Box<Account<'info, SubmissionCounter>>,
+    #[account(
+        init,
+        payer = owner,
+        space = 8 + QueuedOrder::INIT_SPACE,
+        seeds = [
+            b"queued-order",
+            next_auction.key().as_ref(),
+            &next_submission_counter.accepted_order_count.to_le_bytes(),
+        ],
+        bump,
+    )]
+    pub next_order: Box<Account<'info, QueuedOrder>>,
+    #[account(
+        init,
+        payer = owner,
+        space = 8 + ActiveOrder::INIT_SPACE,
+        seeds = [
+            b"active-order",
+            next_auction.key().as_ref(),
+            owner.key().as_ref(),
+        ],
+        bump,
+    )]
+    pub next_active_order: Box<Account<'info, ActiveOrder>>,
+    /// CHECK: constrained to the canonical instructions sysvar address.
+    #[account(address = solana_instructions_sysvar::ID)]
+    pub instructions: UncheckedAccount<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct RolloverIdentity<'info> {
+    #[account(mut)]
+    pub owner: Signer<'info>,
+    pub market: Box<Account<'info, Market>>,
+    #[account(has_one = market, has_one = key_epoch)]
+    pub old_auction: Box<Account<'info, Auction>>,
+    #[account(has_one = market, has_one = key_epoch)]
+    pub next_auction: Box<Account<'info, Auction>>,
+    #[account(has_one = market)]
+    pub key_epoch: Box<Account<'info, KeyEpoch>>,
+}
+
+#[derive(Accounts)]
+pub struct RolloverState<'info> {
+    #[account(mut)]
+    pub old_order: Box<Account<'info, QueuedOrder>>,
+    #[account(mut)]
+    pub old_active_order: Box<Account<'info, ActiveOrder>>,
+    #[account(mut)]
+    pub next_submission_counter: Box<Account<'info, SubmissionCounter>>,
+    #[account(mut)]
     pub private_balance: Box<Account<'info, EncryptedPrivateBalance>>,
 }
 
@@ -1700,12 +2852,7 @@ pub struct PrivateWithdrawal<'info> {
         has_one = market,
     )]
     pub key_epoch: Box<Account<'info, KeyEpoch>>,
-    #[account(
-        mut,
-        has_one = market,
-        has_one = auction,
-    )]
-    pub order: Box<Account<'info, QueuedOrder>>,
+    pub withdrawal_order: PrivateWithdrawalOrder<'info>,
     #[account(has_one = market)]
     pub withdrawal_verification_key: Box<Account<'info, QueueVerificationKey>>,
     pub base_transfer_accounts: ConfidentialTransferAccounts<'info>,
@@ -1719,6 +2866,14 @@ pub struct PrivateWithdrawal<'info> {
     /// CHECK: The helper requires the canonical Token-2022 program id.
     #[account(executable)]
     pub token_program: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct PrivateWithdrawalOrder<'info> {
+    #[account(mut)]
+    pub order: Box<Account<'info, QueuedOrder>>,
+    #[account(mut)]
+    pub active_order: Box<Account<'info, ActiveOrder>>,
 }
 
 #[derive(Accounts)]
@@ -1794,9 +2949,6 @@ pub struct VerifyThresholdDecryption<'info> {
     pub key_epoch: Box<Account<'info, KeyEpoch>>,
 }
 
-#[derive(Accounts)]
-pub struct VerifyGroth16Pipeline {}
-
 #[account]
 #[derive(InitSpace)]
 pub struct KeyEpoch {
@@ -1820,7 +2972,7 @@ pub struct KeyEpoch {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn transfer_demo_deposit_asset<'info>(
+fn transfer_public_deposit_asset<'info>(
     amount: u64,
     owner: &AccountInfo<'info>,
     source: &AccountInfo<'info>,
@@ -1832,7 +2984,6 @@ fn transfer_demo_deposit_asset<'info>(
     expected_vault: &Pubkey,
     market: &Pubkey,
     vault_authority_bump: u8,
-    expected_elgamal_pubkey: &[u8; 32],
 ) -> Result<()> {
     require_keys_eq!(
         *mint.key,
@@ -1868,13 +3019,6 @@ fn transfer_demo_deposit_asset<'info>(
         expected_mint,
         &vault_authority,
     )?;
-    token2022::validate_confidential_vault(
-        &vault.try_borrow_data()?,
-        expected_mint,
-        &vault_authority,
-        expected_elgamal_pubkey,
-    )?;
-
     if amount == 0 {
         return Ok(());
     }
@@ -1891,20 +3035,9 @@ fn transfer_demo_deposit_asset<'info>(
         amount,
         decimals,
     )?;
-    let bump = [vault_authority_bump];
-    let signer_seeds: &[&[u8]] = &[b"vault-authority", market.as_ref(), &bump];
-    token2022::invoke_confidential_deposit(
-        token_program,
-        vault,
-        mint,
-        vault_authority_account,
-        amount,
-        decimals,
-        &[signer_seeds],
-    )?;
 
-    // Reject fee-bearing or otherwise non-exact demo deposits. This keeps the
-    // public amount in the Groth16 statement identical to actual vault credit.
+    // Reject fee-bearing or otherwise non-exact deposits. Internal encrypted
+    // credit must remain exactly backed by the vault's public token balance.
     let source_after = token2022::validate_public_token_account(
         &source.try_borrow_data()?,
         expected_mint,
@@ -1915,13 +3048,99 @@ fn transfer_demo_deposit_asset<'info>(
         expected_mint,
         &vault_authority,
     )?;
-    token2022::validate_confidential_deposit_deltas(
-        source_before,
-        source_after,
-        vault_before,
-        vault_after,
+    require!(
+        source_before.checked_sub(source_after) == Some(amount)
+            && vault_after.checked_sub(vault_before) == Some(amount),
+        BeatExError::NonExactDeposit
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn transfer_public_withdrawal_asset<'info>(
+    amount: u64,
+    owner: &AccountInfo<'info>,
+    destination: &AccountInfo<'info>,
+    mint: &AccountInfo<'info>,
+    vault: &AccountInfo<'info>,
+    vault_authority_account: &AccountInfo<'info>,
+    token_program: &AccountInfo<'info>,
+    expected_mint: &Pubkey,
+    expected_vault: &Pubkey,
+    market: &Pubkey,
+    vault_authority_bump: u8,
+) -> Result<()> {
+    require_keys_eq!(
+        *mint.key,
+        *expected_mint,
+        BeatExError::InvalidDepositAccount
+    );
+    require_keys_eq!(
+        *vault.key,
+        *expected_vault,
+        BeatExError::InvalidDepositAccount
+    );
+    require!(
+        destination.key != vault.key,
+        BeatExError::InvalidSettlementDestination
+    );
+    let (vault_authority, derived_bump) =
+        Pubkey::find_program_address(&[b"vault-authority", market.as_ref()], &crate::ID);
+    require!(
+        derived_bump == vault_authority_bump,
+        BeatExError::InvalidDepositAccount
+    );
+    require_keys_eq!(
+        *vault_authority_account.key,
+        vault_authority,
+        BeatExError::InvalidDepositAccount
+    );
+    let decimals = token2022::mint_decimals(&mint.try_borrow_data()?)?;
+    let vault_before = token2022::validate_public_token_account(
+        &vault.try_borrow_data()?,
+        expected_mint,
+        &vault_authority,
+    )?;
+    let destination_before = token2022::validate_public_token_account(
+        &destination.try_borrow_data()?,
+        expected_mint,
+        owner.key,
+    )?;
+    if amount == 0 {
+        return Ok(());
+    }
+    require!(
+        vault_before >= amount,
+        BeatExError::InsufficientDepositFunds
+    );
+    let bump = [vault_authority_bump];
+    let signer_seeds: &[&[u8]] = &[b"vault-authority", market.as_ref(), &bump];
+    token2022::invoke_public_transfer_checked_signed(
+        token_program,
+        vault,
+        mint,
+        destination,
+        vault_authority_account,
         amount,
-    )
+        decimals,
+        &[signer_seeds],
+    )?;
+    let vault_after = token2022::validate_public_token_account(
+        &vault.try_borrow_data()?,
+        expected_mint,
+        &vault_authority,
+    )?;
+    let destination_after = token2022::validate_public_token_account(
+        &destination.try_borrow_data()?,
+        expected_mint,
+        owner.key,
+    )?;
+    require!(
+        vault_before.checked_sub(vault_after) == Some(amount)
+            && destination_after.checked_sub(destination_before) == Some(amount),
+        BeatExError::NonExactDeposit
+    );
+    Ok(())
 }
 
 fn validate_test_settlement_accounts(ctx: &Context<SettleTestOrder>) -> Result<()> {
@@ -1973,7 +3192,17 @@ fn execute_private_withdrawal(
     args: PrivateWithdrawalArgs,
 ) -> Result<()> {
     let auction = &ctx.accounts.auction;
-    let order = &ctx.accounts.order;
+    validate_private_withdrawal_order_context(&ctx)?;
+    let order = &ctx.accounts.withdrawal_order.order;
+    require!(
+        ctx.accounts.withdrawal_order.active_order.active,
+        BeatExError::NoActiveOrder
+    );
+    require_keys_eq!(
+        ctx.accounts.withdrawal_order.active_order.latest_event,
+        order.key(),
+        BeatExError::StaleActiveOrder
+    );
     let next_state =
         queue::advance_withdrawal(order.state, order.withdrawal_state, kind).map_err(|reason| {
             match reason {
@@ -2137,9 +3366,28 @@ fn execute_private_withdrawal(
         &[signer_seeds],
     )?;
 
-    let order = &mut ctx.accounts.order;
+    let order = &mut ctx.accounts.withdrawal_order.order;
     order.withdrawal_state = next_state;
     order.terminal_nullifier = args.terminal_nullifier;
+    ctx.accounts.withdrawal_order.active_order.active = false;
+    Ok(())
+}
+
+fn validate_private_withdrawal_order_context(ctx: &Context<PrivateWithdrawal>) -> Result<()> {
+    let market = &ctx.accounts.market;
+    let auction = &ctx.accounts.auction;
+    let order = &ctx.accounts.withdrawal_order.order;
+    let active_order = &ctx.accounts.withdrawal_order.active_order;
+    require_keys_eq!(order.market, market.key(), BeatExError::OrderState);
+    require_keys_eq!(order.auction, auction.key(), BeatExError::OrderState);
+    require_keys_eq!(active_order.market, market.key(), BeatExError::OrderState);
+    require_keys_eq!(active_order.auction, auction.key(), BeatExError::OrderState);
+    require_keys_eq!(active_order.owner, order.owner, BeatExError::OrderState);
+    require_keys_eq!(
+        active_order.latest_event,
+        order.key(),
+        BeatExError::StaleActiveOrder
+    );
     Ok(())
 }
 
@@ -2261,6 +3509,229 @@ fn queue_deadlines(auction: &Auction) -> queue::QueueDeadlines {
         collection_end_slot: auction.submission_end_slot,
         aggregation_deadline_slot: auction.aggregation_deadline_slot,
     }
+}
+
+fn validate_active_order_context(
+    identity: &ActiveOrderIdentity<'_>,
+    state: &ActiveOrderState<'_>,
+) -> Result<()> {
+    let market = identity.market.key();
+    let auction = identity.auction.key();
+    let key_epoch = identity.key_epoch.key();
+    let owner = identity.owner.key();
+    require_keys_eq!(
+        state.submission_counter.auction,
+        auction,
+        BeatExError::OrderState
+    );
+    require_keys_eq!(
+        state.private_balance.market,
+        market,
+        BeatExError::OrderState
+    );
+    require_keys_eq!(
+        state.private_balance.key_epoch,
+        key_epoch,
+        BeatExError::InvalidKeyEpoch
+    );
+    require_keys_eq!(state.private_balance.owner, owner, BeatExError::OrderState);
+    require_keys_eq!(state.active_order.market, market, BeatExError::OrderState);
+    require_keys_eq!(state.active_order.auction, auction, BeatExError::OrderState);
+    require_keys_eq!(state.active_order.owner, owner, BeatExError::OrderState);
+    require_keys_eq!(state.previous_event.market, market, BeatExError::OrderState);
+    require_keys_eq!(
+        state.previous_event.auction,
+        auction,
+        BeatExError::OrderState
+    );
+    require_keys_eq!(state.previous_event.owner, owner, BeatExError::OrderState);
+    require_keys_eq!(
+        state.active_order.latest_event,
+        state.previous_event.key(),
+        BeatExError::StaleActiveOrder
+    );
+    Ok(())
+}
+
+fn verified_rollover_public_input(
+    instructions: &AccountInfo<'_>,
+    prior_instruction_offset: u16,
+    expected_verification_key: &Pubkey,
+    expected_circuit_kind: QueueCircuitKind,
+) -> Result<[u8; 32]> {
+    let current_index = solana_instructions_sysvar::load_current_index_checked(instructions)?;
+    let verification_index = current_index
+        .checked_sub(prior_instruction_offset)
+        .ok_or_else(|| error!(BeatExError::OrderState))?;
+    let instruction = solana_instructions_sysvar::load_instruction_at_checked(
+        usize::from(verification_index),
+        instructions,
+    )?;
+    require!(
+        instruction.program_id == crate::ID
+            && instruction
+                .data
+                .starts_with(crate::instruction::VerifyRolloverProof::DISCRIMINATOR)
+            && instruction.accounts.len() > 1
+            && instruction.accounts[1].pubkey == *expected_verification_key,
+        BeatExError::OrderState
+    );
+    let mut encoded_args = &instruction.data[8..];
+    let args = VerifyRolloverProofArgs::deserialize(&mut encoded_args)
+        .map_err(|_| error!(BeatExError::OrderState))?;
+    require!(
+        encoded_args.is_empty() && args.circuit_kind == expected_circuit_kind,
+        BeatExError::OrderState
+    );
+    Ok(args.expected_public_input)
+}
+
+fn bound_rollover_arguments(
+    instructions: &AccountInfo<'_>,
+    accounts: &RolloverOrder<'_>,
+) -> Result<(BindRolloverSettlementArgs, BindRolloverOrderArgs)> {
+    let current_index = solana_instructions_sysvar::load_current_index_checked(instructions)?;
+    let settlement_index = current_index
+        .checked_sub(3)
+        .ok_or_else(|| error!(BeatExError::OrderState))?;
+    let order_index = current_index
+        .checked_sub(1)
+        .ok_or_else(|| error!(BeatExError::OrderState))?;
+    let settlement_instruction = solana_instructions_sysvar::load_instruction_at_checked(
+        usize::from(settlement_index),
+        instructions,
+    )?;
+    let order_instruction = solana_instructions_sysvar::load_instruction_at_checked(
+        usize::from(order_index),
+        instructions,
+    )?;
+    require!(
+        settlement_instruction.program_id == crate::ID
+            && settlement_instruction
+                .data
+                .starts_with(crate::instruction::BindRolloverSettlement::DISCRIMINATOR)
+            && settlement_instruction.accounts.len() > 8
+            && settlement_instruction.accounts[0].pubkey == accounts.identity.owner.key()
+            && settlement_instruction.accounts[1].pubkey == accounts.identity.market.key()
+            && settlement_instruction.accounts[2].pubkey == accounts.identity.old_auction.key()
+            && settlement_instruction.accounts[3].pubkey == accounts.identity.key_epoch.key()
+            && settlement_instruction.accounts[4].pubkey == accounts.state.old_order.key()
+            && settlement_instruction.accounts[5].pubkey == accounts.state.old_active_order.key()
+            && settlement_instruction.accounts[6].pubkey == accounts.state.private_balance.key()
+            && settlement_instruction.accounts[7].pubkey
+                == accounts.rollover_verification_key.key()
+            && settlement_instruction.accounts[8].pubkey == solana_instructions_sysvar::ID
+            && order_instruction.program_id == crate::ID
+            && order_instruction
+                .data
+                .starts_with(crate::instruction::BindRolloverOrder::DISCRIMINATOR)
+            && order_instruction.accounts.len() > 5
+            && order_instruction.accounts[0].pubkey == accounts.identity.owner.key()
+            && order_instruction.accounts[1].pubkey == accounts.identity.market.key()
+            && order_instruction.accounts[2].pubkey == accounts.identity.next_auction.key()
+            && order_instruction.accounts[3].pubkey == accounts.identity.key_epoch.key()
+            && order_instruction.accounts[4].pubkey == accounts.order_verification_key.key()
+            && order_instruction.accounts[5].pubkey == solana_instructions_sysvar::ID,
+        BeatExError::OrderState
+    );
+    let mut settlement_data = &settlement_instruction.data[8..];
+    let settlement = BindRolloverSettlementArgs::deserialize(&mut settlement_data)
+        .map_err(|_| error!(BeatExError::OrderState))?;
+    let mut order_data = &order_instruction.data[8..];
+    let order = BindRolloverOrderArgs::deserialize(&mut order_data)
+        .map_err(|_| error!(BeatExError::OrderState))?;
+    require!(
+        settlement_data.is_empty() && order_data.is_empty(),
+        BeatExError::OrderState
+    );
+    Ok((settlement, order))
+}
+
+fn bound_settlement_arguments(
+    instructions: &AccountInfo<'_>,
+    accounts: &SettleOrderToBalance<'_>,
+) -> Result<BindRolloverSettlementArgs> {
+    let current_index = solana_instructions_sysvar::load_current_index_checked(instructions)?;
+    let binding_index = current_index
+        .checked_sub(1)
+        .ok_or_else(|| error!(BeatExError::OrderState))?;
+    let instruction = solana_instructions_sysvar::load_instruction_at_checked(
+        usize::from(binding_index),
+        instructions,
+    )?;
+    require!(
+        instruction.program_id == crate::ID
+            && instruction
+                .data
+                .starts_with(crate::instruction::BindRolloverSettlement::DISCRIMINATOR)
+            && instruction.accounts.len() > 8
+            && instruction.accounts[0].pubkey == accounts.owner.key()
+            && instruction.accounts[1].pubkey == accounts.market.key()
+            && instruction.accounts[2].pubkey == accounts.auction.key()
+            && instruction.accounts[3].pubkey == accounts.key_epoch.key()
+            && instruction.accounts[4].pubkey == accounts.order.key()
+            && instruction.accounts[5].pubkey == accounts.active_order.key()
+            && instruction.accounts[6].pubkey == accounts.private_balance.key()
+            && instruction.accounts[7].pubkey == accounts.rollover_verification_key.key()
+            && instruction.accounts[8].pubkey == solana_instructions_sysvar::ID,
+        BeatExError::OrderState
+    );
+    let mut encoded = &instruction.data[8..];
+    let binding = BindRolloverSettlementArgs::deserialize(&mut encoded)
+        .map_err(|_| error!(BeatExError::OrderState))?;
+    require!(encoded.is_empty(), BeatExError::OrderState);
+    Ok(binding)
+}
+
+fn validate_rollover_context(
+    identity: &RolloverIdentity<'_>,
+    state: &RolloverState<'_>,
+) -> Result<()> {
+    let market = identity.market.key();
+    let old_auction = identity.old_auction.key();
+    let next_auction = identity.next_auction.key();
+    let key_epoch = identity.key_epoch.key();
+    let owner = identity.owner.key();
+    require_keys_eq!(state.old_order.market, market, BeatExError::OrderState);
+    require_keys_eq!(
+        state.old_order.auction,
+        old_auction,
+        BeatExError::OrderState
+    );
+    require_keys_eq!(state.old_order.owner, owner, BeatExError::OrderState);
+    require_keys_eq!(
+        state.old_active_order.market,
+        market,
+        BeatExError::OrderState
+    );
+    require_keys_eq!(
+        state.old_active_order.auction,
+        old_auction,
+        BeatExError::OrderState
+    );
+    require_keys_eq!(state.old_active_order.owner, owner, BeatExError::OrderState);
+    require_keys_eq!(
+        state.old_active_order.latest_event,
+        state.old_order.key(),
+        BeatExError::StaleActiveOrder
+    );
+    require_keys_eq!(
+        state.next_submission_counter.auction,
+        next_auction,
+        BeatExError::OrderState
+    );
+    require_keys_eq!(
+        state.private_balance.market,
+        market,
+        BeatExError::OrderState
+    );
+    require_keys_eq!(
+        state.private_balance.key_epoch,
+        key_epoch,
+        BeatExError::InvalidKeyEpoch
+    );
+    require_keys_eq!(state.private_balance.owner, owner, BeatExError::OrderState);
+    Ok(())
 }
 
 fn current_auction_id(market: &Market, slot: u64) -> Result<u64> {
@@ -2390,6 +3861,10 @@ pub enum BeatExError {
     IncompleteOrder,
     #[msg("the order has already been aggregated")]
     OrderAlreadyAggregated,
+    #[msg("the active-order pointer does not match the supplied previous event")]
+    StaleActiveOrder,
+    #[msg("the wallet has no active order to replace or cancel")]
+    NoActiveOrder,
     #[msg("the supplied ciphertext is not the auction aggregate entry")]
     CiphertextMismatch,
     #[msg("the aggregate entry has already been decrypted")]
@@ -2432,6 +3907,8 @@ pub enum BeatExError {
     InvalidInitialBalance,
     #[msg("the deposit must credit at least one asset")]
     EmptyDeposit,
+    #[msg("the withdrawal must debit at least one asset")]
+    EmptyWithdrawal,
     #[msg("a Token-2022 mint, source or vault is not valid for this deposit")]
     InvalidDepositAccount,
     #[msg("the depositing token account does not contain enough public funds")]

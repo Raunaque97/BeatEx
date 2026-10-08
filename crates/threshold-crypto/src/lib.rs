@@ -10,7 +10,7 @@ use {
         scalar::Scalar,
         traits::{Identity, IsIdentity},
     },
-    rand::rngs::OsRng,
+    rand::{rngs::OsRng, CryptoRng, RngCore},
     sha2::{Digest, Sha256},
     solana_zk_sdk::encryption::{
         elgamal::{ElGamalCiphertext, ElGamalKeypair, ElGamalPubkey, ElGamalSecretKey},
@@ -105,6 +105,12 @@ impl ParticipantSecretShare {
 
     pub fn public_share(&self) -> &ParticipantPublicShare {
         &self.public
+    }
+
+    /// Export the scalar for storage in a committee participant's private
+    /// keystore. Callers must treat the returned bytes as secret material.
+    pub fn secret_bytes(&self) -> [u8; 32] {
+        self.scalar.to_bytes()
     }
 }
 
@@ -219,18 +225,49 @@ pub fn dealer_setup(
     participant_count: usize,
     context: &[u8],
 ) -> Result<DealerSetup, ThresholdError> {
+    dealer_setup_with_keypair(
+        threshold,
+        participant_count,
+        context,
+        &ElGamalKeypair::new_rand(),
+    )
+}
+
+/// Create a dealer-assisted threshold configuration around an existing
+/// Solana ElGamal keypair. This is needed when a Token-2022 confidential vault
+/// was configured first and the committee must share that exact decryption
+/// key rather than introduce a second, unrelated key.
+pub fn dealer_setup_with_keypair(
+    threshold: usize,
+    participant_count: usize,
+    context: &[u8],
+    keypair: &ElGamalKeypair,
+) -> Result<DealerSetup, ThresholdError> {
+    dealer_setup_with_keypair_and_rng(threshold, participant_count, context, keypair, &mut OsRng)
+}
+
+/// Variant of [`dealer_setup_with_keypair`] with caller-supplied randomness.
+/// This is useful for an auditable setup process and deterministic integration
+/// environments. Production callers must provide a cryptographically secure
+/// RNG and must never reuse its seed across independent committees.
+pub fn dealer_setup_with_keypair_and_rng<R: RngCore + CryptoRng>(
+    threshold: usize,
+    participant_count: usize,
+    context: &[u8],
+    keypair: &ElGamalKeypair,
+    rng: &mut R,
+) -> Result<DealerSetup, ThresholdError> {
     if threshold == 0 || participant_count < threshold || participant_count > u32::MAX as usize {
         return Err(ThresholdError::InvalidParameters);
     }
 
-    let keypair = ElGamalKeypair::new_rand();
     let mut master_secret = *keypair.secret().get_scalar();
     let encryption_pubkey = keypair.pubkey_owned();
 
     let mut coefficients = Vec::with_capacity(threshold);
     coefficients.push(master_secret);
     for _ in 1..threshold {
-        coefficients.push(Scalar::random(&mut OsRng));
+        coefficients.push(Scalar::random(&mut *rng));
     }
 
     let coefficient_commitments = coefficients
@@ -770,6 +807,24 @@ mod tests {
         let bytes = ciphertext.to_bytes();
         assert_eq!(bytes.len(), 64);
         assert_eq!(ElGamalCiphertext::from_bytes(&bytes), Some(ciphertext));
+    }
+
+    #[test]
+    fn setup_can_share_an_existing_token2022_elgamal_key() {
+        let keypair = ElGamalKeypair::new_rand();
+        let expected_pubkey = keypair.pubkey_owned();
+        let setup = dealer_setup_with_keypair(3, 7, SETUP_CONTEXT, &keypair).unwrap();
+        assert_eq!(setup.public.encryption_pubkey, expected_pubkey);
+        let reconstructed = reconstruct_elgamal_keypair(
+            &setup.public,
+            &[
+                &setup.secret_shares[0],
+                &setup.secret_shares[3],
+                &setup.secret_shares[6],
+            ],
+        )
+        .unwrap();
+        assert_eq!(reconstructed.pubkey(), &expected_pubkey);
     }
 
     #[test]

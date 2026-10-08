@@ -1,6 +1,6 @@
 # BeatEx Groth16 feasibility spike
 
-This standalone, host-only crate demonstrates deterministic BN254 Groth16
+This standalone, host-only crate validates deterministic BN254 Groth16
 setup, proving, Arkworks verification, and verification of exported bytes with
 Light Protocol's `groth16-solana` verifier.
 

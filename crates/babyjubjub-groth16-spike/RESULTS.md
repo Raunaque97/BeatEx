@@ -151,14 +151,20 @@ key epoch, revision, amounts, key, and all four old/new ciphertexts.
 | Native proving median | 380.048 ms |
 | Compressed proving key | 5,127,920 bytes |
 | Estimated instruction payload | about 432 bytes |
-| Full two-asset SBF deposit path | 159,533 CU |
+| Full two-asset SBF deposit path | 132,113 CU |
 
 The SBF path verifies the proof, moves public tokens from the trader sources
-to the market vaults, immediately converts those public vault amounts into
-Token-2022 confidential pending balances, and only then advances the encrypted
-private-balance revision.
+to the market vaults, verifies exact source and vault deltas, and only then
+advances the encrypted private-balance revision. The funds remain in the
+vaults' public Token-2022 balances while trading state remains encrypted.
 
-## Private claim and cancellation refund
+The public withdrawal uses the same relation in reverse: the remaining private
+balance plus the declared withdrawal must equal the current balance. Its
+release test, including deterministic setup and proof generation, completes in
+under 0.7 seconds on an Apple M4. The two-asset SBF withdrawal consumes 132,157
+CU and transfers both public amounts in one transaction.
+
+## Optional confidential Token-2022 claim and cancellation refund
 
 The withdrawal circuit reopens the salted order commitment authenticated at
 submission, selects the buy/sell quantities at only the clearing index, and
@@ -187,9 +193,26 @@ Groth16 proof.
 The proof is correct but is not presently suitable for browser generation or
 an interactive claim UX. The prototype therefore assigns claim/refund proving
 to the committee-side vault-proof service. Faster proving, GPU acceleration,
-or a different exact cross-curve backend remains demo-hardening work.
+or a different exact cross-curve backend remains Devnet-integration work.
 
 The full SBF fixture uses independently generated standard Token-2022 proof
 bundles, the exact program-bound claim witness, and the production withdrawal
 handler. Both confidential destination pending balances and the terminal order
 state are checked after the atomic transaction.
+
+## Encrypted-balance rollover and order modification
+
+Recurring market makers can settle directly into their encrypted balance and
+place the next order without the Ristretto/Token-2022 bridge. The rollover and
+order proofs are independent once the intermediate ciphertexts are selected and
+can therefore be generated concurrently.
+
+| Measurement | Rollover settlement | Collateral release |
+| --- | ---: | ---: |
+| Constraints | 31,880 | 29,024 |
+| Recurring proof, Apple M4 | 0.526–0.549 s | 0.425–0.429 s |
+
+The ordinary 234,166-constraint order proof remains the latency-dominant part
+of rollover at roughly 2.2 seconds. Replacement composes the smaller collateral
+release proof with that same order proof; cancellation needs only the release
+proof.

@@ -28,11 +28,11 @@ transcript compatibility must be checked on Devnet.
 ## Interpretation
 
 - Browser proof generation is fast enough even at 65 levels.
-- The native proof program supports the 17-level demo comfortably, but requires
+- The native proof program supports the 17-level Devnet configuration comfortably, but requires
   14 proof-verification transactions before order-write/finalize transactions.
 - 33 and 65 levels remain cryptographically feasible, but require 27 and 52
   proof transactions and a sharded replacement for the current monolithic
-  auction account. They are poor hackathon-demo defaults.
+  auction account. They are poor Devnet defaults.
 - The recommended current cap remains 17 levels. The cap is caused by the
   account layout and transaction UX, not browser proving time.
 

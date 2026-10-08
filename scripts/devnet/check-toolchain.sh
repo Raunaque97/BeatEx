@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+project_root="$(cd "$script_dir/../.." && pwd)"
+user_cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin"
+if [[ -d "$user_cargo_bin" ]]; then
+  PATH="$PATH:$user_cargo_bin"
+fi
+if [[ -d "$project_root/.devnet/tools/bin" ]]; then
+  PATH="$project_root/.devnet/tools/bin:$PATH"
+fi
+
 failures=0
 
 check_command() {
@@ -18,7 +28,7 @@ check_command() {
   printf 'FOUND    %-24s %s\n' "$command_name" "$version"
 }
 
-printf 'BeatEx demo toolchain\n\n'
+printf 'BeatEx Devnet toolchain\n\n'
 check_command anchor 'Anchor CLI 1.1.2'
 check_command solana 'Solana/Agave CLI 3.1.10'
 check_command solana-keygen 'bundled with Solana/Agave CLI 3.1.10'

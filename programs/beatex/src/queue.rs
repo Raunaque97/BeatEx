@@ -18,6 +18,9 @@ pub const ELGAMAL_CIPHERTEXT_BYTES: usize = 64;
 /// Digest size used to bind ciphertext account data to Groth16 public inputs.
 pub const QUEUE_DIGEST_BYTES: usize = 32;
 pub const QUEUE_CIRCUIT_VERSION: u16 = 1;
+pub const AGGREGATE_FOLD_CIRCUIT_VERSION: u16 = 2;
+pub const ORDER_MODIFICATION_CIRCUIT_VERSION: u16 = 1;
+pub const ROLLOVER_SETTLEMENT_CIRCUIT_VERSION: u16 = 1;
 /// Order circuit v1 range-constrains each per-level quantity to four bits.
 pub const MAX_PRIVATE_ORDER_QUANTITY: u64 = 15;
 /// Version 2 replaces per-entry threshold interpolation with one
@@ -81,6 +84,10 @@ pub enum QueueCircuitKind {
     /// Explicit discriminants are part of the verification-key PDA namespace.
     /// Existing variants must never be renumbered; new variants append here.
     CancellationRefund = 5,
+    /// Replaces one active order or cancels it back to the encrypted balance.
+    OrderModification = 6,
+    /// Credits a settled private payout directly into the encrypted balance.
+    RolloverSettlement = 7,
 }
 
 pub const fn circuit_version(kind: QueueCircuitKind) -> u16 {
@@ -88,9 +95,12 @@ pub const fn circuit_version(kind: QueueCircuitKind) -> u16 {
         QueueCircuitKind::AggregatePublication => AGGREGATE_PUBLICATION_CIRCUIT_VERSION,
         QueueCircuitKind::PrivateClaim => PRIVATE_CLAIM_CIRCUIT_VERSION,
         QueueCircuitKind::CancellationRefund => CANCELLATION_REFUND_CIRCUIT_VERSION,
-        QueueCircuitKind::OrderSubmission
-        | QueueCircuitKind::AggregateFold
-        | QueueCircuitKind::BalanceDeposit => QUEUE_CIRCUIT_VERSION,
+        QueueCircuitKind::AggregateFold => AGGREGATE_FOLD_CIRCUIT_VERSION,
+        QueueCircuitKind::OrderModification => ORDER_MODIFICATION_CIRCUIT_VERSION,
+        QueueCircuitKind::RolloverSettlement => ROLLOVER_SETTLEMENT_CIRCUIT_VERSION,
+        QueueCircuitKind::OrderSubmission | QueueCircuitKind::BalanceDeposit => {
+            QUEUE_CIRCUIT_VERSION
+        }
     }
 }
 
@@ -161,6 +171,11 @@ pub struct QueuedOrder {
     /// Circuit-derived terminal nullifier. It remains zero while pending and is
     /// written atomically with the eventual claim or refund token movement.
     pub terminal_nullifier: [u8; QUEUE_DIGEST_BYTES],
+    /// Immutable event whose ciphertexts this event replaces. Initial
+    /// submissions use `Pubkey::default()` and therefore replace encrypted
+    /// zero. Following the pointer keeps the old curve available to fold bots
+    /// without duplicating 2,176 bytes in every replacement account.
+    pub previous_event: Pubkey,
     #[max_len(2176)]
     pub ciphertexts: Vec<u8>,
     /// Hash of the canonical auction/order metadata and all ciphertext bytes.
@@ -168,6 +183,81 @@ pub struct QueuedOrder {
     /// Poseidon commitment to private quantities, reserves and salt.
     pub order_commitment: [u8; QUEUE_DIGEST_BYTES],
     pub order_circuit_version: u16,
+    pub bump: u8,
+}
+
+const QUEUED_ORDER_VERSION_OFFSET: usize = 8;
+const QUEUED_ORDER_AUCTION_OFFSET: usize = QUEUED_ORDER_VERSION_OFFSET + 1 + 32;
+const QUEUED_ORDER_STATE_OFFSET: usize = QUEUED_ORDER_AUCTION_OFFSET + 32 + 32 + 32 + 8 + 8;
+const QUEUED_ORDER_CIPHERTEXTS_LEN_OFFSET: usize =
+    QUEUED_ORDER_STATE_OFFSET + 1 + 1 + QUEUE_DIGEST_BYTES + 32;
+
+pub struct FoldOrderMetadata {
+    pub auction: Pubkey,
+    pub state: QueuedOrderState,
+    pub ciphertext_digest: QueueDigest,
+}
+
+/// Read only the fixed fields needed by a fold. This avoids allocating and
+/// copying the 2,176-byte ciphertext vector during SBF execution.
+pub fn fold_order_metadata(data: &[u8]) -> Option<FoldOrderMetadata> {
+    if data.len() < QUEUED_ORDER_CIPHERTEXTS_LEN_OFFSET + 4
+        || &data[..8] != QueuedOrder::DISCRIMINATOR
+        || data[QUEUED_ORDER_VERSION_OFFSET] != crate::state::PROTOCOL_VERSION
+    {
+        return None;
+    }
+    let auction = Pubkey::new_from_array(
+        data[QUEUED_ORDER_AUCTION_OFFSET..QUEUED_ORDER_AUCTION_OFFSET + 32]
+            .try_into()
+            .ok()?,
+    );
+    let state = match data[QUEUED_ORDER_STATE_OFFSET] {
+        value if value == QueuedOrderState::Accepted as u8 => QueuedOrderState::Accepted,
+        value if value == QueuedOrderState::Folded as u8 => QueuedOrderState::Folded,
+        _ => return None,
+    };
+    let ciphertext_len = u32::from_le_bytes(
+        data[QUEUED_ORDER_CIPHERTEXTS_LEN_OFFSET..QUEUED_ORDER_CIPHERTEXTS_LEN_OFFSET + 4]
+            .try_into()
+            .ok()?,
+    ) as usize;
+    if ciphertext_len != QUEUED_CIPHERTEXT_COUNT * ELGAMAL_CIPHERTEXT_BYTES {
+        return None;
+    }
+    let digest_offset = QUEUED_ORDER_CIPHERTEXTS_LEN_OFFSET
+        .checked_add(4)?
+        .checked_add(ciphertext_len)?;
+    let ciphertext_digest = data
+        .get(digest_offset..digest_offset + QUEUE_DIGEST_BYTES)?
+        .try_into()
+        .ok()?;
+    Some(FoldOrderMetadata {
+        auction,
+        state,
+        ciphertext_digest,
+    })
+}
+
+pub fn mark_order_folded(data: &mut [u8]) -> QueueInvariantResult<()> {
+    let metadata = fold_order_metadata(data).ok_or(QueueInvariantError::OrderAlreadyFolded)?;
+    fold_order_state(metadata.state)?;
+    data[QUEUED_ORDER_STATE_OFFSET] = QueuedOrderState::Folded as u8;
+    Ok(())
+}
+
+/// One mutable pointer to the latest private order for `(auction, owner)`.
+/// Historical queue events remain immutable and independently foldable.
+#[account]
+#[derive(InitSpace)]
+pub struct ActiveOrder {
+    pub version: u8,
+    pub market: Pubkey,
+    pub auction: Pubkey,
+    pub owner: Pubkey,
+    pub latest_event: Pubkey,
+    pub revision: u64,
+    pub active: bool,
     pub bump: u8,
 }
 
@@ -397,7 +487,12 @@ const fn validate_counts(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{FoldQueuedOrdersArgs, Groth16ProofInput, SubmitQueuedOrderArgs};
+    use crate::{
+        BindRolloverOrderArgs, BindRolloverSettlementArgs, CancelActiveOrderArgs,
+        FoldQueuedOrdersArgs, Groth16ProofInput, ReleaseOrderCollateralArgs,
+        ReplaceQueuedOrderArgs, RolloverNextOrderArgs, RolloverOrderArgs, RolloverSettlementArgs,
+        SubmitQueuedOrderArgs, VerifyRolloverProofArgs,
+    };
 
     const DEADLINES: QueueDeadlines = QueueDeadlines {
         collection_end_slot: 100,
@@ -412,6 +507,40 @@ mod tests {
     }
 
     #[test]
+    fn allocation_free_fold_view_matches_anchor_layout() {
+        let auction = Pubkey::new_unique();
+        let digest = [0x5a; QUEUE_DIGEST_BYTES];
+        let order = QueuedOrder {
+            version: crate::state::PROTOCOL_VERSION,
+            market: Pubkey::new_unique(),
+            auction,
+            owner: Pubkey::new_unique(),
+            funder: Pubkey::new_unique(),
+            client_order_nonce: 7,
+            sequence: 11,
+            state: QueuedOrderState::Accepted,
+            withdrawal_state: WithdrawalState::Pending,
+            terminal_nullifier: [0; QUEUE_DIGEST_BYTES],
+            previous_event: Pubkey::default(),
+            ciphertexts: vec![1; QUEUED_CIPHERTEXT_COUNT * ELGAMAL_CIPHERTEXT_BYTES],
+            ciphertext_digest: digest,
+            order_commitment: [2; QUEUE_DIGEST_BYTES],
+            order_circuit_version: QUEUE_CIRCUIT_VERSION,
+            bump: 3,
+        };
+        let mut data = Vec::new();
+        order.try_serialize(&mut data).unwrap();
+        let metadata = fold_order_metadata(&data).unwrap();
+        assert_eq!(metadata.auction, auction);
+        assert_eq!(metadata.state, QueuedOrderState::Accepted);
+        assert_eq!(metadata.ciphertext_digest, digest);
+        mark_order_folded(&mut data).unwrap();
+        let decoded = QueuedOrder::try_deserialize(&mut data.as_slice()).unwrap();
+        assert_eq!(decoded.state, QueuedOrderState::Folded);
+        assert_eq!(decoded.ciphertexts, order.ciphertexts);
+    }
+
+    #[test]
     fn circuit_kinds_are_append_only_and_independently_versioned() {
         assert_eq!(QueueCircuitKind::OrderSubmission as u8, 0);
         assert_eq!(QueueCircuitKind::AggregateFold as u8, 1);
@@ -419,6 +548,12 @@ mod tests {
         assert_eq!(QueueCircuitKind::AggregatePublication as u8, 3);
         assert_eq!(QueueCircuitKind::PrivateClaim as u8, 4);
         assert_eq!(QueueCircuitKind::CancellationRefund as u8, 5);
+        assert_eq!(QueueCircuitKind::OrderModification as u8, 6);
+        assert_eq!(QueueCircuitKind::RolloverSettlement as u8, 7);
+        assert_eq!(
+            circuit_version(QueueCircuitKind::AggregateFold),
+            AGGREGATE_FOLD_CIRCUIT_VERSION
+        );
         assert_eq!(
             circuit_version(QueueCircuitKind::PrivateClaim),
             PRIVATE_CLAIM_CIRCUIT_VERSION
@@ -426,6 +561,14 @@ mod tests {
         assert_eq!(
             circuit_version(QueueCircuitKind::CancellationRefund),
             CANCELLATION_REFUND_CIRCUIT_VERSION
+        );
+        assert_eq!(
+            circuit_version(QueueCircuitKind::OrderModification),
+            ORDER_MODIFICATION_CIRCUIT_VERSION
+        );
+        assert_eq!(
+            circuit_version(QueueCircuitKind::RolloverSettlement),
+            ROLLOVER_SETTLEMENT_CIRCUIT_VERSION
         );
     }
 
@@ -601,17 +744,85 @@ mod tests {
         };
         let fold = FoldQueuedOrdersArgs {
             new_aggregate: vec![0; ELGAMAL_CIPHERTEXT_BYTES * QUEUED_CIPHERTEXT_COUNT],
+            proof: proof.clone(),
+        };
+        let release = ReleaseOrderCollateralArgs {
+            released_encrypted_base: [0; 64],
+            released_encrypted_quote: [0; 64],
+            proof: proof.clone(),
+        };
+        let replacement = ReplaceQueuedOrderArgs {
+            release: release.clone(),
+            replacement: submit.clone(),
+        };
+        let cancellation = CancelActiveOrderArgs { release };
+        let rollover = RolloverOrderArgs {
+            settlement: RolloverSettlementArgs {
+                terminal_nullifier: [1; 32],
+                credited_encrypted_base: [0; 64],
+                credited_encrypted_quote: [0; 64],
+            },
+            next_order: RolloverNextOrderArgs {
+                client_order_nonce: submit.client_order_nonce,
+                order_commitment: submit.order_commitment,
+                ciphertexts: submit.ciphertexts.clone(),
+                new_encrypted_base: submit.new_encrypted_base,
+                new_encrypted_quote: submit.new_encrypted_quote,
+            },
+        };
+        let rollover_verification = VerifyRolloverProofArgs {
+            circuit_kind: QueueCircuitKind::RolloverSettlement,
+            expected_public_input: [0; 32],
             proof,
+        };
+        let settlement_binding = BindRolloverSettlementArgs {
+            settlement: rollover.settlement.clone(),
+            expected_public_input: [0; 32],
+        };
+        let order_binding = BindRolloverOrderArgs {
+            next_order: rollover.next_order.clone(),
+            credited_encrypted_base: rollover.settlement.credited_encrypted_base,
+            credited_encrypted_quote: rollover.settlement.credited_encrypted_quote,
+            expected_public_input: [0; 32],
         };
         let mut submit_bytes = Vec::new();
         submit.serialize(&mut submit_bytes).unwrap();
         let mut fold_bytes = Vec::new();
         fold.serialize(&mut fold_bytes).unwrap();
+        let mut replacement_bytes = Vec::new();
+        replacement.serialize(&mut replacement_bytes).unwrap();
+        let mut cancellation_bytes = Vec::new();
+        cancellation.serialize(&mut cancellation_bytes).unwrap();
+        let mut rollover_bytes = Vec::new();
+        rollover.serialize(&mut rollover_bytes).unwrap();
+        let mut rollover_verification_bytes = Vec::new();
+        rollover_verification
+            .serialize(&mut rollover_verification_bytes)
+            .unwrap();
+        let mut settlement_binding_bytes = Vec::new();
+        settlement_binding
+            .serialize(&mut settlement_binding_bytes)
+            .unwrap();
+        let mut order_binding_bytes = Vec::new();
+        order_binding.serialize(&mut order_binding_bytes).unwrap();
         assert_eq!(submit_bytes.len(), 2_636);
         assert_eq!(fold_bytes.len(), 2_468);
-        // Leaves >1 KiB in a 4,096-byte v1 packet for account keys, signature,
-        // blockhash, instruction discriminator and message framing.
+        assert_eq!(replacement_bytes.len(), 3_052);
+        assert_eq!(cancellation_bytes.len(), 416);
+        assert_eq!(rollover_bytes.len(), 2_508);
+        assert_eq!(rollover_verification_bytes.len(), 321);
+        assert_eq!(settlement_binding_bytes.len(), 192);
+        assert_eq!(order_binding_bytes.len(), 2_508);
+        let rollover_instruction_data = 2 * rollover_verification_bytes.len()
+            + settlement_binding_bytes.len()
+            + order_binding_bytes.len()
+            + 6 * 8;
+        assert_eq!(rollover_instruction_data, 3_390);
+        // The six-instruction atomic rollover remains below the 4,096-byte v1
+        // packet limit after account indexes and message framing.
         assert!(submit_bytes.len() < 3_000);
         assert!(fold_bytes.len() < 3_000);
+        assert!(replacement_bytes.len() < 3_200);
+        assert!(rollover_instruction_data < 3_500);
     }
 }

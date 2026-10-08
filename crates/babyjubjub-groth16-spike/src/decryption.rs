@@ -12,13 +12,16 @@
 //! with the same chained Poseidon construction used elsewhere in the spike.
 
 use super::*;
+use crate::transition::{
+    decode_wire_point, decode_wire_point_allow_identity, SolanaVerificationKey,
+};
 use ark_ec::AffineRepr;
 use ark_ff::Field;
 use ark_r1cs_std::prelude::ToBitsGadget;
 use std::ops::Neg;
 
-const COMMITTEE_SIZE: usize = 7;
-const QUORUM_SIZE: usize = 3;
+pub const COMMITTEE_SIZE: usize = 7;
+pub const QUORUM_SIZE: usize = 3;
 const CURVE_VALUES: usize = LEVELS * 2;
 const PLAINTEXT_BITS: usize = 64;
 const BATCH_CHALLENGE_BITS: usize = 128;
@@ -635,6 +638,287 @@ pub struct SolanaAggregatePublicationFixture {
     pub supply: [u64; LEVELS],
 }
 
+#[derive(Clone, Debug)]
+pub struct AggregatePublicationRequest {
+    pub auction: [u8; 32],
+    pub accepted_order_count: u64,
+    pub participant_ids: [u8; QUORUM_SIZE],
+    pub aggregate: [[u8; 64]; CURVE_VALUES],
+    pub demand: [u64; LEVELS],
+    pub supply: [u64; LEVELS],
+}
+
+#[derive(Clone, Debug)]
+pub struct AggregatePublicationProofOutput {
+    pub proof_a: [u8; 64],
+    pub proof_b: [u8; 128],
+    pub proof_c: [u8; 64],
+    pub public_input: [u8; 32],
+    pub participant_ids: [u8; QUORUM_SIZE],
+    pub demand: [u64; LEVELS],
+    pub supply: [u64; LEVELS],
+}
+
+#[derive(Clone, Debug)]
+pub struct BabyJubjubCommitteePublic {
+    pub encryption_key: [u8; 32],
+    pub participant_public_shares: [[u8; 32]; COMMITTEE_SIZE],
+}
+
+pub struct AggregatePublicationProver {
+    proving_key: ark_groth16::ProvingKey<Bn254>,
+    secret_shares: [JubjubScalar; COMMITTEE_SIZE],
+    public: BabyJubjubCommitteePublic,
+}
+
+impl AggregatePublicationProver {
+    /// Deterministic committee and Groth16 setup for Devnet testing only.
+    /// Production must load independently generated committee shares and a
+    /// ceremony-generated proving key.
+    pub fn deterministic_devnet() -> Result<Self, Box<dyn std::error::Error>> {
+        let (secret_shares, public) = deterministic_devnet_committee_with_shares();
+        let mut setup_rng = ChaCha20Rng::from_seed([0xe1; 32]);
+        let (proving_key, _) =
+            Groth16::<Bn254>::circuit_specific_setup(PublicationCircuit::blank(), &mut setup_rng)?;
+        Ok(Self {
+            proving_key,
+            secret_shares,
+            public,
+        })
+    }
+
+    pub fn committee(&self) -> &BabyJubjubCommitteePublic {
+        &self.public
+    }
+
+    pub fn verification_key(&self) -> Result<SolanaVerificationKey, Box<dyn std::error::Error>> {
+        let key = &self.proving_key.vk;
+        let ic = key
+            .gamma_abc_g1
+            .iter()
+            .copied()
+            .map(transition::g1_bytes)
+            .collect::<Vec<_>>()
+            .try_into()
+            .map_err(|_| std::io::Error::other("publication key must have two IC points"))?;
+        Ok(SolanaVerificationKey {
+            alpha_g1: transition::g1_bytes(key.alpha_g1),
+            beta_g2: transition::g2_bytes(key.beta_g2),
+            gamma_g2: transition::g2_bytes(key.gamma_g2),
+            delta_g2: transition::g2_bytes(key.delta_g2),
+            ic,
+        })
+    }
+
+    /// Decrypt the full aggregate with a selected threshold quorum and recover
+    /// its bounded integer quantities. The auction protocol provides a tight
+    /// discrete-log bound (`accepted events * max order quantity`), so this is
+    /// a small lookup rather than a general discrete-log problem.
+    pub fn decrypt_aggregate(
+        &self,
+        aggregate: [[u8; 64]; CURVE_VALUES],
+        participant_ids: [u8; QUORUM_SIZE],
+        max_plaintext: u64,
+    ) -> Result<([u64; LEVELS], [u64; LEVELS]), Box<dyn std::error::Error>> {
+        if participant_ids[0] == 0
+            || participant_ids[0] >= participant_ids[1]
+            || participant_ids[1] >= participant_ids[2]
+            || usize::from(participant_ids[2]) > COMMITTEE_SIZE
+        {
+            return Err(std::io::Error::other("invalid decryption quorum").into());
+        }
+        let ciphertexts: [Ciphertext; CURVE_VALUES] = aggregate
+            .map(|encoded| {
+                Ok::<_, Box<dyn std::error::Error>>(Ciphertext {
+                    ephemeral: decode_wire_point_allow_identity(encoded[..32].try_into()?)?,
+                    body: decode_wire_point_allow_identity(encoded[32..].try_into()?)?,
+                })
+            })
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?
+            .try_into()
+            .map_err(|_| std::io::Error::other("aggregate must contain 34 ciphertexts"))?;
+        let ids = participant_ids.map(usize::from);
+        let coefficients = lagrange_coefficients(ids);
+        let mut plaintext_points = std::collections::HashMap::new();
+        let mut point = EdwardsProjective::zero();
+        let generator = EdwardsProjective::generator();
+        for quantity in 0..=max_plaintext {
+            plaintext_points.insert(transition::wire_point_bytes(point.into_affine()), quantity);
+            point += generator;
+        }
+        let plaintexts = ciphertexts
+            .into_iter()
+            .map(|ciphertext| {
+                let interpolated =
+                    (0..QUORUM_SIZE).fold(EdwardsProjective::zero(), |sum, member| {
+                        let share = self.secret_shares[ids[member] - 1];
+                        let decryption_share = ciphertext.ephemeral.mul_bigint(share.into_bigint());
+                        sum + decryption_share.mul_bigint(coefficients[member].into_bigint())
+                    });
+                let message = (ciphertext.body.into_group() - interpolated).into_affine();
+                plaintext_points
+                    .get(&transition::wire_point_bytes(message))
+                    .copied()
+                    .ok_or_else(|| {
+                        std::io::Error::other(
+                            "decrypted aggregate quantity exceeds the configured bound",
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let demand = std::array::from_fn(|level| plaintexts[level * 2]);
+        let supply = std::array::from_fn(|level| plaintexts[level * 2 + 1]);
+        Ok((demand, supply))
+    }
+
+    pub fn prove<R: RngCore + CryptoRng>(
+        &self,
+        request: AggregatePublicationRequest,
+        rng: &mut R,
+    ) -> Result<AggregatePublicationProofOutput, Box<dyn std::error::Error>> {
+        if request.accepted_order_count == 0
+            || request.participant_ids[0] == 0
+            || request.participant_ids[0] >= request.participant_ids[1]
+            || request.participant_ids[1] >= request.participant_ids[2]
+            || usize::from(request.participant_ids[2]) > COMMITTEE_SIZE
+        {
+            return Err(std::io::Error::other("invalid publication quorum or order count").into());
+        }
+        let committee_key = decode_wire_point(self.public.encryption_key)?;
+        let public_share_keys: [EdwardsAffine; COMMITTEE_SIZE] = self
+            .public
+            .participant_public_shares
+            .map(decode_wire_point)
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?
+            .try_into()
+            .map_err(|_| std::io::Error::other("committee must contain seven shares"))?;
+        let aggregate: [Ciphertext; CURVE_VALUES] = request
+            .aggregate
+            .map(|encoded| {
+                Ok::<_, Box<dyn std::error::Error>>(Ciphertext {
+                    ephemeral: decode_wire_point_allow_identity(encoded[..32].try_into()?)?,
+                    body: decode_wire_point_allow_identity(encoded[32..].try_into()?)?,
+                })
+            })
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?
+            .try_into()
+            .map_err(|_| std::io::Error::other("aggregate must contain 34 ciphertexts"))?;
+        let plaintexts = std::array::from_fn(|index| {
+            if index % 2 == 0 {
+                request.demand[index / 2]
+            } else {
+                request.supply[index / 2]
+            }
+        });
+        let participant_ids = request.participant_ids.map(usize::from);
+        let decryption_shares = std::array::from_fn(|member| {
+            let share = self.secret_shares[participant_ids[member] - 1];
+            std::array::from_fn(|index| {
+                aggregate[index]
+                    .ephemeral
+                    .mul_bigint(share.into_bigint())
+                    .into_affine()
+            })
+        });
+        let mut witness = PublicationWitness {
+            auction_context: transition::pubkey_context(request.auction),
+            accepted_order_count: request.accepted_order_count,
+            committee_key,
+            public_share_keys,
+            participant_ids,
+            aggregate,
+            plaintexts,
+            decryption_shares,
+            dleq_proofs: [ChaumPedersenProof {
+                commitment_g: EdwardsAffine::zero(),
+                commitment_r: EdwardsAffine::zero(),
+                response: JubjubScalar::zero(),
+            }; QUORUM_SIZE],
+        };
+        let private_seed = witness.private_batch_seed();
+        let (batched_ephemeral, batched_shares) = witness.batched_points(private_seed);
+        witness.dleq_proofs = std::array::from_fn(|member| {
+            let nonce = JubjubScalar::rand(rng);
+            let commitment_g = EdwardsProjective::generator()
+                .mul_bigint(nonce.into_bigint())
+                .into_affine();
+            let commitment_r = batched_ephemeral
+                .mul_bigint(nonce.into_bigint())
+                .into_affine();
+            let participant_id = witness.participant_ids[member];
+            let challenge = dleq_challenge_native(
+                private_seed,
+                participant_id,
+                witness.public_share_keys[participant_id - 1],
+                batched_ephemeral,
+                batched_shares[member],
+                commitment_g,
+                commitment_r,
+            );
+            ChaumPedersenProof {
+                commitment_g,
+                commitment_r,
+                response: nonce + challenge * self.secret_shares[participant_id - 1],
+            }
+        });
+        let digest = witness.public_digest();
+        let proof = Groth16::<Bn254>::prove(
+            &self.proving_key,
+            PublicationCircuit::from_witness(witness),
+            rng,
+        )?;
+        let prepared_key = Groth16::<Bn254>::process_vk(&self.proving_key.vk)?;
+        if !Groth16::<Bn254>::verify_with_processed_vk(&prepared_key, &[digest], &proof)? {
+            return Err(std::io::Error::other("generated publication proof did not verify").into());
+        }
+        Ok(AggregatePublicationProofOutput {
+            proof_a: transition::g1_bytes(proof.a.neg()),
+            proof_b: transition::g2_bytes(proof.b),
+            proof_c: transition::g1_bytes(proof.c),
+            public_input: transition::field_bytes(digest),
+            participant_ids: request.participant_ids,
+            demand: request.demand,
+            supply: request.supply,
+        })
+    }
+}
+
+/// Public Baby Jubjub committee configuration used by the deterministic
+/// Devnet environment, without performing an expensive Groth16 setup.
+pub fn deterministic_devnet_committee() -> BabyJubjubCommitteePublic {
+    deterministic_devnet_committee_with_shares().1
+}
+
+fn deterministic_devnet_committee_with_shares(
+) -> ([JubjubScalar; COMMITTEE_SIZE], BabyJubjubCommitteePublic) {
+    let mut committee_rng = ChaCha20Rng::from_seed([0xd3; 32]);
+    let secret = JubjubScalar::rand(&mut committee_rng);
+    let coefficient_1 = JubjubScalar::rand(&mut committee_rng);
+    let coefficient_2 = JubjubScalar::rand(&mut committee_rng);
+    let secret_shares = std::array::from_fn(|index| {
+        let x = JubjubScalar::from((index + 1) as u64);
+        secret + coefficient_1 * x + coefficient_2 * x.square()
+    });
+    let committee_key = EdwardsProjective::generator()
+        .mul_bigint(secret.into_bigint())
+        .into_affine();
+    let public_share_keys = secret_shares.map(|share| {
+        EdwardsProjective::generator()
+            .mul_bigint(share.into_bigint())
+            .into_affine()
+    });
+    (
+        secret_shares,
+        BabyJubjubCommitteePublic {
+            encryption_key: transition::wire_point_bytes(committee_key),
+            participant_public_shares: public_share_keys.map(transition::wire_point_bytes),
+        },
+    )
+}
+
 /// Deterministic development fixture for host/SBF transcript parity tests.
 /// Setup and proof randomness are intentionally unsuitable for production.
 pub fn deterministic_solana_fixture(
@@ -805,5 +1089,35 @@ mod tests {
         let mut changed = witness;
         changed.auction_context[1] += Fq::from(1u64);
         assert!(!is_satisfied(changed, digest));
+    }
+
+    #[test]
+    #[ignore = "generates a full aggregate-publication Groth16 proof; run in release mode"]
+    fn arbitrary_publication_prover_generates_a_verified_proof() {
+        let witness = PublicationWitness::deterministic();
+        let prover = AggregatePublicationProver::deterministic_devnet().unwrap();
+        assert_eq!(
+            prover.committee().encryption_key,
+            transition::wire_point_bytes(witness.committee_key)
+        );
+        let participant_ids = witness.participant_ids.map(|id| id as u8);
+        let aggregate = witness.aggregate.map(transition::ciphertext_bytes);
+        let (demand, supply) = prover
+            .decrypt_aggregate(aggregate, participant_ids, 64)
+            .unwrap();
+        let request = AggregatePublicationRequest {
+            auction: transition::context_pubkey(witness.auction_context),
+            accepted_order_count: witness.accepted_order_count,
+            participant_ids,
+            aggregate,
+            demand,
+            supply,
+        };
+        let mut rng = ChaCha20Rng::from_seed([0xea; 32]);
+        let output = prover.prove(request, &mut rng).unwrap();
+        assert_eq!(output.participant_ids, [1, 4, 7]);
+        assert_eq!(output.demand[0], witness.plaintexts[0]);
+        assert_eq!(output.supply[0], witness.plaintexts[1]);
+        assert_ne!(output.public_input, [0; 32]);
     }
 }

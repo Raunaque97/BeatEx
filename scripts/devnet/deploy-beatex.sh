@@ -3,7 +3,7 @@ set -euo pipefail
 
 cluster='localnet'
 wallet=''
-program_keypair='.demo/program/beatex-keypair.json'
+program_keypair='.devnet/program/beatex-keypair.json'
 skip_build=0
 
 usage() {
@@ -106,7 +106,7 @@ if [[ -z "$declared_id" || "$declared_id" != "$localnet_id" || "$declared_id" !=
 fi
 
 if (( ! skip_build )); then
-  cargo-build-sbf --arch v0 --features sbf-test-fixtures \
+  cargo-build-sbf --arch v0 \
     --manifest-path programs/beatex/Cargo.toml \
     --sbf-out-dir target/deploy-v0
 fi

@@ -10,8 +10,8 @@ use {
     },
     curve25519_dalek::scalar::Scalar,
     solana_pubkey::Pubkey,
-    solana_zk_sdk_v4::encryption::elgamal::ElGamalKeypair,
-    solana_zk_sdk_v4::encryption::pedersen::{Pedersen, PedersenOpening},
+    solana_zk_sdk::encryption::elgamal::ElGamalKeypair,
+    solana_zk_sdk::encryption::pedersen::{Pedersen, PedersenOpening},
 };
 
 fn fixture_request(
@@ -23,10 +23,10 @@ fn fixture_request(
     let destination_keypair = ElGamalKeypair::new_rand();
     let source_pubkey = source_key.pubkey_bytes();
 
-    // Use the reconstructed v4 public key so the fixture exercises the same
-    // byte compatibility boundary as production proof generation.
+    // Reparse the reconstructed public key so the fixture exercises the same
+    // canonical byte boundary as production proof generation.
     let source_pubkey_typed =
-        solana_zk_sdk_v4::encryption::elgamal::ElGamalPubkey::try_from(source_pubkey.as_slice())
+        solana_zk_sdk::encryption::elgamal::ElGamalPubkey::try_from(source_pubkey.as_slice())
             .unwrap();
     let available_balance = source_pubkey_typed.encrypt_u64(current_balance).to_bytes();
     let decryptable_available_balance = source_ae_key.encrypt_balance(current_balance);
@@ -279,7 +279,7 @@ fn coordinator_builds_six_exact_proof_context_transactions() {
         .collect::<Vec<_>>();
     assert_eq!(all_accounts.len(), 6);
     assert!(all_accounts.iter().all(|account| {
-        account.owner == solana_zk_sdk_v4::zk_elgamal_proof_program::id() && account.space > 32
+        account.owner == solana_zk_elgamal_proof_interface::id() && account.space > 32
     }));
     for (transfer, expected) in [(&plan.base, addresses.base), (&plan.quote, addresses.quote)] {
         assert_eq!(transfer.accounts[0].address, expected.equality);

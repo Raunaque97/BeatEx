@@ -13,20 +13,25 @@ use {
     },
     curve25519_dalek::scalar::Scalar,
     rand::{CryptoRng, RngCore},
-    solana_zk_sdk_v4::{
+    solana_zk_elgamal_proof_interface::proof_data::{
+        batched_range_proof::batched_range_proof_u128::BatchedRangeProofU128Data,
+        ciphertext_commitment_equality::CiphertextCommitmentEqualityProofData,
+        BatchedGroupedCiphertext3HandlesValidityProofData,
+    },
+    solana_zk_sdk::{
         encryption::{
             auth_encryption::AeCiphertext,
             elgamal::{ElGamalCiphertext, ElGamalPubkey},
             grouped_elgamal::{GroupedElGamal, GroupedElGamalCiphertext},
             pedersen::{Pedersen, PedersenOpening},
-            pod::pedersen::PodPedersenCommitment,
         },
-        zk_elgamal_proof_program::proof_data::{
-            batched_range_proof::batched_range_proof_u128::BatchedRangeProofU128Data,
-            ciphertext_commitment_equality::CiphertextCommitmentEqualityProofData,
-            BatchedGroupedCiphertext3HandlesValidityProofData, ZkProofData,
+        zk_elgamal_proof_program::{
+            build_batched_grouped_ciphertext_3_handles_validity_proof_data,
+            build_batched_range_proof_u128_data, build_ciphertext_commitment_equality_proof_data,
+            VerifyZkProof,
         },
     },
+    solana_zk_sdk_pod::encryption::pedersen::PodPedersenCommitment,
     spl_token_confidential_transfer_proof_generation::{
         try_combine_lo_hi_ciphertexts, try_combine_lo_hi_commitments, try_combine_lo_hi_openings,
         try_split_u64, REMAINING_BALANCE_BIT_LENGTH, TRANSFER_AMOUNT_HI_BITS,
@@ -123,11 +128,11 @@ impl TransferProofBundle {
 
     pub fn combined_amount_commitment(&self) -> Result<[u8; 32], VaultProofError> {
         let commitments = self.commitments()?;
-        let lo = solana_zk_sdk_v4::encryption::pedersen::PedersenCommitment::from_bytes(
+        let lo = solana_zk_sdk::encryption::pedersen::PedersenCommitment::from_bytes(
             &commitments.amount_lo,
         )
         .ok_or(VaultProofError::InvalidGeneratedContext)?;
-        let hi = solana_zk_sdk_v4::encryption::pedersen::PedersenCommitment::from_bytes(
+        let hi = solana_zk_sdk::encryption::pedersen::PedersenCommitment::from_bytes(
             &commitments.amount_hi,
         )
         .ok_or(VaultProofError::InvalidGeneratedContext)?;
@@ -261,11 +266,11 @@ pub fn claim_bridge_witness(
     let quote_opening = PedersenOpening::from_bytes(&quote.combined_amount_opening())
         .ok_or(VaultProofError::InvalidGeneratedContext)?;
     let batched_opening = (base_opening + quote_opening * rho).to_bytes();
-    let base_commitment = solana_zk_sdk_v4::encryption::pedersen::PedersenCommitment::from_bytes(
+    let base_commitment = solana_zk_sdk::encryption::pedersen::PedersenCommitment::from_bytes(
         &base_amount_commitment,
     )
     .ok_or(VaultProofError::InvalidGeneratedContext)?;
-    let quote_commitment = solana_zk_sdk_v4::encryption::pedersen::PedersenCommitment::from_bytes(
+    let quote_commitment = solana_zk_sdk::encryption::pedersen::PedersenCommitment::from_bytes(
         &quote_amount_commitment,
     )
     .ok_or(VaultProofError::InvalidGeneratedContext)?;
@@ -545,7 +550,7 @@ pub fn generate_transfer_proof(
     #[allow(clippy::arithmetic_side_effects)]
     let new_available_balance_ciphertext = current_available_balance - transfer_ciphertext;
     let (new_available_balance_commitment, new_source_opening) = Pedersen::new(new_clear_balance);
-    let equality_proof_data = CiphertextCommitmentEqualityProofData::new(
+    let equality_proof_data = build_ciphertext_commitment_equality_proof_data(
         &source_key.inner,
         &new_available_balance_ciphertext,
         &new_available_balance_commitment,
@@ -553,34 +558,35 @@ pub fn generate_transfer_proof(
         new_clear_balance,
     )
     .map_err(|error| VaultProofError::ProofGeneration(error.to_string()))?;
-    let ciphertext_validity_proof_data = BatchedGroupedCiphertext3HandlesValidityProofData::new(
-        source_key.inner.pubkey(),
-        &destination_pubkey,
-        auditor_pubkey,
-        &grouped_lo,
-        &grouped_hi,
-        amount_lo,
-        amount_hi,
-        &opening_lo,
-        &opening_hi,
-    )
-    .map_err(|error| VaultProofError::ProofGeneration(error.to_string()))?;
+    let ciphertext_validity_proof_data =
+        build_batched_grouped_ciphertext_3_handles_validity_proof_data(
+            source_key.inner.pubkey(),
+            &destination_pubkey,
+            auditor_pubkey,
+            &grouped_lo,
+            &grouped_hi,
+            amount_lo,
+            amount_hi,
+            &opening_lo,
+            &opening_hi,
+        )
+        .map_err(|error| VaultProofError::ProofGeneration(error.to_string()))?;
     let auditor_ciphertext_lo = ciphertext_validity_proof_data
-        .context_data()
+        .context
         .grouped_ciphertext_lo
         .try_extract_ciphertext(2)
         .map_err(|_| VaultProofError::InvalidGeneratedContext)?
         .try_into()
         .map_err(|_| VaultProofError::InvalidGeneratedContext)?;
     let auditor_ciphertext_hi = ciphertext_validity_proof_data
-        .context_data()
+        .context
         .grouped_ciphertext_hi
         .try_extract_ciphertext(2)
         .map_err(|_| VaultProofError::InvalidGeneratedContext)?
         .try_into()
         .map_err(|_| VaultProofError::InvalidGeneratedContext)?;
     let (padding_commitment, padding_opening) = Pedersen::new(0_u64);
-    let range_proof_data = BatchedRangeProofU128Data::new(
+    let range_proof_data = build_batched_range_proof_u128_data(
         vec![
             &new_available_balance_commitment,
             &grouped_lo.commitment,

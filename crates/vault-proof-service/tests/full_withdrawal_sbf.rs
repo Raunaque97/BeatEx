@@ -6,8 +6,9 @@ use {
     ark_groth16::Groth16,
     ark_snark::SNARK,
     beatex::{
-        Auction, AuctionState, DleqProofInput, KeyEpoch, Market, PrivateWithdrawalArgs,
-        QueueCircuitKind, QueueVerificationKey, QueuedOrder, QueuedOrderState, WithdrawalState,
+        ActiveOrder, Auction, AuctionState, DleqProofInput, KeyEpoch, Market,
+        PrivateWithdrawalArgs, QueueCircuitKind, QueueVerificationKey, QueuedOrder,
+        QueuedOrderState, WithdrawalState,
     },
     beatex_babyjubjub_groth16_spike::claim::{
         export_private_withdrawal_verifying_key, PrivateWithdrawalCircuit, PrivateWithdrawalKind,
@@ -29,13 +30,11 @@ use {
     solana_message::Message,
     solana_signer::Signer,
     solana_transaction::Transaction,
+    solana_zk_elgamal_proof_interface::{proof_data::ProofType, state::ProofContextState},
+    solana_zk_sdk::encryption::elgamal::{ElGamalKeypair, ElGamalPubkey},
     solana_zk_sdk_pod::encryption::{
         auth_encryption::PodAeCiphertext,
         elgamal::{PodElGamalCiphertext, PodElGamalPubkey},
-    },
-    solana_zk_sdk_v4::{
-        encryption::elgamal::{ElGamalKeypair, ElGamalPubkey},
-        zk_elgamal_proof_program::{proof_data::ProofType, state::ProofContextState},
     },
     spl_token_2022_interface::{
         extension::{
@@ -206,12 +205,7 @@ fn put_contexts(
         ),
     ];
     for (address, bytes) in addresses.into_iter().zip(data) {
-        put_account(
-            svm,
-            address,
-            solana_zk_sdk_v4::zk_elgamal_proof_program::id(),
-            bytes,
-        );
+        put_account(svm, address, solana_zk_elgamal_proof_interface::id(), bytes);
     }
     addresses
 }
@@ -225,6 +219,7 @@ fn exact_private_claim_executes_atomically_in_sbf() {
     let market = Pubkey::new_unique();
     let auction = Pubkey::new_unique();
     let order = Pubkey::new_unique();
+    let active_order = Pubkey::new_unique();
     let key_epoch = Pubkey::new_unique();
     let claim_vk = Pubkey::new_unique();
     let base_mint = Pubkey::new_unique();
@@ -441,10 +436,21 @@ fn exact_private_claim_executes_atomically_in_sbf() {
         state: QueuedOrderState::Folded,
         withdrawal_state: WithdrawalState::Pending,
         terminal_nullifier: [0; 32],
+        previous_event: Pubkey::default(),
         ciphertexts: vec![0; beatex::queue::QUEUED_CIPHERTEXT_COUNT * 64],
         ciphertext_digest: [0; 32],
         order_commitment,
         order_circuit_version: 1,
+        bump: 0,
+    };
+    let active_order_state = ActiveOrder {
+        version: 1,
+        market,
+        auction,
+        owner: payer.pubkey(),
+        latest_event: order,
+        revision: 0,
+        active: true,
         bump: 0,
     };
     let vk_state = QueueVerificationKey {
@@ -463,6 +469,7 @@ fn exact_private_claim_executes_atomically_in_sbf() {
     put_anchor(&mut svm, key_epoch, &key_epoch_state);
     put_anchor(&mut svm, auction, &auction_state);
     put_anchor(&mut svm, order, &order_state);
+    put_anchor(&mut svm, active_order, &active_order_state);
     put_anchor(&mut svm, claim_vk, &vk_state);
     put_account(
         &mut svm,
@@ -531,6 +538,7 @@ fn exact_private_claim_executes_atomically_in_sbf() {
             AccountMeta::new_readonly(auction, false),
             AccountMeta::new_readonly(key_epoch, false),
             AccountMeta::new(order, false),
+            AccountMeta::new(active_order, false),
             AccountMeta::new_readonly(claim_vk, false),
             AccountMeta::new_readonly(base_mint, false),
             AccountMeta::new(base_vault, false),

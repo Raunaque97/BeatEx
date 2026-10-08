@@ -6,10 +6,11 @@ use {
         AccountDeserialize, AccountSerialize, InstructionData, Space,
     },
     beatex::{
-        groth16, queue_hash, AggregateAccumulator, Auction, AuctionState, DecryptionShareInput,
-        DleqProofInput, Groth16ProofInput, KeyEpoch, Market, PublishAggregateCurvesArgs,
-        QueueCircuitKind, QueueVerificationKey, SubmissionCounter, VerifyThresholdDecryptionArgs,
-        COMMITTEE_SIZE,
+        queue_hash, ActiveOrder, AggregateAccumulator, Auction, AuctionState, DecryptionShareInput,
+        DleqProofInput, EncryptedPrivateBalance, FoldQueuedOrdersArgs, Groth16ProofInput, KeyEpoch,
+        Market, PublishAggregateCurvesArgs, QueueCircuitKind, QueueVerificationKey, QueuedOrder,
+        QueuedOrderState, ReleaseOrderCollateralArgs, SubmissionCounter, SubmitQueuedOrderArgs,
+        VerifyThresholdDecryptionArgs, WithdrawalState, COMMITTEE_SIZE,
     },
     beatex_threshold_crypto::{
         create_decryption_share, dealer_setup_3_of_7, DecryptionProofContext,
@@ -49,29 +50,6 @@ fn svm_with_program() -> LiteSVM {
     let mut svm = LiteSVM::new();
     svm.add_program_from_file(beatex::ID, program_path).unwrap();
     svm
-}
-
-fn execute_pipeline_proof(proof: Groth16ProofInput) -> u64 {
-    let mut svm = svm_with_program();
-    let payer = Keypair::new();
-    svm.airdrop(&payer.pubkey(), 1_000_000_000).unwrap();
-    let instruction = Instruction {
-        program_id: beatex::ID,
-        accounts: vec![],
-        data: beatex::instruction::VerifyGroth16Pipeline {
-            circuit_version: groth16::PIPELINE_CIRCUIT_VERSION,
-            proof,
-        }
-        .data(),
-    };
-    let transaction = Transaction::new(
-        &[&payer],
-        Message::new(&[instruction], Some(&payer.pubkey())),
-        svm.latest_blockhash(),
-    );
-    svm.send_transaction(transaction)
-        .unwrap()
-        .compute_units_consumed
 }
 
 fn dleq_input(proof: &beatex_threshold_crypto::DleqProof) -> DleqProofInput {
@@ -263,14 +241,6 @@ fn threshold_args(
         claimed_amount,
         shares,
     }
-}
-
-#[test]
-#[ignore = "requires an SBF build with --sbf-stack-size 32768 --features sbf-test-fixtures"]
-fn groth16_fixture_executes_inside_sbf() {
-    let compute_units = execute_pipeline_proof(groth16::pipeline_fixture());
-    eprintln!("Groth16 pipeline consumed {compute_units} CU");
-    assert!(compute_units > 0);
 }
 
 #[test]
@@ -943,6 +913,580 @@ fn temporal_auction_initialization_and_timeout_are_permissionless() {
     svm.send_transaction(transaction).unwrap();
     let cancelled: Auction = deserialize_account(&svm, &auction);
     assert_eq!(cancelled.state, AuctionState::Cancelled);
+}
+
+#[test]
+#[ignore = "requires an SBF v0 build and deterministic collateral-release setup"]
+fn cancelled_order_refund_to_balance_executes_inside_sbf() {
+    let mut svm = svm_with_program();
+    let owner = Keypair::new();
+    svm.airdrop(&owner.pubkey(), 10_000_000_000).unwrap();
+    let mut clock = svm.get_sysvar::<Clock>();
+    clock.slot = 100;
+    svm.set_sysvar(&clock);
+
+    let market = Pubkey::new_unique();
+    let auction = Pubkey::new_unique();
+    let key_epoch = Pubkey::new_unique();
+    let private_balance = Pubkey::new_unique();
+    let previous_event = Pubkey::new_unique();
+    let release_vk = Pubkey::new_unique();
+    let (active_order, _) = Pubkey::find_program_address(
+        &[b"active-order", auction.as_ref(), owner.pubkey().as_ref()],
+        &beatex::ID,
+    );
+    let fixture =
+        beatex_babyjubjub_groth16_spike::release::deterministic_solana_fixture_for_context(
+            market.to_bytes(),
+            auction.to_bytes(),
+            active_order.to_bytes(),
+            owner.pubkey().to_bytes(),
+        )
+        .unwrap();
+    let market_state = Market {
+        version: 1,
+        authority: owner.pubkey(),
+        base_mint: Pubkey::new_unique(),
+        quote_mint: Pubkey::new_unique(),
+        base_vault: Pubkey::new_unique(),
+        quote_vault: Pubkey::new_unique(),
+        base_lot_size: 1,
+        quote_lot_size: 1,
+        tick_size: 1,
+        grid_radius: 8,
+        max_order_quantity: 15,
+        max_aggregate_quantity: 10_000,
+        current_key_epoch: key_epoch,
+        market_start_slot: 0,
+        last_clearing_price: 100,
+        last_clearing_volume: 0,
+        last_cleared_auction_sequence: 0,
+        minimum_reference_volume: 1,
+        oracle_price_account: Pubkey::new_unique(),
+        oracle_feed_id: [1; 32],
+        oracle_max_age_seconds: 90,
+        oracle_max_confidence_bps: 100,
+        oracle_exponent_adjustment: 0,
+        min_reference_price: 1,
+        max_reference_price: 10_000,
+        submission_duration_slots: 50,
+        aggregation_duration_slots: 50,
+        decryption_duration_slots: 50,
+        allocation_rule_version: 1,
+        order_circuit_version: 1,
+        claim_circuit_version: 1,
+        paused: false,
+        vault_authority_bump: 0,
+        bump: 0,
+    };
+    let auction_state = Auction {
+        version: 1,
+        market,
+        auction_id: 0,
+        key_epoch,
+        state: AuctionState::Cancelled,
+        open_slot: 90,
+        submission_end_slot: 150,
+        aggregation_deadline_slot: 200,
+        decryption_deadline_slot: 250,
+        reference_price: 100,
+        reference_from_oracle: false,
+        oracle_publish_time: 0,
+        tick_size: 1,
+        grid_size: 17,
+        allocation_rule_version: 1,
+        order_circuit_version: 1,
+        claim_circuit_version: 1,
+        finalized_order_count: 0,
+        aggregate_buy: [[0; 64]; 17],
+        aggregate_sell: [[0; 64]; 17],
+        decrypted_demand: [0; 17],
+        decrypted_supply: [0; 17],
+        decrypted_entry_bitmap: 0,
+        clearing_index: 8,
+        clearing_price: 100,
+        clearing_volume: 0,
+        base_residual: 0,
+        quote_residual: 0,
+        bump: 0,
+    };
+    let key_epoch_state = KeyEpoch {
+        authority: owner.pubkey(),
+        market,
+        epoch: 1,
+        encryption_pubkey: [1; 32],
+        babyjub_encryption_pubkey: fixture.committee_key,
+        babyjub_participant_public_shares: [fixture.committee_key; COMMITTEE_SIZE],
+        coefficient_commitments: [[1; 32]; 3],
+        participant_public_shares: [[1; 32]; COMMITTEE_SIZE],
+        participant_authorities: [owner.pubkey(); COMMITTEE_SIZE],
+        key_relation_proof: DleqProofInput {
+            commitment_1: [0; 32],
+            commitment_2: [0; 32],
+            response: [0; 32],
+        },
+        threshold: 3,
+        proof_transcript_version: 2,
+        activation_slot: 1,
+        retired: false,
+        acknowledgement_bitmap: 0x7f,
+        bump: 0,
+    };
+    let balance_state = EncryptedPrivateBalance {
+        version: 1,
+        market,
+        owner: owner.pubkey(),
+        key_epoch,
+        encrypted_base: fixture.balance_ciphertexts[0],
+        encrypted_quote: fixture.balance_ciphertexts[1],
+        deposited_base: 100,
+        deposited_quote: 10_000_000,
+        balance_digest: [0; 32],
+        revision: fixture.balance_revision,
+        bump: 0,
+    };
+    let previous_event_state = QueuedOrder {
+        version: 1,
+        market,
+        auction,
+        owner: owner.pubkey(),
+        funder: owner.pubkey(),
+        client_order_nonce: fixture.client_order_nonce,
+        sequence: 0,
+        state: QueuedOrderState::Accepted,
+        withdrawal_state: WithdrawalState::Pending,
+        terminal_nullifier: [0; 32],
+        previous_event: Pubkey::default(),
+        ciphertexts: queue_hash::order_bytes(&queue_hash::identity_order()),
+        ciphertext_digest: [0; 32],
+        order_commitment: fixture.order_commitment,
+        order_circuit_version: 1,
+        bump: 0,
+    };
+    let active_order_state = ActiveOrder {
+        version: 1,
+        market,
+        auction,
+        owner: owner.pubkey(),
+        latest_event: previous_event,
+        revision: 0,
+        active: true,
+        bump: 0,
+    };
+    let release_vk_state = QueueVerificationKey {
+        version: 1,
+        market,
+        circuit_kind: QueueCircuitKind::OrderModification,
+        circuit_version: beatex::queue::ORDER_MODIFICATION_CIRCUIT_VERSION,
+        alpha_g1: fixture.vk_alpha_g1,
+        beta_g2: fixture.vk_beta_g2,
+        gamma_g2: fixture.vk_gamma_g2,
+        delta_g2: fixture.vk_delta_g2,
+        ic: fixture.vk_ic,
+        bump: 0,
+    };
+    put_anchor_account(&mut svm, market, &market_state);
+    put_anchor_account(&mut svm, auction, &auction_state);
+    put_anchor_account(&mut svm, key_epoch, &key_epoch_state);
+    put_anchor_account(&mut svm, private_balance, &balance_state);
+    put_anchor_account(&mut svm, previous_event, &previous_event_state);
+    put_anchor_account(&mut svm, active_order, &active_order_state);
+    put_anchor_account(&mut svm, release_vk, &release_vk_state);
+
+    let instruction = Instruction {
+        program_id: beatex::ID,
+        accounts: vec![
+            AccountMeta::new(owner.pubkey(), true),
+            AccountMeta::new_readonly(market, false),
+            AccountMeta::new_readonly(auction, false),
+            AccountMeta::new_readonly(key_epoch, false),
+            AccountMeta::new_readonly(release_vk, false),
+            AccountMeta::new(private_balance, false),
+            AccountMeta::new(active_order, false),
+            AccountMeta::new(previous_event, false),
+        ],
+        data: beatex::instruction::RefundOrderToBalance {
+            args: ReleaseOrderCollateralArgs {
+                released_encrypted_base: fixture.balance_ciphertexts[2],
+                released_encrypted_quote: fixture.balance_ciphertexts[3],
+                proof: Groth16ProofInput {
+                    proof_a: fixture.proof_a,
+                    proof_b: fixture.proof_b,
+                    proof_c: fixture.proof_c,
+                    public_input: fixture.public_input,
+                },
+            },
+        }
+        .data(),
+    };
+    let transaction = Transaction::new(
+        &[&owner],
+        Message::new(
+            &[
+                ComputeBudgetInstruction::request_heap_frame(256 * 1024),
+                ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
+                instruction,
+            ],
+            Some(&owner.pubkey()),
+        ),
+        svm.latest_blockhash(),
+    );
+    let metadata = svm.send_transaction(transaction).unwrap();
+    let refunded: QueuedOrder = deserialize_account(&svm, &previous_event);
+    let active: ActiveOrder = deserialize_account(&svm, &active_order);
+    let balance: EncryptedPrivateBalance = deserialize_account(&svm, &private_balance);
+    assert_eq!(refunded.withdrawal_state, WithdrawalState::Refunded);
+    assert!(!active.active);
+    assert_eq!(balance.encrypted_base, fixture.balance_ciphertexts[2]);
+    assert_eq!(balance.encrypted_quote, fixture.balance_ciphertexts[3]);
+    eprintln!(
+        "cancelled-order internal refund consumed {} CU",
+        metadata.compute_units_consumed
+    );
+}
+
+#[test]
+#[ignore = "requires an SBF v0 build and deterministic order/fold setups"]
+fn queued_order_and_replacement_aware_fold_execute_inside_sbf() {
+    let mut svm = svm_with_program();
+    let owner = Keypair::new();
+    svm.airdrop(&owner.pubkey(), 10_000_000_000).unwrap();
+    let mut clock = svm.get_sysvar::<Clock>();
+    clock.slot = 100;
+    svm.set_sysvar(&clock);
+
+    let market = Pubkey::new_unique();
+    let auction = Pubkey::new_unique();
+    let key_epoch = Pubkey::new_unique();
+    let order_vk = Pubkey::new_unique();
+    let counter = Pubkey::new_unique();
+    let private_balance = Pubkey::new_unique();
+    let order_fixture =
+        beatex_babyjubjub_groth16_spike::transition::deterministic_solana_fixture_for_context(
+            auction.to_bytes(),
+            owner.pubkey().to_bytes(),
+        )
+        .unwrap();
+
+    let market_state = Market {
+        version: 1,
+        authority: owner.pubkey(),
+        base_mint: Pubkey::new_unique(),
+        quote_mint: Pubkey::new_unique(),
+        base_vault: Pubkey::new_unique(),
+        quote_vault: Pubkey::new_unique(),
+        base_lot_size: 1,
+        quote_lot_size: 1,
+        tick_size: order_fixture.tick_size,
+        grid_radius: 8,
+        max_order_quantity: 15,
+        max_aggregate_quantity: 10_000,
+        current_key_epoch: key_epoch,
+        market_start_slot: 0,
+        last_clearing_price: order_fixture.reference_price,
+        last_clearing_volume: 0,
+        last_cleared_auction_sequence: 0,
+        minimum_reference_volume: 1,
+        oracle_price_account: Pubkey::new_unique(),
+        oracle_feed_id: [1; 32],
+        oracle_max_age_seconds: 90,
+        oracle_max_confidence_bps: 100,
+        oracle_exponent_adjustment: 0,
+        min_reference_price: 1,
+        max_reference_price: u64::MAX - 10_000,
+        submission_duration_slots: 50,
+        aggregation_duration_slots: 50,
+        decryption_duration_slots: 50,
+        allocation_rule_version: 1,
+        order_circuit_version: 1,
+        claim_circuit_version: 1,
+        paused: false,
+        vault_authority_bump: 0,
+        bump: 0,
+    };
+    let auction_state = Auction {
+        version: 1,
+        market,
+        auction_id: 0,
+        key_epoch,
+        state: AuctionState::Pending,
+        open_slot: 90,
+        submission_end_slot: 150,
+        aggregation_deadline_slot: 200,
+        decryption_deadline_slot: 250,
+        reference_price: order_fixture.reference_price,
+        reference_from_oracle: false,
+        oracle_publish_time: 0,
+        tick_size: order_fixture.tick_size,
+        grid_size: 17,
+        allocation_rule_version: 1,
+        order_circuit_version: 1,
+        claim_circuit_version: 1,
+        finalized_order_count: 0,
+        aggregate_buy: [[0; 64]; 17],
+        aggregate_sell: [[0; 64]; 17],
+        decrypted_demand: [0; 17],
+        decrypted_supply: [0; 17],
+        decrypted_entry_bitmap: 0,
+        clearing_index: 8,
+        clearing_price: order_fixture.reference_price,
+        clearing_volume: 0,
+        base_residual: 0,
+        quote_residual: 0,
+        bump: 0,
+    };
+    let key_epoch_state = KeyEpoch {
+        authority: owner.pubkey(),
+        market,
+        epoch: 1,
+        encryption_pubkey: [1; 32],
+        babyjub_encryption_pubkey: order_fixture.committee_key,
+        babyjub_participant_public_shares: [order_fixture.committee_key; COMMITTEE_SIZE],
+        coefficient_commitments: [[1; 32]; 3],
+        participant_public_shares: [[1; 32]; COMMITTEE_SIZE],
+        participant_authorities: [owner.pubkey(); COMMITTEE_SIZE],
+        key_relation_proof: DleqProofInput {
+            commitment_1: [0; 32],
+            commitment_2: [0; 32],
+            response: [0; 32],
+        },
+        threshold: 3,
+        proof_transcript_version: 2,
+        activation_slot: 1,
+        retired: false,
+        acknowledgement_bitmap: 0x7f,
+        bump: 0,
+    };
+    let order_vk_state = QueueVerificationKey {
+        version: 1,
+        market,
+        circuit_kind: QueueCircuitKind::OrderSubmission,
+        circuit_version: 1,
+        alpha_g1: order_fixture.vk_alpha_g1,
+        beta_g2: order_fixture.vk_beta_g2,
+        gamma_g2: order_fixture.vk_gamma_g2,
+        delta_g2: order_fixture.vk_delta_g2,
+        ic: order_fixture.vk_ic,
+        bump: 0,
+    };
+    let counter_state = SubmissionCounter {
+        version: 1,
+        auction,
+        accepted_order_count: 0,
+        bump: 0,
+    };
+    let balance_state = EncryptedPrivateBalance {
+        version: 1,
+        market,
+        owner: owner.pubkey(),
+        key_epoch,
+        encrypted_base: order_fixture.old_base,
+        encrypted_quote: order_fixture.old_quote,
+        deposited_base: 100,
+        deposited_quote: 10_000_000,
+        balance_digest: [0; 32],
+        revision: 0,
+        bump: 0,
+    };
+    put_anchor_account(&mut svm, market, &market_state);
+    put_anchor_account(&mut svm, auction, &auction_state);
+    put_anchor_account(&mut svm, key_epoch, &key_epoch_state);
+    put_anchor_account(&mut svm, order_vk, &order_vk_state);
+    put_anchor_account(&mut svm, counter, &counter_state);
+    put_anchor_account(&mut svm, private_balance, &balance_state);
+
+    let (order, _) = Pubkey::find_program_address(
+        &[b"queued-order", auction.as_ref(), &0_u64.to_le_bytes()],
+        &beatex::ID,
+    );
+    let (active_order, _) = Pubkey::find_program_address(
+        &[b"active-order", auction.as_ref(), owner.pubkey().as_ref()],
+        &beatex::ID,
+    );
+    let submit = Instruction {
+        program_id: beatex::ID,
+        accounts: vec![
+            AccountMeta::new(owner.pubkey(), true),
+            AccountMeta::new_readonly(market, false),
+            AccountMeta::new_readonly(auction, false),
+            AccountMeta::new_readonly(key_epoch, false),
+            AccountMeta::new_readonly(order_vk, false),
+            AccountMeta::new(counter, false),
+            AccountMeta::new(private_balance, false),
+            AccountMeta::new(order, false),
+            AccountMeta::new(active_order, false),
+            AccountMeta::new_readonly(anchor_lang::system_program::ID, false),
+        ],
+        data: beatex::instruction::SubmitQueuedOrder {
+            args: SubmitQueuedOrderArgs {
+                client_order_nonce: order_fixture.client_order_nonce,
+                order_commitment: order_fixture.order_commitment,
+                ciphertexts: queue_hash::order_bytes(&order_fixture.ciphertexts),
+                new_encrypted_base: order_fixture.new_base,
+                new_encrypted_quote: order_fixture.new_quote,
+                proof: Groth16ProofInput {
+                    proof_a: order_fixture.proof_a,
+                    proof_b: order_fixture.proof_b,
+                    proof_c: order_fixture.proof_c,
+                    public_input: order_fixture.public_input,
+                },
+            },
+        }
+        .data(),
+    };
+    let transaction = Transaction::new(
+        &[&owner],
+        Message::new(
+            &[
+                ComputeBudgetInstruction::request_heap_frame(256 * 1024),
+                ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
+                submit,
+            ],
+            Some(&owner.pubkey()),
+        ),
+        svm.latest_blockhash(),
+    );
+    let metadata = svm.send_transaction(transaction).unwrap();
+    let submitted: QueuedOrder = deserialize_account(&svm, &order);
+    let active: ActiveOrder = deserialize_account(&svm, &active_order);
+    let balance: EncryptedPrivateBalance = deserialize_account(&svm, &private_balance);
+    assert_eq!(submitted.state, QueuedOrderState::Accepted);
+    assert_eq!(active.latest_event, order);
+    assert_eq!(balance.encrypted_base, order_fixture.new_base);
+    assert_eq!(
+        deserialize_account::<SubmissionCounter>(&svm, &counter).accepted_order_count,
+        1
+    );
+    eprintln!(
+        "17-level queued-order submission consumed {} CU",
+        metadata.compute_units_consumed
+    );
+
+    let fold_fixture =
+        beatex_babyjubjub_groth16_spike::transition::deterministic_fold_solana_fixture().unwrap();
+    let fold_auction = Pubkey::new_from_array(fold_fixture.auction);
+    let fold_market = Pubkey::new_unique();
+    let fold_counter = Pubkey::new_unique();
+    let fold_accumulator = Pubkey::new_unique();
+    let fold_vk = Pubkey::new_unique();
+    let mut fold_market_state = market_state;
+    fold_market_state.authority = owner.pubkey();
+    let mut fold_auction_state = auction_state;
+    fold_auction_state.market = fold_market;
+    fold_auction_state.key_epoch = key_epoch;
+    fold_auction_state.open_slot = 90;
+    fold_auction_state.submission_end_slot = 150;
+    fold_auction_state.aggregation_deadline_slot = 200;
+    let fold_counter_state = SubmissionCounter {
+        version: 1,
+        auction: fold_auction,
+        accepted_order_count: fold_fixture.old_folded_count + 3,
+        bump: 0,
+    };
+    let fold_accumulator_state = AggregateAccumulator {
+        version: 1,
+        auction: fold_auction,
+        folded_order_count: fold_fixture.old_folded_count,
+        fold_revision: 4,
+        ciphertexts: queue_hash::order_bytes(&fold_fixture.old_aggregate),
+        ciphertext_digest: [0; 32],
+        bump: 0,
+    };
+    let fold_vk_state = QueueVerificationKey {
+        version: 1,
+        market: fold_market,
+        circuit_kind: QueueCircuitKind::AggregateFold,
+        circuit_version: beatex::queue::AGGREGATE_FOLD_CIRCUIT_VERSION,
+        alpha_g1: fold_fixture.vk_alpha_g1,
+        beta_g2: fold_fixture.vk_beta_g2,
+        gamma_g2: fold_fixture.vk_gamma_g2,
+        delta_g2: fold_fixture.vk_delta_g2,
+        ic: fold_fixture.vk_ic,
+        bump: 0,
+    };
+    put_anchor_account(&mut svm, fold_market, &fold_market_state);
+    put_anchor_account(&mut svm, fold_auction, &fold_auction_state);
+    put_anchor_account(&mut svm, fold_counter, &fold_counter_state);
+    put_anchor_account(&mut svm, fold_accumulator, &fold_accumulator_state);
+    put_anchor_account(&mut svm, fold_vk, &fold_vk_state);
+    for (index, order_address) in fold_fixture.order_keys.iter().enumerate().take(3) {
+        let order_address = Pubkey::new_from_array(*order_address);
+        let order_state = QueuedOrder {
+            version: 1,
+            market: fold_market,
+            auction: fold_auction,
+            owner: owner.pubkey(),
+            funder: owner.pubkey(),
+            client_order_nonce: index as u64,
+            sequence: fold_fixture.old_folded_count + index as u64,
+            state: QueuedOrderState::Accepted,
+            withdrawal_state: WithdrawalState::Pending,
+            terminal_nullifier: [0; 32],
+            previous_event: Pubkey::default(),
+            ciphertexts: queue_hash::order_bytes(&queue_hash::identity_order()),
+            ciphertext_digest: fold_fixture.order_digests[index],
+            order_commitment: [0; 32],
+            order_circuit_version: 1,
+            bump: 0,
+        };
+        put_anchor_account(&mut svm, order_address, &order_state);
+    }
+    let mut accounts = vec![
+        AccountMeta::new_readonly(owner.pubkey(), true),
+        AccountMeta::new_readonly(fold_market, false),
+        AccountMeta::new_readonly(fold_auction, false),
+        AccountMeta::new_readonly(fold_counter, false),
+        AccountMeta::new(fold_accumulator, false),
+        AccountMeta::new_readonly(fold_vk, false),
+    ];
+    accounts.extend(
+        fold_fixture.order_keys[..3]
+            .iter()
+            .map(|key| AccountMeta::new(Pubkey::new_from_array(*key), false)),
+    );
+    let fold = Instruction {
+        program_id: beatex::ID,
+        accounts,
+        data: beatex::instruction::FoldQueuedOrders {
+            args: FoldQueuedOrdersArgs {
+                new_aggregate: queue_hash::order_bytes(&fold_fixture.new_aggregate),
+                proof: Groth16ProofInput {
+                    proof_a: fold_fixture.proof_a,
+                    proof_b: fold_fixture.proof_b,
+                    proof_c: fold_fixture.proof_c,
+                    public_input: fold_fixture.public_input,
+                },
+            },
+        }
+        .data(),
+    };
+    let transaction = Transaction::new(
+        &[&owner],
+        Message::new(
+            &[
+                ComputeBudgetInstruction::request_heap_frame(256 * 1024),
+                ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
+                fold,
+            ],
+            Some(&owner.pubkey()),
+        ),
+        svm.latest_blockhash(),
+    );
+    let metadata = svm.send_transaction(transaction).unwrap();
+    let folded: AggregateAccumulator = deserialize_account(&svm, &fold_accumulator);
+    assert_eq!(folded.folded_order_count, fold_fixture.old_folded_count + 3);
+    assert_eq!(
+        folded.ciphertexts,
+        queue_hash::order_bytes(&fold_fixture.new_aggregate)
+    );
+    for key in &fold_fixture.order_keys[..3] {
+        let order: QueuedOrder = deserialize_account(&svm, &Pubkey::new_from_array(*key));
+        assert_eq!(order.state, QueuedOrderState::Folded);
+    }
+    eprintln!(
+        "replacement-aware three-order fold consumed {} CU",
+        metadata.compute_units_consumed
+    );
 }
 
 #[test]

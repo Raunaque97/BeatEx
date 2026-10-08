@@ -1,8 +1,10 @@
 [workspace]
 members = [
     "crates/babyjubjub-groth16-spike",
-    "crates/demo-sim",
+    "crates/auction-sim",
+    "crates/devnet-client",
     "crates/groth16-spike",
+    "crates/market-maker",
     "crates/threshold-crypto",
     "crates/vault-proof-service",
     "crates/zk-elgamal-bench",

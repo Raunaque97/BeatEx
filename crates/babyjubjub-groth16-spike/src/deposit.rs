@@ -6,6 +6,11 @@
 //! increments. All four ciphertexts use the registered committee key.
 
 use super::*;
+use crate::transition::{
+    decode_wire_point, scalar_bytes, scalar_from_bytes, PrivateBalanceOpening,
+    SolanaVerificationKey,
+};
+use ark_ec::AffineRepr;
 use std::ops::Neg;
 
 const BALANCE_DEPOSIT_DOMAIN: &[u8] = b"BeatEx balance deposit v1";
@@ -259,11 +264,232 @@ pub struct SolanaBalanceDepositFixture {
     pub new_quote: [u8; 64],
 }
 
+#[derive(Clone, Debug)]
+pub struct DepositProofRequest {
+    pub market: [u8; 32],
+    pub owner: [u8; 32],
+    pub key_epoch: [u8; 32],
+    pub committee_key: [u8; 32],
+    pub old_revision: u64,
+    pub base_amount: u64,
+    pub quote_amount: u64,
+    pub old_balance: PrivateBalanceOpening,
+}
+
+#[derive(Clone, Debug)]
+pub struct DepositProofOutput {
+    pub proof_a: [u8; 64],
+    pub proof_b: [u8; 128],
+    pub proof_c: [u8; 64],
+    pub public_input: [u8; 32],
+    pub new_encrypted_base: [u8; 64],
+    pub new_encrypted_quote: [u8; 64],
+    pub new_balance: PrivateBalanceOpening,
+}
+
+#[derive(Clone, Debug)]
+pub struct PublicWithdrawalProofRequest {
+    pub market: [u8; 32],
+    pub owner: [u8; 32],
+    pub key_epoch: [u8; 32],
+    pub committee_key: [u8; 32],
+    pub current_revision: u64,
+    pub base_amount: u64,
+    pub quote_amount: u64,
+    pub current_balance: PrivateBalanceOpening,
+}
+
+#[derive(Clone, Debug)]
+pub struct PublicWithdrawalProofOutput {
+    pub proof_a: [u8; 64],
+    pub proof_b: [u8; 128],
+    pub proof_c: [u8; 64],
+    pub public_input: [u8; 32],
+    pub remaining_encrypted_base: [u8; 64],
+    pub remaining_encrypted_quote: [u8; 64],
+    pub remaining_balance: PrivateBalanceOpening,
+}
+
+pub struct DepositProver {
+    proving_key: ark_groth16::ProvingKey<Bn254>,
+}
+
+impl DepositProver {
+    /// Deterministic setup for Devnet testing only. Production must replace
+    /// this with ceremony-generated parameters loaded from an artifact.
+    pub fn deterministic_devnet() -> Result<Self, Box<dyn std::error::Error>> {
+        let mut setup_rng = ChaCha20Rng::from_seed([0x81; 32]);
+        let (proving_key, _) =
+            Groth16::<Bn254>::circuit_specific_setup(DepositCircuit::blank(), &mut setup_rng)?;
+        Ok(Self { proving_key })
+    }
+
+    pub fn verification_key(&self) -> Result<SolanaVerificationKey, Box<dyn std::error::Error>> {
+        transition::verification_key_bytes(&self.proving_key.vk, "deposit")
+    }
+
+    pub fn prove<R: RngCore + CryptoRng>(
+        &self,
+        request: DepositProofRequest,
+        rng: &mut R,
+    ) -> Result<DepositProofOutput, Box<dyn std::error::Error>> {
+        if request.base_amount == 0 && request.quote_amount == 0 {
+            return Err(std::io::Error::other("deposit must credit at least one asset").into());
+        }
+        let new_base = request
+            .old_balance
+            .base_value
+            .checked_add(request.base_amount)
+            .ok_or_else(|| std::io::Error::other("base balance overflow"))?;
+        let new_quote = request
+            .old_balance
+            .quote_value
+            .checked_add(request.quote_amount)
+            .ok_or_else(|| std::io::Error::other("quote balance overflow"))?;
+        request
+            .old_revision
+            .checked_add(1)
+            .ok_or_else(|| std::io::Error::other("balance revision overflow"))?;
+        let new_base_randomness = JubjubScalar::rand(rng);
+        let new_quote_randomness = JubjubScalar::rand(rng);
+        let witness = DepositWitness {
+            market_context: pubkey_context(request.market),
+            owner_context: pubkey_context(request.owner),
+            key_epoch_context: pubkey_context(request.key_epoch),
+            committee_key: decode_wire_point(request.committee_key)?.into_group(),
+            old_revision: request.old_revision,
+            base_amount: request.base_amount,
+            quote_amount: request.quote_amount,
+            old_base: request.old_balance.base_value,
+            old_quote: request.old_balance.quote_value,
+            randomness: [
+                scalar_from_bytes(request.old_balance.base_randomness)?,
+                scalar_from_bytes(request.old_balance.quote_randomness)?,
+                new_base_randomness,
+                new_quote_randomness,
+            ],
+        };
+        let digest = witness
+            .digest()
+            .ok_or_else(|| std::io::Error::other("invalid deposit transition"))?;
+        let ciphertexts = witness
+            .ciphertexts()
+            .ok_or_else(|| std::io::Error::other("invalid deposit balances"))?
+            .map(transition::ciphertext_bytes);
+        let proof = Groth16::<Bn254>::prove(
+            &self.proving_key,
+            DepositCircuit::from_witness(witness),
+            rng,
+        )?;
+        let prepared_key = Groth16::<Bn254>::process_vk(&self.proving_key.vk)?;
+        if !Groth16::<Bn254>::verify_with_processed_vk(&prepared_key, &[digest], &proof)? {
+            return Err(std::io::Error::other("generated deposit proof did not verify").into());
+        }
+        Ok(DepositProofOutput {
+            proof_a: transition::g1_bytes(proof.a.neg()),
+            proof_b: transition::g2_bytes(proof.b),
+            proof_c: transition::g1_bytes(proof.c),
+            public_input: transition::field_bytes(digest),
+            new_encrypted_base: ciphertexts[2],
+            new_encrypted_quote: ciphertexts[3],
+            new_balance: PrivateBalanceOpening {
+                base_value: new_base,
+                quote_value: new_quote,
+                base_randomness: scalar_bytes(new_base_randomness),
+                quote_randomness: scalar_bytes(new_quote_randomness),
+            },
+        })
+    }
+
+    /// Prove a public withdrawal with the deposit relation reversed. The
+    /// circuit establishes `remaining + amount = current`; the on-chain
+    /// handler then applies the state transition from current to remaining.
+    pub fn prove_public_withdrawal<R: RngCore + CryptoRng>(
+        &self,
+        request: PublicWithdrawalProofRequest,
+        rng: &mut R,
+    ) -> Result<PublicWithdrawalProofOutput, Box<dyn std::error::Error>> {
+        if request.base_amount == 0 && request.quote_amount == 0 {
+            return Err(std::io::Error::other("withdrawal must debit at least one asset").into());
+        }
+        let remaining_base = request
+            .current_balance
+            .base_value
+            .checked_sub(request.base_amount)
+            .ok_or_else(|| std::io::Error::other("insufficient private base balance"))?;
+        let remaining_quote = request
+            .current_balance
+            .quote_value
+            .checked_sub(request.quote_amount)
+            .ok_or_else(|| std::io::Error::other("insufficient private quote balance"))?;
+        request
+            .current_revision
+            .checked_add(1)
+            .ok_or_else(|| std::io::Error::other("balance revision overflow"))?;
+        let remaining_base_randomness = JubjubScalar::rand(rng);
+        let remaining_quote_randomness = JubjubScalar::rand(rng);
+        let witness = DepositWitness {
+            market_context: pubkey_context(request.market),
+            owner_context: pubkey_context(request.owner),
+            key_epoch_context: pubkey_context(request.key_epoch),
+            committee_key: decode_wire_point(request.committee_key)?.into_group(),
+            old_revision: request.current_revision,
+            base_amount: request.base_amount,
+            quote_amount: request.quote_amount,
+            old_base: remaining_base,
+            old_quote: remaining_quote,
+            randomness: [
+                remaining_base_randomness,
+                remaining_quote_randomness,
+                scalar_from_bytes(request.current_balance.base_randomness)?,
+                scalar_from_bytes(request.current_balance.quote_randomness)?,
+            ],
+        };
+        let digest = witness
+            .digest()
+            .ok_or_else(|| std::io::Error::other("invalid withdrawal transition"))?;
+        let ciphertexts = witness
+            .ciphertexts()
+            .ok_or_else(|| std::io::Error::other("invalid withdrawal balances"))?
+            .map(transition::ciphertext_bytes);
+        let proof = Groth16::<Bn254>::prove(
+            &self.proving_key,
+            DepositCircuit::from_witness(witness),
+            rng,
+        )?;
+        let prepared_key = Groth16::<Bn254>::process_vk(&self.proving_key.vk)?;
+        if !Groth16::<Bn254>::verify_with_processed_vk(&prepared_key, &[digest], &proof)? {
+            return Err(std::io::Error::other("generated withdrawal proof did not verify").into());
+        }
+        Ok(PublicWithdrawalProofOutput {
+            proof_a: transition::g1_bytes(proof.a.neg()),
+            proof_b: transition::g2_bytes(proof.b),
+            proof_c: transition::g1_bytes(proof.c),
+            public_input: transition::field_bytes(digest),
+            remaining_encrypted_base: ciphertexts[0],
+            remaining_encrypted_quote: ciphertexts[1],
+            remaining_balance: PrivateBalanceOpening {
+                base_value: remaining_base,
+                quote_value: remaining_quote,
+                base_randomness: scalar_bytes(remaining_base_randomness),
+                quote_randomness: scalar_bytes(remaining_quote_randomness),
+            },
+        })
+    }
+}
+
 /// Deterministic development fixture for host/SBF parity tests. Both setup
 /// and proof seeds are intentionally non-production.
 pub fn deterministic_solana_fixture(
 ) -> Result<SolanaBalanceDepositFixture, Box<dyn std::error::Error>> {
     build_solana_fixture(DepositWitness::deterministic())
+}
+
+/// Export the deterministic Devnet deposit verification key without proving a
+/// fixture. Production deployments must install ceremony-generated parameters.
+pub fn deterministic_verification_key(
+) -> Result<transition::SolanaVerificationKey, Box<dyn std::error::Error>> {
+    DepositProver::deterministic_devnet()?.verification_key()
 }
 
 /// Deterministic fixture bound to caller-provided Solana account addresses.
@@ -452,5 +678,57 @@ mod tests {
         };
         let cs = ConstraintSystem::<Fq>::new_ref();
         assert!(circuit.generate_constraints(cs).is_err());
+    }
+
+    #[test]
+    #[ignore = "generates a full balance-deposit Groth16 proof; run in release mode"]
+    fn arbitrary_deposit_prover_generates_a_verified_transition() {
+        let prover = DepositProver::deterministic_devnet().unwrap();
+        let request = DepositProofRequest {
+            market: [0x11; 32],
+            owner: [0x22; 32],
+            key_epoch: [0x33; 32],
+            committee_key: transition::deterministic_committee_key_bytes(),
+            old_revision: 0,
+            base_amount: 20,
+            quote_amount: 50_000_000,
+            old_balance: PrivateBalanceOpening {
+                base_value: 0,
+                quote_value: 0,
+                base_randomness: [0; 32],
+                quote_randomness: [0; 32],
+            },
+        };
+        let mut rng = ChaCha20Rng::from_seed([0x92; 32]);
+        let output = prover.prove(request, &mut rng).unwrap();
+        assert_eq!(output.new_balance.base_value, 20);
+        assert_eq!(output.new_balance.quote_value, 50_000_000);
+        assert_ne!(output.public_input, [0; 32]);
+    }
+
+    #[test]
+    #[ignore = "generates a full public-withdrawal Groth16 proof; run in release mode"]
+    fn public_withdrawal_prover_generates_a_verified_reverse_transition() {
+        let prover = DepositProver::deterministic_devnet().unwrap();
+        let request = PublicWithdrawalProofRequest {
+            market: [0x11; 32],
+            owner: [0x22; 32],
+            key_epoch: [0x33; 32],
+            committee_key: transition::deterministic_committee_key_bytes(),
+            current_revision: 7,
+            base_amount: 3,
+            quote_amount: 125_000,
+            current_balance: PrivateBalanceOpening {
+                base_value: 20,
+                quote_value: 50_000_000,
+                base_randomness: scalar_bytes(JubjubScalar::from(0x41u64)),
+                quote_randomness: scalar_bytes(JubjubScalar::from(0x42u64)),
+            },
+        };
+        let mut rng = ChaCha20Rng::from_seed([0x93; 32]);
+        let output = prover.prove_public_withdrawal(request, &mut rng).unwrap();
+        assert_eq!(output.remaining_balance.base_value, 17);
+        assert_eq!(output.remaining_balance.quote_value, 49_875_000);
+        assert_ne!(output.public_input, [0; 32]);
     }
 }

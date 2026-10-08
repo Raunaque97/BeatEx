@@ -1,0 +1,28 @@
+[package]
+name = "beatex-devnet-client"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+anchor-lang = "=1.1.2"
+base64 = "0.22.1"
+beatex-babyjubjub-groth16-spike = { path = "../babyjubjub-groth16-spike" }
+beatex-program = { path = "../../programs/beatex", features = ["no-entrypoint"] }
+beatex-threshold-crypto = { path = "../threshold-crypto" }
+beatex-vault-proof-service = { path = "../vault-proof-service" }
+ark-bn254 = "=0.5.0"
+ark-groth16 = "=0.5.0"
+ark-snark = "=0.5.1"
+rand_chacha = "=0.3.1"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+solana-keypair = "=3.1.2"
+solana-instruction = "=3.5.1"
+solana-instructions-sysvar = "=3.0.1"
+solana-signer = "=3.0.0"
+solana-zk-sdk.workspace = true
+solana-zk-sdk-pod = "=0.1.2"
+spl-token-2022-interface = "=3.0.0"

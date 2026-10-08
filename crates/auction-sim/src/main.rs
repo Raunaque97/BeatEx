@@ -20,7 +20,7 @@ fn aggregate_level(public_key: &ElGamalPubkey, quantities: &[u64]) -> ElGamalCip
         .iter()
         .map(|quantity| public_key.encrypt_u64(*quantity))
         .reduce(|aggregate, ciphertext| aggregate + ciphertext)
-        .expect("the demo has at least one trader")
+        .expect("the simulation has at least one trader")
 }
 
 fn main() {
@@ -48,7 +48,7 @@ fn main() {
             sell: &sells[trader],
         }
         .validate(&grid)
-        .expect("demo orders satisfy the public reference rules");
+        .expect("simulation orders satisfy the public reference rules");
     }
 
     let mut demand = [0_u64; 5];

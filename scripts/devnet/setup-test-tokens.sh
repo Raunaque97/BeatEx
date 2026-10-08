@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+project_root="$(cd "$script_dir/../.." && pwd)"
+if [[ -d "$project_root/.devnet/tools/bin" ]]; then
+  PATH="$project_root/.devnet/tools/bin:$PATH"
+fi
+
 TOKEN_2022_PROGRAM_ID='TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb'
 cluster='localnet'
 wallet=''
 state_dir=''
-metadata_base_uri='https://beatex.dev/demo-metadata'
+metadata_base_uri='https://beatex.dev/devnet-metadata'
 dry_run=0
 
 usage() {
@@ -16,7 +22,7 @@ Usage:
 Options:
   --cluster localnet|devnet       Target cluster (default: localnet)
   --wallet <KEYPAIR>              Fee payer and mint authority (required)
-  --state-dir <DIRECTORY>         Persistent keys/output (default: .demo/<cluster>)
+  --state-dir <DIRECTORY>         Persistent keys/output (default: .devnet/<cluster>)
   --metadata-base-uri <URL>       Base URI written into embedded metadata
   --dry-run                       Print the immutable token specification only
   -h, --help                      Show this help
@@ -70,12 +76,12 @@ case "$cluster" in
 esac
 
 if [[ -z "$state_dir" ]]; then
-  state_dir=".demo/$cluster"
+  state_dir=".devnet/$cluster"
 fi
 
 if (( dry_run )); then
   cat <<EOF
-BeatEx demo token specification
+BeatEx Devnet token specification
 cluster: $cluster
 rpc: $rpc_url
 program: $TOKEN_2022_PROGRAM_ID
@@ -98,6 +104,7 @@ if [[ ! -f "$wallet" ]]; then
   printf 'Wallet keypair does not exist: %s\n' "$wallet" >&2
   exit 2
 fi
+wallet="$(cd "$(dirname "$wallet")" && pwd)/$(basename "$wallet")"
 
 for required_command in solana solana-keygen spl-token; do
   if ! command -v "$required_command" >/dev/null 2>&1; then
@@ -123,7 +130,11 @@ config_file="$state_dir/solana-cli.yml"
 solana config set --config "$config_file" --url "$rpc_url" --keypair "$wallet" >/dev/null
 
 solana_args=(--config "$config_file")
-token_args=(--config "$config_file" --program-id "$TOKEN_2022_PROGRAM_ID")
+token_args=(
+  --config "$config_file"
+  --fee-payer "$wallet"
+  --program-id "$TOKEN_2022_PROGRAM_ID"
+)
 
 if ! solana "${solana_args[@]}" cluster-version >/dev/null; then
   printf 'Cannot reach %s at %s\n' "$cluster" "$rpc_url" >&2
@@ -154,7 +165,7 @@ ensure_confidential_account() {
     --address "$address" >&2
 }
 
-ensure_demo_mint() {
+ensure_test_mint() {
   local slug="$1"
   local name="$2"
   local symbol="$3"
@@ -211,8 +222,8 @@ ensure_demo_mint() {
 results_file="$state_dir/addresses.tsv"
 {
   printf 'symbol\tmint\towner-token-account\tdecimals\n'
-  ensure_demo_mint 'tbtc' 'BeatEx Test Bitcoin' 'tBTC' 8 100
-  ensure_demo_mint 'tusd' 'BeatEx Test USD' 'tUSD' 6 1000000
+  ensure_test_mint 'tbtc' 'BeatEx Test Bitcoin' 'tBTC' 8 100
+  ensure_test_mint 'tusd' 'BeatEx Test USD' 'tUSD' 6 1000000
 } | tee "$results_file"
 
 printf '\nOwner: %s\nSaved: %s\n' "$wallet_pubkey" "$results_file"

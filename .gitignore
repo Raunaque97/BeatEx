@@ -2,8 +2,8 @@
 target/
 **/target/
 
-# Local demo wallets, validator ledgers, deployed artifacts, and secrets.
-.demo/
+# Local Devnet wallets, validator ledgers, deployed artifacts, and secrets.
+.devnet/
 
 # Rust profiling output.
 *.profraw

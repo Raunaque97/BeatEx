@@ -34,14 +34,14 @@ const ORDER_CIPHERTEXT_DOMAIN: [u8; 32] = [
     154, 95, 96, 244, 127, 123, 119, 133, 235, 107, 255, 115, 186, 204, 140, 36, 69, 110, 121, 68,
     149, 151, 175, 156, 26, 206, 152, 4, 125, 217, 164, 26,
 ];
-const FOLD_DOMAIN: [u8; 32] = [
-    66, 101, 97, 116, 69, 120, 32, 113, 117, 101, 117, 101, 100, 32, 97, 103, 103, 114, 101, 103,
-    97, 116, 101, 32, 102, 111, 108, 100, 32, 118, 49, 0,
-];
+const ORDER_EVENT_DOMAIN: [u8; 32] = *b"BeatEx queue event v2\0\0\0\0\0\0\0\0\0\0\0";
+const FOLD_DOMAIN: [u8; 32] = *b"BeatEx replace fold v2\0\0\0\0\0\0\0\0\0\0";
 const BALANCE_DEPOSIT_DOMAIN: [u8; 32] = [
     66, 101, 97, 116, 69, 120, 32, 98, 97, 108, 97, 110, 99, 101, 32, 100, 101, 112, 111, 115, 105,
     116, 32, 118, 49, 0, 0, 0, 0, 0, 0, 0,
 ];
+const COLLATERAL_RELEASE_DOMAIN: [u8; 32] = *b"BeatEx collateral release v1\0\0\0\0";
+const ROLLOVER_SETTLEMENT_DOMAIN: [u8; 32] = *b"BeatEx rollover credit v1\0\0\0\0\0\0\0";
 const AGGREGATE_PUBLICATION_DOMAIN: [u8; 32] = [
     127, 140, 212, 251, 15, 85, 102, 242, 234, 78, 218, 28, 27, 68, 89, 72, 136, 155, 32, 56, 121,
     130, 126, 98, 114, 162, 223, 31, 24, 175, 167, 8,
@@ -108,6 +108,48 @@ pub struct BalanceDepositStatement<'a> {
     pub old_quote: &'a EncryptedValue,
     pub new_base: &'a EncryptedValue,
     pub new_quote: &'a EncryptedValue,
+}
+
+pub struct CollateralReleaseStatement<'a> {
+    pub market: &'a Pubkey,
+    pub auction: &'a Pubkey,
+    pub active_order: &'a Pubkey,
+    pub owner: &'a Pubkey,
+    pub balance_revision: u64,
+    pub client_order_nonce: u64,
+    pub order_commitment: [u8; 32],
+    pub committee_key: [u8; 32],
+    pub old_base: &'a EncryptedValue,
+    pub old_quote: &'a EncryptedValue,
+    pub released_base: &'a EncryptedValue,
+    pub released_quote: &'a EncryptedValue,
+}
+
+pub struct RolloverSettlementStatement<'a> {
+    pub market: &'a Pubkey,
+    pub auction: &'a Pubkey,
+    pub order: &'a Pubkey,
+    pub active_order: &'a Pubkey,
+    pub owner: &'a Pubkey,
+    pub key_epoch: &'a Pubkey,
+    pub client_order_nonce: u64,
+    pub sequence: u64,
+    pub allocation_rule_version: u16,
+    pub order_circuit_version: u16,
+    pub claim_circuit_version: u16,
+    pub order_commitment: [u8; 32],
+    pub clearing_index: u8,
+    pub clearing_price: u64,
+    pub demand_at_clearing: u64,
+    pub supply_at_clearing: u64,
+    pub clearing_volume: u64,
+    pub terminal_nullifier: [u8; 32],
+    pub balance_revision: u64,
+    pub committee_key: [u8; 32],
+    pub old_base: &'a EncryptedValue,
+    pub old_quote: &'a EncryptedValue,
+    pub credited_base: &'a EncryptedValue,
+    pub credited_quote: &'a EncryptedValue,
 }
 
 /// Compact public statement for publishing the decrypted aggregate. The
@@ -201,6 +243,28 @@ pub fn order_ciphertext_digest(
     transcript_hash(&payload)
 }
 
+pub fn order_event_ciphertext_digest(
+    auction: &Pubkey,
+    event: &Pubkey,
+    previous_ciphertexts: &[u8],
+    ciphertexts: &[u8],
+) -> Result<[u8; 32]> {
+    order_event_digest(
+        auction,
+        event,
+        Some(previous_ciphertexts),
+        Some(ciphertexts),
+    )
+}
+
+pub fn initial_order_event_ciphertext_digest(
+    auction: &Pubkey,
+    event: &Pubkey,
+    ciphertexts: &[u8],
+) -> Result<[u8; 32]> {
+    order_event_digest(auction, event, None, Some(ciphertexts))
+}
+
 pub fn fold_statement_digest(statement: &FoldStatement<'_>) -> Result<[u8; 32]> {
     require!(
         !statement.active_orders.is_empty() && statement.active_orders.len() <= FOLD_BATCH_SIZE,
@@ -276,6 +340,83 @@ pub fn balance_deposit_statement_digest(
         statement.old_quote,
         statement.new_base,
         statement.new_quote,
+    ] {
+        append_ciphertext(&mut payload, ciphertext)?;
+    }
+    transcript_hash(&payload)
+}
+
+pub fn collateral_release_statement_digest(
+    statement: &CollateralReleaseStatement<'_>,
+) -> Result<[u8; 32]> {
+    validate_field(&statement.order_commitment)?;
+    let mut payload = Vec::with_capacity(40);
+    payload.push(COLLATERAL_RELEASE_DOMAIN);
+    payload.push(ONE);
+    for key in [
+        statement.market,
+        statement.auction,
+        statement.active_order,
+        statement.owner,
+    ] {
+        payload.extend(pubkey_fields(key));
+    }
+    payload.push(u64_field(statement.balance_revision));
+    payload.push(u64_field(statement.client_order_nonce));
+    payload.push(statement.order_commitment);
+    append_point(&mut payload, &statement.committee_key)?;
+    for ciphertext in [
+        statement.old_base,
+        statement.old_quote,
+        statement.released_base,
+        statement.released_quote,
+    ] {
+        append_ciphertext(&mut payload, ciphertext)?;
+    }
+    transcript_hash(&payload)
+}
+
+pub fn rollover_settlement_statement_digest(
+    statement: &RolloverSettlementStatement<'_>,
+) -> Result<[u8; 32]> {
+    validate_field(&statement.order_commitment)?;
+    validate_field(&statement.terminal_nullifier)?;
+    require!(
+        statement.terminal_nullifier != ZERO,
+        BeatExError::InvalidWithdrawalNullifier
+    );
+    let mut payload = Vec::with_capacity(64);
+    payload.push(ROLLOVER_SETTLEMENT_DOMAIN);
+    payload.push(ONE);
+    for key in [
+        statement.market,
+        statement.auction,
+        statement.order,
+        statement.active_order,
+        statement.owner,
+        statement.key_epoch,
+    ] {
+        payload.extend(pubkey_fields(key));
+    }
+    payload.push(u64_field(statement.client_order_nonce));
+    payload.push(u64_field(statement.sequence));
+    payload.push(u64_field(u64::from(statement.allocation_rule_version)));
+    payload.push(u64_field(u64::from(statement.order_circuit_version)));
+    payload.push(u64_field(u64::from(statement.claim_circuit_version)));
+    payload.push(statement.order_commitment);
+    payload.push(u64_field(u64::from(statement.clearing_index)));
+    payload.push(u64_field(statement.clearing_price));
+    payload.push(u64_field(statement.demand_at_clearing));
+    payload.push(u64_field(statement.supply_at_clearing));
+    payload.push(u64_field(statement.clearing_volume));
+    payload.push(statement.terminal_nullifier);
+    payload.push(u64_field(statement.balance_revision));
+    append_point(&mut payload, &statement.committee_key)?;
+    for ciphertext in [
+        statement.old_base,
+        statement.old_quote,
+        statement.credited_base,
+        statement.credited_quote,
     ] {
         append_ciphertext(&mut payload, ciphertext)?;
     }
@@ -454,14 +595,22 @@ pub fn ristretto_batching_scalar(
 }
 
 fn inactive_order_digest(auction: &Pubkey) -> Result<[u8; 32]> {
-    let identity = order_bytes(&identity_order());
-    let mut payload = Vec::with_capacity(5 + QUEUED_CIPHERTEXT_COUNT * 4);
-    payload.push(ORDER_CIPHERTEXT_DOMAIN);
-    payload.extend(pubkey_fields(auction));
-    payload.push(ZERO);
-    payload.push(ZERO);
-    append_order(&mut payload, &identity)?;
-    transcript_hash(&payload)
+    order_event_digest(auction, &Pubkey::default(), None, None)
+}
+
+fn order_event_digest(
+    auction: &Pubkey,
+    event: &Pubkey,
+    previous_ciphertexts: Option<&[u8]>,
+    ciphertexts: Option<&[u8]>,
+) -> Result<[u8; 32]> {
+    let mut transcript = TranscriptBuilder::new();
+    transcript.push(ORDER_EVENT_DOMAIN)?;
+    transcript.push_pubkey(auction)?;
+    transcript.push_pubkey(event)?;
+    transcript.push_order_or_identity(previous_ciphertexts)?;
+    transcript.push_order_or_identity(ciphertexts)?;
+    transcript.finish()
 }
 
 pub fn identity_order() -> EncryptedOrder {
@@ -638,6 +787,38 @@ impl TranscriptBuilder {
             .map_err(|_| error!(BeatExError::InvalidBabyJubjubEncoding))?;
         self.push_point(first)?;
         self.push_point(second)
+    }
+
+    fn push_pubkey(&mut self, key: &Pubkey) -> Result<()> {
+        for field in pubkey_fields(key) {
+            self.push(field)?;
+        }
+        Ok(())
+    }
+
+    fn push_order_or_identity(&mut self, ciphertexts: Option<&[u8]>) -> Result<()> {
+        if let Some(ciphertexts) = ciphertexts {
+            require!(
+                ciphertexts.len() == QUEUED_CIPHERTEXT_COUNT * 64,
+                BeatExError::UnsupportedQueueGrid
+            );
+            for ciphertext in ciphertexts.chunks_exact(64) {
+                let ciphertext: &EncryptedValue = ciphertext
+                    .try_into()
+                    .map_err(|_| error!(BeatExError::InvalidBabyJubjubEncoding))?;
+                self.push_ciphertext(ciphertext)?;
+            }
+        } else {
+            // Twisted Edwards identity is (0, 1). Each ElGamal identity
+            // ciphertext contains the identity for both compressed points.
+            for _ in 0..QUEUED_CIPHERTEXT_COUNT {
+                self.push(ONE)?;
+                self.push(ZERO)?;
+                self.push(ONE)?;
+                self.push(ZERO)?;
+            }
+        }
+        Ok(())
     }
 
     fn push_raw_32(&mut self, bytes: &[u8; 32]) -> Result<()> {
@@ -900,6 +1081,108 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "generates a deterministic collateral-release Groth16 setup"]
+    fn collateral_release_statement_matches_and_verifies_exact_circuit_fixture() {
+        let fixture =
+            beatex_babyjubjub_groth16_spike::release::deterministic_solana_fixture().unwrap();
+        let digest = collateral_release_statement_digest(&CollateralReleaseStatement {
+            market: &Pubkey::new_from_array(fixture.market),
+            auction: &Pubkey::new_from_array(fixture.auction),
+            active_order: &Pubkey::new_from_array(fixture.active_order),
+            owner: &Pubkey::new_from_array(fixture.owner),
+            balance_revision: fixture.balance_revision,
+            client_order_nonce: fixture.client_order_nonce,
+            order_commitment: fixture.order_commitment,
+            committee_key: fixture.committee_key,
+            old_base: &fixture.balance_ciphertexts[0],
+            old_quote: &fixture.balance_ciphertexts[1],
+            released_base: &fixture.balance_ciphertexts[2],
+            released_quote: &fixture.balance_ciphertexts[3],
+        })
+        .unwrap();
+        let mut expected_le = fixture.public_input;
+        expected_le.reverse();
+        assert_eq!(digest, expected_le);
+
+        let verification_key = QueueVerificationKey {
+            version: 1,
+            market: Pubkey::new_unique(),
+            circuit_kind: QueueCircuitKind::OrderModification,
+            circuit_version: 1,
+            alpha_g1: fixture.vk_alpha_g1,
+            beta_g2: fixture.vk_beta_g2,
+            gamma_g2: fixture.vk_gamma_g2,
+            delta_g2: fixture.vk_delta_g2,
+            ic: fixture.vk_ic,
+            bump: 255,
+        };
+        let proof = crate::Groth16ProofInput {
+            proof_a: fixture.proof_a,
+            proof_b: fixture.proof_b,
+            proof_c: fixture.proof_c,
+            public_input: fixture.public_input,
+        };
+        groth16::verify_queue_proof(&proof, &digest, &verification_key).unwrap();
+    }
+
+    #[test]
+    #[ignore = "generates a deterministic rollover-settlement Groth16 setup"]
+    fn rollover_statement_matches_and_verifies_exact_circuit_fixture() {
+        let fixture =
+            beatex_babyjubjub_groth16_spike::rollover::deterministic_solana_fixture().unwrap();
+        let digest = rollover_settlement_statement_digest(&RolloverSettlementStatement {
+            market: &Pubkey::new_from_array(fixture.market),
+            auction: &Pubkey::new_from_array(fixture.auction),
+            order: &Pubkey::new_from_array(fixture.order),
+            active_order: &Pubkey::new_from_array(fixture.active_order),
+            owner: &Pubkey::new_from_array(fixture.owner),
+            key_epoch: &Pubkey::new_from_array(fixture.key_epoch),
+            client_order_nonce: fixture.client_order_nonce,
+            sequence: fixture.sequence,
+            allocation_rule_version: fixture.allocation_rule_version,
+            order_circuit_version: fixture.order_circuit_version,
+            claim_circuit_version: fixture.claim_circuit_version,
+            order_commitment: fixture.order_commitment,
+            clearing_index: fixture.clearing_index,
+            clearing_price: fixture.clearing_price,
+            demand_at_clearing: fixture.demand,
+            supply_at_clearing: fixture.supply,
+            clearing_volume: fixture.clearing_volume,
+            terminal_nullifier: fixture.nullifier,
+            balance_revision: fixture.balance_revision,
+            committee_key: fixture.committee_key,
+            old_base: &fixture.balance_ciphertexts[0],
+            old_quote: &fixture.balance_ciphertexts[1],
+            credited_base: &fixture.balance_ciphertexts[2],
+            credited_quote: &fixture.balance_ciphertexts[3],
+        })
+        .unwrap();
+        let mut expected_le = fixture.public_input;
+        expected_le.reverse();
+        assert_eq!(digest, expected_le);
+
+        let verification_key = QueueVerificationKey {
+            version: 1,
+            market: Pubkey::new_unique(),
+            circuit_kind: QueueCircuitKind::RolloverSettlement,
+            circuit_version: 1,
+            alpha_g1: fixture.vk_alpha_g1,
+            beta_g2: fixture.vk_beta_g2,
+            gamma_g2: fixture.vk_gamma_g2,
+            delta_g2: fixture.vk_delta_g2,
+            ic: fixture.vk_ic,
+            bump: 255,
+        };
+        let proof = crate::Groth16ProofInput {
+            proof_a: fixture.proof_a,
+            proof_b: fixture.proof_b,
+            proof_c: fixture.proof_c,
+            public_input: fixture.public_input,
+        };
+        groth16::verify_queue_proof(&proof, &digest, &verification_key).unwrap();
+    }
+
+    #[test]
     #[ignore = "generates a deterministic deposit Groth16 setup"]
     fn deposit_statement_matches_and_verifies_exact_circuit_fixture() {
         let fixture =
@@ -1064,7 +1347,7 @@ mod tests {
             version: 1,
             market: Pubkey::new_unique(),
             circuit_kind: QueueCircuitKind::AggregateFold,
-            circuit_version: 1,
+            circuit_version: crate::queue::AGGREGATE_FOLD_CIRCUIT_VERSION,
             alpha_g1: fixture.vk_alpha_g1,
             beta_g2: fixture.vk_beta_g2,
             gamma_g2: fixture.vk_gamma_g2,

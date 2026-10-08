@@ -9,7 +9,7 @@ use {
     crate::WithdrawalProofBundle,
     solana_instruction::Instruction,
     solana_pubkey::Pubkey,
-    solana_zk_sdk_v4::zk_elgamal_proof_program::{
+    solana_zk_elgamal_proof_interface::{
         instruction::{close_context_state, ContextStateInfo, ProofInstruction},
         proof_data::{
             batched_grouped_ciphertext_validity::BatchedGroupedCiphertext3HandlesValidityProofContext,
@@ -67,7 +67,7 @@ fn transfer_plan(
     payer: Pubkey,
     rent_lamports: [u64; 3],
 ) -> TransferContextPlan {
-    let proof_program = solana_zk_sdk_v4::zk_elgamal_proof_program::id();
+    let proof_program = solana_zk_elgamal_proof_interface::id();
     let accounts = [
         ProofContextAccountSpec {
             address: addresses.equality,
