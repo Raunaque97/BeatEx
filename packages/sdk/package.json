@@ -18,9 +18,10 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "dev": "tsc -p tsconfig.json --watch --preserveWatchOutput",
     "check": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run build && node --test test/*.test.mjs",
-    "test:devnet": "npm run build && node --test test/*.integration.mjs"
+    "test": "pnpm build && node --test test/*.test.mjs",
+    "test:devnet": "pnpm build && node --test test/*.integration.mjs"
   },
   "engines": {
     "node": ">=20"
