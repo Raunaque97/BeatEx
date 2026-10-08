@@ -1,0 +1,271 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import {
+  BEATEX_PROGRAM_ADDRESS,
+  InMemoryPrivateStateStorage,
+  QueueCircuitKind,
+  createKitTransactionCompiler,
+  deriveAuctionPda,
+  deriveActiveOrderPda,
+  deriveKeyEpochPda,
+  deriveMarketPda,
+  derivePrivateBalancePda,
+  deriveQueuedOrderPda,
+  deriveSubmissionCounterPda,
+  deriveVerificationKeyPda,
+  deriveVaultAuthorityPda,
+  encodeBindRolloverSettlement,
+  encodeDepositCollateral,
+  encodeInitializeAuction,
+  encodeBindRolloverOrder,
+  encodePrepareRollover,
+  encodeRolloverOrder,
+  encodeSubmitQueuedOrder,
+  encodeVerifyRolloverProof,
+} from "../dist/index.js";
+
+const TBTC = "33D68TXfhVb8qiKXBF6yob5opkaeD4ayPsNPketQdgxm";
+const TUSD = "7Fg3pJw2stGKi7WTQRYNsWYqYrFcuwziD8C5HpH9s9Ng";
+const MARKET = "3haCd5iqRJuk9FGVFRdkW6jMnKQL4CH4vgwdpVc8XzxS";
+const OWNER = "Db3M2ef9iDH1rVeFhmQzoDnywbu4wdQWDonqGfs2ATQS";
+
+const fixed = (length, fill = 0) => new Uint8Array(length).fill(fill);
+const proof = {
+  proofA: fixed(64, 1),
+  proofB: fixed(128, 2),
+  proofC: fixed(64, 3),
+  publicInput: fixed(32, 4),
+};
+
+test("Devnet PDA derivation matches the deployed market", async () => {
+  const [market] = await deriveMarketPda({ baseMint: TBTC, quoteMint: TUSD, marketNonce: 2n });
+  assert.equal(market, MARKET);
+  const [vault] = await deriveVaultAuthorityPda(market);
+  assert.equal(vault, "2gbWNfRTH37Nvc3k3FCayaT1FvXysDTF8KKE3SpcWnWN");
+  const [epoch] = await deriveKeyEpochPda(market, 1n);
+  assert.equal(epoch, "AoJ755HzDcFx8VZB3rpotAWRszxv7dCVZYX9WSRe3abe");
+  const [balance] = await derivePrivateBalancePda(market, OWNER);
+  assert.equal(typeof balance, "string");
+  const [auction] = await deriveAuctionPda(market, 1007n);
+  assert.equal(typeof auction, "string");
+});
+
+test("instruction encoders preserve frozen Anchor wire lengths", () => {
+  assert.equal(encodeInitializeAuction(42n).length, 16);
+  assert.equal(
+    encodeDepositCollateral({
+      baseAmount: 1n,
+      quoteAmount: 2n,
+      newEncryptedBase: fixed(64),
+      newEncryptedQuote: fixed(64),
+      proof,
+    }).length,
+    440,
+  );
+  assert.equal(
+    encodeSubmitQueuedOrder({
+      clientOrderNonce: 3n,
+      orderCommitment: fixed(32),
+      ciphertexts: fixed(2176),
+      newEncryptedBase: fixed(64),
+      newEncryptedQuote: fixed(64),
+      proof,
+    }).length,
+    2644,
+  );
+  assert.equal(
+    encodeVerifyRolloverProof({
+      circuitKind: QueueCircuitKind.RolloverSettlement,
+      expectedPublicInput: fixed(32),
+      proof,
+    }).length,
+    329,
+  );
+  assert.equal(
+    encodeBindRolloverSettlement({
+      settlement: {
+        terminalNullifier: fixed(32),
+        creditedEncryptedBase: fixed(64),
+        creditedEncryptedQuote: fixed(64),
+      },
+      expectedPublicInput: fixed(32),
+    }).length,
+    200,
+  );
+  assert.equal(encodeRolloverOrder().length, 8);
+});
+
+test("private-state journal records broadcast before atomic confirmation", async () => {
+  const storage = new InMemoryPrivateStateStorage();
+  const key = { cluster: "devnet", programId: BEATEX_PROGRAM_ADDRESS, market: MARKET, owner: OWNER };
+  const state = {
+    balanceRevision: 0n,
+    keyEpoch: "AoJ755HzDcFx8VZB3rpotAWRszxv7dCVZYX9WSRe3abe",
+    balance: {
+      baseValue: 0n,
+      quoteValue: 0n,
+      baseRandomness: fixed(32),
+      quoteRandomness: fixed(32),
+    },
+    encryptedBase: fixed(64),
+    encryptedQuote: fixed(64),
+    activeOrder: null,
+  };
+  await storage.stage(key, {
+    id: "transition-1",
+    operation: "initialize",
+    expectedStorageRevision: null,
+    nextState: state,
+  });
+  await storage.markBroadcast(key, "transition-1", "signature", "blockhash", 99n);
+  const pending = await storage.load(key);
+  assert.equal(pending.pending?.transactionSignature, "signature");
+  const record = await storage.commitConfirmed(key, "transition-1", {
+    signature: "signature",
+    slot: 10n,
+    confirmationStatus: "confirmed",
+  });
+  assert.equal(record.storageRevision, 0n);
+  assert.equal(record.state.balanceRevision, 0n);
+  assert.equal((await storage.load(key)).pending, null);
+});
+
+test("Kit compiler emits an extended v1 transaction below the configured cap", async () => {
+  const compiler = createKitTransactionCompiler();
+  const bytes = await compiler.compileTransaction({
+    feePayer: OWNER,
+    recentBlockhash: {
+      blockhash: "11111111111111111111111111111111",
+      lastValidBlockHeight: 1n,
+    },
+    instructions: [
+      {
+        programId: BEATEX_PROGRAM_ADDRESS,
+        accounts: [{ address: MARKET, writable: false, signer: false }],
+        data: encodeRolloverOrder(),
+      },
+    ],
+    config: {
+      version: 1,
+      maxTransactionBytes: 4096,
+      computeUnitLimit: 1_400_000,
+      loadedAccountsDataSizeLimit: 2 * 1024 * 1024,
+      heapSize: 256 * 1024,
+      priorityFeeLamports: 0n,
+    },
+  });
+  assert.ok(bytes.length > 0 && bytes.length < 4096);
+});
+
+test("the frozen six-instruction rollover remains exactly 4,093 bytes", async () => {
+  const owner = "GYuK4aof3fS7M1dzYzwLrrdokdQsVieuPfVuEBxjCitq";
+  const keyEpoch = "AoJ755HzDcFx8VZB3rpotAWRszxv7dCVZYX9WSRe3abe";
+  const [oldAuction] = await deriveAuctionPda(MARKET, 822n);
+  const [nextAuction] = await deriveAuctionPda(MARKET, 823n);
+  const [nextCounter] = await deriveSubmissionCounterPda(nextAuction);
+  const [oldOrder] = await deriveQueuedOrderPda(oldAuction, 0n);
+  const [oldActive] = await deriveActiveOrderPda(oldAuction, owner);
+  const [nextOrder] = await deriveQueuedOrderPda(nextAuction, 0n);
+  const [nextActive] = await deriveActiveOrderPda(nextAuction, owner);
+  const [balance] = await derivePrivateBalancePda(MARKET, owner);
+  const [rolloverKey] = await deriveVerificationKeyPda(
+    MARKET,
+    QueueCircuitKind.RolloverSettlement,
+    1,
+  );
+  const [orderKey] = await deriveVerificationKeyPda(
+    MARKET,
+    QueueCircuitKind.OrderSubmission,
+    1,
+  );
+  const settlement = {
+    terminalNullifier: fixed(32),
+    creditedEncryptedBase: fixed(64),
+    creditedEncryptedQuote: fixed(64),
+  };
+  const nextOrderArgs = {
+    clientOrderNonce: 1n,
+    orderCommitment: fixed(32),
+    ciphertexts: fixed(2176),
+    newEncryptedBase: fixed(64),
+    newEncryptedQuote: fixed(64),
+  };
+  const account = (address, writable = false, signer = false) => ({ address, writable, signer });
+  const instruction = (accounts, data) => ({
+    programId: BEATEX_PROGRAM_ADDRESS,
+    accounts,
+    data,
+  });
+  const sysvar = "Sysvar1nstructions1111111111111111111111111";
+  const system = "11111111111111111111111111111111";
+  const instructions = [
+    instruction(
+      [
+        account(owner, true, true), account(MARKET), account(nextAuction), account(nextCounter),
+        account(nextOrder, true), account(nextActive, true), account(sysvar), account(system),
+      ],
+      encodePrepareRollover(),
+    ),
+    instruction(
+      [account(MARKET), account(rolloverKey)],
+      encodeVerifyRolloverProof({
+        circuitKind: QueueCircuitKind.RolloverSettlement,
+        expectedPublicInput: fixed(32),
+        proof,
+      }),
+    ),
+    instruction(
+      [
+        account(owner, false, true), account(MARKET), account(oldAuction), account(keyEpoch),
+        account(oldOrder), account(oldActive), account(balance), account(rolloverKey), account(sysvar),
+      ],
+      encodeBindRolloverSettlement({ settlement, expectedPublicInput: fixed(32) }),
+    ),
+    instruction(
+      [account(MARKET), account(orderKey)],
+      encodeVerifyRolloverProof({
+        circuitKind: QueueCircuitKind.OrderSubmission,
+        expectedPublicInput: fixed(32),
+        proof,
+      }),
+    ),
+    instruction(
+      [
+        account(owner, false, true), account(MARKET), account(nextAuction), account(keyEpoch),
+        account(orderKey), account(sysvar),
+      ],
+      encodeBindRolloverOrder({
+        nextOrder: nextOrderArgs,
+        creditedEncryptedBase: fixed(64),
+        creditedEncryptedQuote: fixed(64),
+        expectedPublicInput: fixed(32),
+      }),
+    ),
+    instruction(
+      [
+        account(owner, true, true), account(MARKET), account(oldAuction), account(nextAuction),
+        account(keyEpoch), account(oldOrder, true), account(oldActive, true),
+        account(nextCounter, true), account(balance, true), account(rolloverKey), account(orderKey),
+        account(nextOrder, true), account(nextActive, true), account(sysvar),
+      ],
+      encodeRolloverOrder(),
+    ),
+  ];
+  const bytes = await createKitTransactionCompiler().compileTransaction({
+    feePayer: owner,
+    recentBlockhash: {
+      blockhash: "11111111111111111111111111111111",
+      lastValidBlockHeight: 1n,
+    },
+    instructions,
+    config: {
+      version: 1,
+      maxTransactionBytes: 4096,
+      computeUnitLimit: 1_400_000,
+      loadedAccountsDataSizeLimit: 2 * 1024 * 1024,
+      heapSize: 256 * 1024,
+      priorityFeeLamports: 0n,
+    },
+  });
+  assert.equal(bytes.length, 4093);
+});

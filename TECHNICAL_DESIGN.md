@@ -1407,8 +1407,8 @@ The scripted Devnet run should validate:
 8. Permissionless relay of the proof and publication of aggregate demand and supply curves.
 9. Independent recomputation of the deterministic clearing price.
 10. Onchain clearing result matching the independent result.
-11. At least two private claims settling through confidential transfers.
-12. A separate auction timing out and entering the refund path.
+11. Private settlements crediting the encrypted ledger, followed by a public withdrawal.
+12. A separate auction timing out and refunding its reserve into the encrypted ledger.
 
 The Devnet run should also include negative tests: corrupted publication proof, invalid participant set, corrupted claim proof, and double claim must fail.
 
@@ -1451,7 +1451,42 @@ The Devnet run should also include negative tests: corrupted publication proof, 
 
 ---
 
-## 23. References
+## 23. TypeScript frontend SDK
+
+The browser-compatible `@beatex/sdk` package is the supported frontend
+boundary. It checks in the exact Anchor-compatible account decoders,
+instruction codecs, PDA derivations, and Solana version-1 transaction builder
+instead of requiring frontend components to duplicate the Rust client.
+
+The high-level client exposes deposit, place, replace, cancel, internal
+settlement/refund, atomic rollover, and public withdrawal methods plus market,
+auction, queue, order, and private-balance reads. A pluggable `BeatExProver`
+keeps browser WASM, worker, native bridge, and proving-service implementations
+behind the same typed interface.
+
+Private state uses a two-phase journal. The SDK compiles, signs, and simulates
+the transaction before staging the next private opening; it records the
+broadcast signature and commits the opening only after confirmation. A page
+reload can resume confirmation through `recoverPendingTransition`. All balance
+mutations are serialized per `(cluster, program, market, owner)`, and the SDK
+compares the locally stored revision and ciphertexts with the onchain balance
+before generating a new proof.
+
+The SDK emits no Node.js-only code on the runtime path. Its built-in JSON-RPC
+adapter uses `fetch`, its default compiler uses `@solana/kit`, and wallet
+integration is provided through a Kit signer adapter or the small byte-oriented
+`BeatExSigner` interface. Transactions are rejected before broadcast if they
+exceed the 4,096-byte v1 ceiling; the six-instruction rollover sequence cannot
+be extended with optional instructions.
+
+Private state storage is intentionally injectable. The provided browser
+storage adapter supplies cross-tab atomicity through Web Locks but not
+encryption; an application handling valuable assets must provide an encrypted
+storage layer and backup/recovery UX.
+
+---
+
+## 24. References
 
 - Eric Budish, Peter Cramton, and John Shim, *The High-Frequency Trading Arms Race: Frequent Batch Auctions as a Market Design Response*.
 - [Solana Confidential Balances documentation](https://www.solana-program.com/docs/confidential-balances)

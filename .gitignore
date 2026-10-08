@@ -11,6 +11,10 @@ target/
 # JavaScript/WebAssembly benchmark dependencies and generated packages.
 node_modules/
 **/node_modules/
+.npm-cache/
+**/.npm-cache/
+dist/
+**/dist/
 pkg/
 **/pkg/
 

@@ -1,0 +1,35 @@
+{
+  "name": "@beatex/sdk",
+  "version": "0.1.0",
+  "description": "Browser-compatible TypeScript SDK for BeatEx confidential batch auctions",
+  "type": "module",
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "test:devnet": "npm run build && node --test test/*.integration.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@solana/kit": "8.4.0"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3"
+  },
+  "license": "Apache-2.0"
+}

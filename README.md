@@ -216,6 +216,12 @@ The current 972,376-byte SBF program is deployed on Devnet at
 The retained Devnet tBTC and tUSD addresses are recorded in
 `docs/DEVNET_ENVIRONMENT.md`.
 
+Frontend applications use the browser-compatible TypeScript package at
+[`packages/sdk`](./packages/sdk/). It provides typed deposit, order,
+replacement, cancellation, internal settlement/refund, rollover, withdrawal,
+read, transaction, prover, and crash-safe private-state APIs. The frontend does
+not need to encode Anchor instructions or manage balance revisions directly.
+
 Create or reuse the test assets, deploy the program, initialize the custody
 vaults, 3-of-7 key epoch and all eight versioned verification-key PDAs, and fund
 the two persistent market-maker identities with one command:
