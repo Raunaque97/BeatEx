@@ -22,6 +22,13 @@ import {
   encodeRolloverOrder,
   encodeSubmitQueuedOrder,
   encodeVerifyRolloverProof,
+  baseTokensToUnits,
+  baseUnitsToTokens,
+  buildAuctionGrid,
+  priceAtGridOffset,
+  quoteTokensToUnits,
+  quoteUnitsToTokens,
+  tokenPriceToUnits,
 } from "../dist/index.js";
 
 const TBTC = "33D68TXfhVb8qiKXBF6yob5opkaeD4ayPsNPketQdgxm";
@@ -36,6 +43,27 @@ const proof = {
   proofC: fixed(64, 3),
   publicInput: fixed(32, 4),
 };
+
+test("human token quantities convert exactly to configured units", () => {
+  assert.equal(baseTokensToUnits("0.000001"), 1n);
+  assert.equal(baseUnitsToTokens(1n), "0.000001");
+  assert.equal(quoteTokensToUnits("1.25"), 1_250_000n);
+  assert.equal(quoteUnitsToTokens(1_250_000n), "1.25");
+  assert.equal(tokenPriceToUnits("65000"), 65_000n);
+  assert.throws(() => baseTokensToUnits("0.00000001"), /exact multiple/);
+});
+
+test("basis-point grid uses checked half-up prices and rejects duplicates", () => {
+  assert.equal(priceAtGridOffset(99_950n, 25, 1), 100_200n);
+  const grid = buildAuctionGrid({ referencePrice: 100_000n, gridStepBps: 25, gridSize: 17 });
+  assert.equal(grid[8].price, 100_000n);
+  assert.equal(grid[0].offset, -8);
+  assert.ok(grid.every((level, index) => index === 0 || grid[index - 1].price < level.price));
+  assert.throws(
+    () => buildAuctionGrid({ referencePrice: 100n, gridStepBps: 1, gridSize: 17 }),
+    /duplicate or unordered/,
+  );
+});
 
 test("Devnet PDA derivation matches the deployed market", async () => {
   const [market] = await deriveMarketPda({ baseMint: TBTC, quoteMint: TUSD, marketNonce: 2n });

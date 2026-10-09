@@ -10,7 +10,9 @@
 pub enum AuctionError {
     EmptyGrid,
     EvenGridSize,
-    ZeroTickSize,
+    ZeroGridStepBps,
+    InvalidGridMultiplier,
+    DuplicatePriceLevel,
     PriceUnderflow,
     PriceOverflow,
     IndexOutOfBounds,
@@ -20,14 +22,17 @@ pub enum AuctionError {
     SupplyOverflow { index: u16 },
 }
 
-/// An odd-sized price grid centered on the previous clearing price.
+pub const BPS_DENOMINATOR: u64 = 10_000;
+
+/// An odd-sized price grid centered on the auction reference price.
 ///
-/// `reference_price` and `tick_size` are expressed in price lots. The center
-/// level is `level_count / 2`, and is exactly `reference_price`.
+/// `reference_price` is expressed in quote units per base unit. Adjacent levels
+/// are separated by `grid_step_bps` of the reference price. Every level uses
+/// checked integer arithmetic and round-half-up to the nearest quote unit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PriceGrid {
     pub reference_price: u64,
-    pub tick_size: u64,
+    pub grid_step_bps: u16,
     pub level_count: u16,
 }
 
@@ -35,20 +40,21 @@ impl PriceGrid {
     /// Validate the grid shape and every price implied by its two edges.
     pub fn validate(&self) -> Result<(), AuctionError> {
         validate_odd_level_count(self.level_count)?;
-        if self.tick_size == 0 {
-            return Err(AuctionError::ZeroTickSize);
+        if self.reference_price == 0 {
+            return Err(AuctionError::PriceUnderflow);
+        }
+        if self.grid_step_bps == 0 {
+            return Err(AuctionError::ZeroGridStepBps);
         }
 
-        let radius = u64::from(self.center_index());
-        let edge_delta = radius
-            .checked_mul(self.tick_size)
-            .ok_or(AuctionError::PriceOverflow)?;
-        self.reference_price
-            .checked_sub(edge_delta)
-            .ok_or(AuctionError::PriceUnderflow)?;
-        self.reference_price
-            .checked_add(edge_delta)
-            .ok_or(AuctionError::PriceOverflow)?;
+        let mut previous = None;
+        for index in 0..self.level_count {
+            let price = self.price_at_unchecked(index)?;
+            if previous.is_some_and(|previous| price <= previous) {
+                return Err(AuctionError::DuplicatePriceLevel);
+            }
+            previous = Some(price);
+        }
         Ok(())
     }
 
@@ -64,22 +70,28 @@ impl PriceGrid {
             return Err(AuctionError::IndexOutOfBounds);
         }
 
-        let center = self.center_index();
-        if index <= center {
-            let delta = u64::from(center - index)
-                .checked_mul(self.tick_size)
-                .ok_or(AuctionError::PriceOverflow)?;
-            self.reference_price
-                .checked_sub(delta)
-                .ok_or(AuctionError::PriceUnderflow)
-        } else {
-            let delta = u64::from(index - center)
-                .checked_mul(self.tick_size)
-                .ok_or(AuctionError::PriceOverflow)?;
-            self.reference_price
-                .checked_add(delta)
-                .ok_or(AuctionError::PriceOverflow)
+        self.price_at_unchecked(index)
+    }
+
+    fn price_at_unchecked(&self, index: u16) -> Result<u64, AuctionError> {
+        let offset = i64::from(index) - i64::from(self.center_index());
+        let multiplier = i64::try_from(BPS_DENOMINATOR)
+            .expect("basis-point denominator fits i64")
+            .checked_add(
+                offset
+                    .checked_mul(i64::from(self.grid_step_bps))
+                    .ok_or(AuctionError::PriceOverflow)?,
+            )
+            .ok_or(AuctionError::PriceOverflow)?;
+        if multiplier <= 0 {
+            return Err(AuctionError::InvalidGridMultiplier);
         }
+        let numerator = u128::from(self.reference_price)
+            .checked_mul(multiplier as u128)
+            .and_then(|value| value.checked_add(u128::from(BPS_DENOMINATOR / 2)))
+            .ok_or(AuctionError::PriceOverflow)?;
+        let price = numerator / u128::from(BPS_DENOMINATOR);
+        u64::try_from(price).map_err(|_| AuctionError::PriceOverflow)
     }
 
     /// Iterate in clearing tie-break order: `k, k-1, k+1, ...`.
@@ -218,37 +230,59 @@ pub struct ClearingResult {
     pub aggregate_supply: u64,
 }
 
-/// Select the maximum executable-volume price using the exact zigzag tie-break.
+/// Select the maximum executable-volume price using the configured tie-break.
 ///
-/// Equal volumes never replace the current winner. Since candidates are
-/// visited `k, k-1, k+1, ...`, this selects the price closest to the previous
-/// clearing price and the lower index when two candidates are equally distant.
+/// The maximum-volume price is selected first. If multiple levels have that
+/// volume, the price closest to `tie_break_price` wins; an equal-distance tie
+/// is resolved in favour of the lower price. This is deliberately independent
+/// of the oracle/reference price: a low-volume auction may use an oracle
+/// reference while still carrying forward the previous clearing price for the
+/// tie-break.
 pub fn clear_auction(
     grid: &PriceGrid,
     aggregate_demand: &[u64],
     aggregate_supply: &[u64],
 ) -> Result<ClearingResult, AuctionError> {
+    clear_auction_with_tiebreak(
+        grid,
+        aggregate_demand,
+        aggregate_supply,
+        grid.reference_price,
+    )
+}
+
+pub fn clear_auction_with_tiebreak(
+    grid: &PriceGrid,
+    aggregate_demand: &[u64],
+    aggregate_supply: &[u64],
+    tie_break_price: u64,
+) -> Result<ClearingResult, AuctionError> {
     validate_aggregate_curves(grid, aggregate_demand, aggregate_supply)?;
 
-    let mut indices = grid.zigzag_indices()?;
-    let center = indices.next().expect("a validated odd grid is non-empty");
-    let center_index = usize::from(center);
-    let mut best_index = center;
-    let mut best_volume = aggregate_demand[center_index].min(aggregate_supply[center_index]);
-
-    for index in indices {
+    let mut best_index = 0u16;
+    let mut best_price = 0u64;
+    let mut best_volume = 0u64;
+    let mut best_distance = u64::MAX;
+    for index in 0..grid.level_count {
         let slice_index = usize::from(index);
         let volume = aggregate_demand[slice_index].min(aggregate_supply[slice_index]);
-        if volume > best_volume {
+        let price = grid.price_at(index)?;
+        let distance = price.abs_diff(tie_break_price);
+        if volume > best_volume
+            || (volume == best_volume
+                && (distance < best_distance || (distance == best_distance && price < best_price)))
+        {
             best_index = index;
+            best_price = price;
             best_volume = volume;
+            best_distance = distance;
         }
     }
 
     let slice_index = usize::from(best_index);
     Ok(ClearingResult {
         index: best_index,
-        price: grid.price_at(best_index)?,
+        price: best_price,
         executable_volume: best_volume,
         aggregate_demand: aggregate_demand[slice_index],
         aggregate_supply: aggregate_supply[slice_index],
@@ -294,8 +328,8 @@ mod tests {
 
     fn grid_5() -> PriceGrid {
         PriceGrid {
-            reference_price: 100,
-            tick_size: 10,
+            reference_price: 10_000,
+            grid_step_bps: 1_000,
             level_count: 5,
         }
     }
@@ -309,7 +343,7 @@ mod tests {
             (0..grid.level_count)
                 .map(|index| grid.price_at(index).unwrap())
                 .collect::<Vec<_>>(),
-            vec![80, 90, 100, 110, 120]
+            vec![8_000, 9_000, 10_000, 11_000, 12_000]
         );
     }
 
@@ -317,7 +351,7 @@ mod tests {
     fn a_single_level_grid_is_valid_and_centered() {
         let grid = PriceGrid {
             reference_price: 7,
-            tick_size: 1,
+            grid_step_bps: 1,
             level_count: 1,
         };
         assert_eq!(grid.validate(), Ok(()));
@@ -330,7 +364,7 @@ mod tests {
         assert_eq!(
             PriceGrid {
                 reference_price: 1,
-                tick_size: 1,
+                grid_step_bps: 1,
                 level_count: 0,
             }
             .validate(),
@@ -339,7 +373,7 @@ mod tests {
         assert_eq!(
             PriceGrid {
                 reference_price: 1,
-                tick_size: 1,
+                grid_step_bps: 1,
                 level_count: 2,
             }
             .validate(),
@@ -348,35 +382,35 @@ mod tests {
         assert_eq!(
             PriceGrid {
                 reference_price: 1,
-                tick_size: 0,
+                grid_step_bps: 0,
                 level_count: 1,
             }
             .validate(),
-            Err(AuctionError::ZeroTickSize)
+            Err(AuctionError::ZeroGridStepBps)
         );
         assert_eq!(
             PriceGrid {
-                reference_price: 9,
-                tick_size: 10,
+                reference_price: 10_000,
+                grid_step_bps: 10_000,
                 level_count: 3,
             }
             .validate(),
-            Err(AuctionError::PriceUnderflow)
+            Err(AuctionError::InvalidGridMultiplier)
         );
         assert_eq!(
             PriceGrid {
-                reference_price: u64::MAX - 9,
-                tick_size: 10,
+                reference_price: 100,
+                grid_step_bps: 10,
                 level_count: 3,
             }
             .validate(),
-            Err(AuctionError::PriceOverflow)
+            Err(AuctionError::DuplicatePriceLevel)
         );
         assert_eq!(
             PriceGrid {
                 reference_price: u64::MAX,
-                tick_size: u64::MAX,
-                level_count: 5,
+                grid_step_bps: 9_999,
+                level_count: 3,
             }
             .validate(),
             Err(AuctionError::PriceOverflow)
@@ -391,8 +425,8 @@ mod tests {
     #[test]
     fn zigzag_order_is_exact_for_multiple_grid_sizes() {
         let make_grid = |level_count| PriceGrid {
-            reference_price: 1_000,
-            tick_size: 1,
+            reference_price: 1_000_000,
+            grid_step_bps: 1,
             level_count,
         };
 
@@ -602,7 +636,7 @@ mod tests {
             result,
             ClearingResult {
                 index: 2,
-                price: 100,
+                price: 10_000,
                 executable_volume: 7,
                 aggregate_demand: 8,
                 aggregate_supply: 7,
@@ -621,6 +655,18 @@ mod tests {
     }
 
     #[test]
+    fn previous_clearing_price_controls_oracle_fallback_ties() {
+        let grid = grid_5();
+        let demand = [0, 0, 6, 6, 0];
+        let supply = [0, 0, 6, 6, 0];
+        // The grid reference is 10,000, but the prior clearing was one level
+        // higher. The upper tied level must therefore win.
+        let result = clear_auction_with_tiebreak(&grid, &demand, &supply, 11_000).unwrap();
+        assert_eq!(result.index, 3);
+        assert_eq!(result.price, 11_000);
+    }
+
+    #[test]
     fn lower_index_is_visited_before_equally_distant_upper_index() {
         let order = grid_5().zigzag_indices().unwrap().collect::<Vec<_>>();
         assert!(
@@ -636,7 +682,7 @@ mod tests {
         let result = clear_auction(&grid_5(), &[9, 7, 5, 3, 1], &[0, 0, 0, 0, 0]).unwrap();
 
         assert_eq!(result.index, 2);
-        assert_eq!(result.price, 100);
+        assert_eq!(result.price, 10_000);
         assert_eq!(result.executable_volume, 0);
         assert_eq!(result.aggregate_demand, 5);
         assert_eq!(result.aggregate_supply, 0);
@@ -650,8 +696,8 @@ mod tests {
         );
 
         let even_grid = PriceGrid {
-            reference_price: 100,
-            tick_size: 1,
+            reference_price: 100_000,
+            grid_step_bps: 1,
             level_count: 4,
         };
         assert_eq!(

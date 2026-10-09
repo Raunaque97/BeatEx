@@ -65,7 +65,7 @@ use {
 const DEFAULT_RPC_URL: &str = "https://api.devnet.solana.com";
 const PYTH_BTC_USD_ACCOUNT: &str = "4cSM2e6rvbGQUFiJbqytoVMi5GgghSMr8LwVrT9VPSPo";
 const PYTH_BTC_USD_FEED: &str = "e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43";
-const MARKET_NONCE: u64 = 2;
+const MARKET_NONCE: u64 = 3;
 const KEY_EPOCH: u64 = 1;
 const TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 
@@ -106,6 +106,7 @@ struct BundleAccount {
 #[serde(rename_all = "camelCase")]
 struct InstructionBundle {
     keypair: String,
+    label: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     signer_keypairs: Vec<String>,
     rpc_url: String,
@@ -153,7 +154,7 @@ struct KeyedRpcAccount {
 #[derive(Clone, Debug, Deserialize)]
 struct OrderIntent {
     reference_price: u64,
-    tick_size: u64,
+    grid_step_bps: u16,
     client_order_nonce: u64,
     buy: [u64; beatex_babyjubjub_groth16_spike::LEVELS],
     sell: [u64; beatex_babyjubjub_groth16_spike::LEVELS],
@@ -598,6 +599,7 @@ fn send_bundle(
     let sender = project_root.join("clients/v1-transaction/send.mjs");
     let bundle = InstructionBundle {
         keypair: absolute(wallet)?.display().to_string(),
+        label: label.to_owned(),
         signer_keypairs: additional_signers
             .iter()
             .map(|path| absolute(path).map(|path| path.display().to_string()))
@@ -636,6 +638,26 @@ fn absolute(path: &Path) -> Result<PathBuf, Box<dyn Error>> {
     } else {
         env::current_dir()?.join(path)
     })
+}
+
+fn wallet_pubkey(path: &Path) -> Result<Pubkey, Box<dyn Error>> {
+    let bytes = fs::read(path)?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    if let Some(object) = value.as_object() {
+        if object.get("version").and_then(serde_json::Value::as_u64) != Some(1)
+            || object.get("type").and_then(serde_json::Value::as_str) != Some("browser-wallet")
+        {
+            return Err("unsupported wallet session file".into());
+        }
+        return Pubkey::from_str(
+            object
+                .get("address")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("browser wallet session is missing address")?,
+        )
+        .map_err(Into::into);
+    }
+    Ok(read_keypair_file(path)?.pubkey())
 }
 
 fn ensure_participants(state_dir: &Path) -> Result<[PathBuf; 7], Box<dyn Error>> {
@@ -704,25 +726,25 @@ fn initialize_market(
     let oracle = Pubkey::from_str(PYTH_BTC_USD_ACCOUNT)?;
     let args = InitializeMarketArgs {
         market_nonce: MARKET_NONCE,
-        base_lot_size: 1,
-        quote_lot_size: 1,
-        tick_size: 5,
+        base_unit_size: beatex::state::BASE_UNIT_SIZE,
+        quote_unit_size: beatex::state::QUOTE_UNIT_SIZE,
+        grid_step_bps: beatex::state::DEFAULT_GRID_STEP_BPS,
         grid_radius: 8,
-        max_order_quantity: queue::MAX_PRIVATE_ORDER_QUANTITY,
-        max_aggregate_quantity: 1_000_000,
+        max_order_quantity: 1_000_000,
+        max_aggregate_quantity: 100_000_000,
         market_start_slot: config.market_start_slot,
         minimum_reference_volume: 1,
         oracle_feed_id: decode_hex_32(PYTH_BTC_USD_FEED)?,
         oracle_max_age_seconds: 600,
         oracle_max_confidence_bps: 200,
-        oracle_exponent_adjustment: -2,
-        min_reference_price: 100,
-        max_reference_price: 5_000,
+        oracle_exponent_adjustment: 0,
+        min_reference_price: 1_000,
+        max_reference_price: 1_000_000,
         submission_duration_slots: 400,
         aggregation_duration_slots: 200,
         decryption_duration_slots: 200,
         allocation_rule_version: allocation::ALLOCATION_RULE_VERSION,
-        order_circuit_version: queue::QUEUE_CIRCUIT_VERSION,
+        order_circuit_version: queue::ORDER_SUBMISSION_CIRCUIT_VERSION,
         claim_circuit_version: queue::PRIVATE_CLAIM_CIRCUIT_VERSION,
     };
     send(
@@ -1057,7 +1079,7 @@ fn initialize_current_auction(
         return Ok(());
     };
     if !account_exists(&rpc_url, &current.auction) {
-        let payer = read_keypair_file(&wallet)?.pubkey();
+        let payer = wallet_pubkey(&wallet)?;
         send(
             &wallet,
             &rpc_url,
@@ -1230,7 +1252,7 @@ fn deposit_initial_balance(
     let deposit_key = verification_key_address(
         &addresses.market,
         QueueCircuitKind::BalanceDeposit,
-        queue::QUEUE_CIRCUIT_VERSION,
+        queue::BALANCE_DEPOSIT_CIRCUIT_VERSION,
     );
     send(
         &config.wallet,
@@ -1300,7 +1322,7 @@ fn submit_order(
             owner: owner.to_bytes(),
             client_order_nonce: intent.client_order_nonce,
             reference_price: auction.reference_price,
-            tick_size: auction.tick_size,
+            grid_step_bps: auction.grid_step_bps,
             committee_key: key_epoch.babyjub_encryption_pubkey,
             buy: intent.buy,
             sell: intent.sell,
@@ -1327,7 +1349,7 @@ fn submit_order(
     let order_key = verification_key_address(
         &addresses.market,
         QueueCircuitKind::OrderSubmission,
-        queue::QUEUE_CIRCUIT_VERSION,
+        queue::ORDER_SUBMISSION_CIRCUIT_VERSION,
     );
     send(
         &config.wallet,
@@ -1448,7 +1470,7 @@ fn replace_order(
             owner: owner.to_bytes(),
             client_order_nonce: intent.client_order_nonce,
             reference_price: auction.reference_price,
-            tick_size: auction.tick_size,
+            grid_step_bps: auction.grid_step_bps,
             committee_key: key_epoch.babyjub_encryption_pubkey,
             buy: intent.buy,
             sell: intent.sell,
@@ -1464,7 +1486,7 @@ fn replace_order(
     let order_key = verification_key_address(
         &addresses.market,
         QueueCircuitKind::OrderSubmission,
-        queue::QUEUE_CIRCUIT_VERSION,
+        queue::ORDER_SUBMISSION_CIRCUIT_VERSION,
     );
     send(
         &config.wallet,
@@ -1645,7 +1667,7 @@ fn rollover_order(
             owner: owner.to_bytes(),
             client_order_nonce: intent.client_order_nonce,
             reference_price: next_auction.reference_price,
-            tick_size: next_auction.tick_size,
+            grid_step_bps: next_auction.grid_step_bps,
             committee_key: key_epoch.babyjub_encryption_pubkey,
             buy: intent.buy,
             sell: intent.sell,
@@ -1661,7 +1683,7 @@ fn rollover_order(
     let order_key = verification_key_address(
         &addresses.market,
         QueueCircuitKind::OrderSubmission,
-        queue::QUEUE_CIRCUIT_VERSION,
+        queue::ORDER_SUBMISSION_CIRCUIT_VERSION,
     );
     let mut settlement_expected_input = output.settlement.public_input;
     settlement_expected_input.reverse();
@@ -1842,17 +1864,17 @@ fn execute_order(config: OrderConfig) -> Result<(), Box<dyn Error>> {
     let mut input = Vec::new();
     std::io::stdin().read_to_end(&mut input)?;
     let intent: OrderIntent = serde_json::from_slice(&input)?;
-    let owner = read_keypair_file(&config.wallet)?.pubkey();
+    let owner = wallet_pubkey(&config.wallet)?;
     let addresses = addresses(&config.common);
     let market = fetch_anchor_account::<beatex::Market>(&config.rpc_url, &addresses.market)?
         .ok_or("market has not been initialized")?;
     let key_epoch =
         fetch_anchor_account::<beatex::KeyEpoch>(&config.rpc_url, &addresses.key_epoch)?
             .ok_or("key epoch has not been initialized")?;
-    if intent.tick_size != market.tick_size {
+    if intent.grid_step_bps != market.grid_step_bps {
         return Err(format!(
-            "intent tick {} does not match market tick {}",
-            intent.tick_size, market.tick_size
+            "intent grid step {} bps does not match market grid step {} bps",
+            intent.grid_step_bps, market.grid_step_bps
         )
         .into());
     }
@@ -1989,7 +2011,7 @@ fn execute_fold(config: FoldConfig) -> Result<(), Box<dyn Error>> {
     if config.rpc_url.contains("mainnet") {
         return Err("mainnet is not supported by the Devnet client".into());
     }
-    let aggregator = read_keypair_file(&config.wallet)?.pubkey();
+    let aggregator = wallet_pubkey(&config.wallet)?;
     let addresses = addresses(&config.common);
     let auction_addresses = auction_addresses(&addresses, config.auction_id);
     let auction =
@@ -2304,7 +2326,7 @@ fn execute_apply_vault(config: ApplyVaultConfig) -> Result<(), Box<dyn Error>> {
     if config.rpc_url.contains("mainnet") {
         return Err("mainnet is not supported by the Devnet client".into());
     }
-    let authority = read_keypair_file(&config.wallet)?.pubkey();
+    let authority = wallet_pubkey(&config.wallet)?;
     let vault_owner = read_keypair_file(&config.vault_owner)?;
     let (vault_keypair, vault_ae_key) = derive_confidential_keys(&vault_owner, b"")?;
     let addresses = addresses(&config.common);
@@ -2603,7 +2625,7 @@ fn execute_claim(config: ClaimConfig) -> Result<(), Box<dyn Error>> {
     let mut proof_rng = ChaCha20Rng::from_entropy();
     let proof = generate_private_withdrawal_groth16_proof(&proving_key, witness, &mut proof_rng)?;
 
-    let payer = read_keypair_file(&config.wallet)?.pubkey();
+    let payer = wallet_pubkey(&config.wallet)?;
     let context_keypairs: [Keypair; 6] = std::array::from_fn(|_| Keypair::new());
     let context_directory = config
         .common
@@ -2787,7 +2809,7 @@ fn execute_balance_settlement(config: BalanceSettlementConfig) -> Result<(), Box
     if auction.state != expected_state {
         return Err("auction is not ready for the requested internal settlement".into());
     }
-    let owner = read_keypair_file(&config.wallet)?.pubkey();
+    let owner = wallet_pubkey(&config.wallet)?;
     let mut state = read_trader_state(&config.common.state_dir, &owner)?
         .ok_or("the trader private-state file is missing")?;
     let stored = state
@@ -3025,7 +3047,7 @@ fn execute_public_balance_withdrawal(
     let key_epoch =
         fetch_anchor_account::<beatex::KeyEpoch>(&config.rpc_url, &addresses.key_epoch)?
             .ok_or("key epoch account is missing")?;
-    let owner = read_keypair_file(&config.wallet)?.pubkey();
+    let owner = wallet_pubkey(&config.wallet)?;
     let mut state = read_trader_state(&config.common.state_dir, &owner)?
         .ok_or("the trader private-state file is missing")?;
     if state.active_order.is_some() {
@@ -3049,7 +3071,7 @@ fn execute_public_balance_withdrawal(
     let deposit_key = verification_key_address(
         &addresses.market,
         QueueCircuitKind::BalanceDeposit,
-        queue::QUEUE_CIRCUIT_VERSION,
+        queue::BALANCE_DEPOSIT_CIRCUIT_VERSION,
     );
     let private_balance = private_balance_address(&addresses.market, &owner);
     send(
@@ -3150,7 +3172,7 @@ fn initialize(config: InitializeConfig) -> Result<(), Box<dyn Error>> {
         return Err("mainnet is not supported by the Devnet client".into());
     }
     fs::create_dir_all(&config.common.state_dir)?;
-    let authority = read_keypair_file(&config.wallet)?.pubkey();
+    let authority = wallet_pubkey(&config.wallet)?;
     let addresses = addresses(&config.common);
     let participants = ensure_participants(&config.common.state_dir)?;
     initialize_market(&config, &addresses, authority)?;

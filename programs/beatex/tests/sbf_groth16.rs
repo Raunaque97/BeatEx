@@ -408,9 +408,9 @@ fn plaintext_lifecycle_executes_inside_sbf() {
         data: beatex::instruction::InitializeMarket {
             args: InitializeMarketArgs {
                 market_nonce,
-                base_lot_size: 1,
-                quote_lot_size: 1,
-                tick_size: 10,
+                base_unit_size: 100,
+                quote_unit_size: 1,
+                grid_step_bps: 10,
                 grid_radius: 2,
                 max_order_quantity: beatex::queue::MAX_PRIVATE_ORDER_QUANTITY,
                 max_aggregate_quantity: 10_000,
@@ -419,9 +419,9 @@ fn plaintext_lifecycle_executes_inside_sbf() {
                 aggregation_duration_slots: 10,
                 decryption_duration_slots: 10,
                 claim_duration_slots: 10,
-                allocation_rule_version: 1,
-                order_circuit_version: 1,
-                claim_circuit_version: 1,
+                allocation_rule_version: 2,
+                order_circuit_version: 2,
+                claim_circuit_version: 2,
             },
         }
         .data(),
@@ -769,15 +769,15 @@ fn temporal_auction_initialization_and_timeout_are_permissionless() {
     let oracle_price = Pubkey::new_unique();
     let feed_id = [7_u8; 32];
     let market_state = Market {
-        version: 1,
+        version: beatex::state::PROTOCOL_VERSION,
         authority: market_authority,
         base_mint: Pubkey::new_unique(),
         quote_mint: Pubkey::new_unique(),
         base_vault: Pubkey::new_unique(),
         quote_vault: Pubkey::new_unique(),
-        base_lot_size: 1,
-        quote_lot_size: 1,
-        tick_size: 10,
+        base_unit_size: 100,
+        quote_unit_size: 1,
+        grid_step_bps: 10,
         grid_radius: 8,
         max_order_quantity: beatex::queue::MAX_PRIVATE_ORDER_QUANTITY,
         max_aggregate_quantity: 10_000,
@@ -797,9 +797,9 @@ fn temporal_auction_initialization_and_timeout_are_permissionless() {
         submission_duration_slots: 10,
         aggregation_duration_slots: 10,
         decryption_duration_slots: 10,
-        allocation_rule_version: 1,
-        order_circuit_version: 1,
-        claim_circuit_version: 1,
+        allocation_rule_version: 2,
+        order_circuit_version: 2,
+        claim_circuit_version: 2,
         paused: false,
         vault_authority_bump: 0,
         bump: 0,
@@ -944,15 +944,15 @@ fn cancelled_order_refund_to_balance_executes_inside_sbf() {
         )
         .unwrap();
     let market_state = Market {
-        version: 1,
+        version: beatex::state::PROTOCOL_VERSION,
         authority: owner.pubkey(),
         base_mint: Pubkey::new_unique(),
         quote_mint: Pubkey::new_unique(),
         base_vault: Pubkey::new_unique(),
         quote_vault: Pubkey::new_unique(),
-        base_lot_size: 1,
-        quote_lot_size: 1,
-        tick_size: 1,
+        base_unit_size: 100,
+        quote_unit_size: 1,
+        grid_step_bps: 1,
         grid_radius: 8,
         max_order_quantity: 15,
         max_aggregate_quantity: 10_000,
@@ -972,15 +972,15 @@ fn cancelled_order_refund_to_balance_executes_inside_sbf() {
         submission_duration_slots: 50,
         aggregation_duration_slots: 50,
         decryption_duration_slots: 50,
-        allocation_rule_version: 1,
-        order_circuit_version: 1,
-        claim_circuit_version: 1,
+        allocation_rule_version: 2,
+        order_circuit_version: 2,
+        claim_circuit_version: 2,
         paused: false,
         vault_authority_bump: 0,
         bump: 0,
     };
     let auction_state = Auction {
-        version: 1,
+        version: beatex::state::PROTOCOL_VERSION,
         market,
         auction_id: 0,
         key_epoch,
@@ -992,11 +992,11 @@ fn cancelled_order_refund_to_balance_executes_inside_sbf() {
         reference_price: 100,
         reference_from_oracle: false,
         oracle_publish_time: 0,
-        tick_size: 1,
+        grid_step_bps: 1,
         grid_size: 17,
-        allocation_rule_version: 1,
-        order_circuit_version: 1,
-        claim_circuit_version: 1,
+        allocation_rule_version: 2,
+        order_circuit_version: 2,
+        claim_circuit_version: 2,
         finalized_order_count: 0,
         aggregate_buy: [[0; 64]; 17],
         aggregate_sell: [[0; 64]; 17],
@@ -1033,7 +1033,7 @@ fn cancelled_order_refund_to_balance_executes_inside_sbf() {
         bump: 0,
     };
     let balance_state = EncryptedPrivateBalance {
-        version: 1,
+        version: beatex::state::PROTOCOL_VERSION,
         market,
         owner: owner.pubkey(),
         key_epoch,
@@ -1046,7 +1046,7 @@ fn cancelled_order_refund_to_balance_executes_inside_sbf() {
         bump: 0,
     };
     let previous_event_state = QueuedOrder {
-        version: 1,
+        version: beatex::state::PROTOCOL_VERSION,
         market,
         auction,
         owner: owner.pubkey(),
@@ -1060,11 +1060,11 @@ fn cancelled_order_refund_to_balance_executes_inside_sbf() {
         ciphertexts: queue_hash::order_bytes(&queue_hash::identity_order()),
         ciphertext_digest: [0; 32],
         order_commitment: fixture.order_commitment,
-        order_circuit_version: 1,
+        order_circuit_version: 2,
         bump: 0,
     };
     let active_order_state = ActiveOrder {
-        version: 1,
+        version: beatex::state::PROTOCOL_VERSION,
         market,
         auction,
         owner: owner.pubkey(),
@@ -1074,7 +1074,7 @@ fn cancelled_order_refund_to_balance_executes_inside_sbf() {
         bump: 0,
     };
     let release_vk_state = QueueVerificationKey {
-        version: 1,
+        version: beatex::state::PROTOCOL_VERSION,
         market,
         circuit_kind: QueueCircuitKind::OrderModification,
         circuit_version: beatex::queue::ORDER_MODIFICATION_CIRCUIT_VERSION,
@@ -1169,15 +1169,15 @@ fn queued_order_and_replacement_aware_fold_execute_inside_sbf() {
         .unwrap();
 
     let market_state = Market {
-        version: 1,
+        version: beatex::state::PROTOCOL_VERSION,
         authority: owner.pubkey(),
         base_mint: Pubkey::new_unique(),
         quote_mint: Pubkey::new_unique(),
         base_vault: Pubkey::new_unique(),
         quote_vault: Pubkey::new_unique(),
-        base_lot_size: 1,
-        quote_lot_size: 1,
-        tick_size: order_fixture.tick_size,
+        base_unit_size: 100,
+        quote_unit_size: 1,
+        grid_step_bps: order_fixture.grid_step_bps,
         grid_radius: 8,
         max_order_quantity: 15,
         max_aggregate_quantity: 10_000,
@@ -1197,15 +1197,15 @@ fn queued_order_and_replacement_aware_fold_execute_inside_sbf() {
         submission_duration_slots: 50,
         aggregation_duration_slots: 50,
         decryption_duration_slots: 50,
-        allocation_rule_version: 1,
-        order_circuit_version: 1,
-        claim_circuit_version: 1,
+        allocation_rule_version: 2,
+        order_circuit_version: 2,
+        claim_circuit_version: 2,
         paused: false,
         vault_authority_bump: 0,
         bump: 0,
     };
     let auction_state = Auction {
-        version: 1,
+        version: beatex::state::PROTOCOL_VERSION,
         market,
         auction_id: 0,
         key_epoch,
@@ -1217,11 +1217,11 @@ fn queued_order_and_replacement_aware_fold_execute_inside_sbf() {
         reference_price: order_fixture.reference_price,
         reference_from_oracle: false,
         oracle_publish_time: 0,
-        tick_size: order_fixture.tick_size,
+        grid_step_bps: order_fixture.grid_step_bps,
         grid_size: 17,
-        allocation_rule_version: 1,
-        order_circuit_version: 1,
-        claim_circuit_version: 1,
+        allocation_rule_version: 2,
+        order_circuit_version: 2,
+        claim_circuit_version: 2,
         finalized_order_count: 0,
         aggregate_buy: [[0; 64]; 17],
         aggregate_sell: [[0; 64]; 17],
@@ -1258,10 +1258,10 @@ fn queued_order_and_replacement_aware_fold_execute_inside_sbf() {
         bump: 0,
     };
     let order_vk_state = QueueVerificationKey {
-        version: 1,
+        version: beatex::state::PROTOCOL_VERSION,
         market,
         circuit_kind: QueueCircuitKind::OrderSubmission,
-        circuit_version: 1,
+        circuit_version: 2,
         alpha_g1: order_fixture.vk_alpha_g1,
         beta_g2: order_fixture.vk_beta_g2,
         gamma_g2: order_fixture.vk_gamma_g2,
@@ -1270,13 +1270,13 @@ fn queued_order_and_replacement_aware_fold_execute_inside_sbf() {
         bump: 0,
     };
     let counter_state = SubmissionCounter {
-        version: 1,
+        version: beatex::state::PROTOCOL_VERSION,
         auction,
         accepted_order_count: 0,
         bump: 0,
     };
     let balance_state = EncryptedPrivateBalance {
-        version: 1,
+        version: beatex::state::PROTOCOL_VERSION,
         market,
         owner: owner.pubkey(),
         key_epoch,
@@ -1378,13 +1378,13 @@ fn queued_order_and_replacement_aware_fold_execute_inside_sbf() {
     fold_auction_state.submission_end_slot = 150;
     fold_auction_state.aggregation_deadline_slot = 200;
     let fold_counter_state = SubmissionCounter {
-        version: 1,
+        version: beatex::state::PROTOCOL_VERSION,
         auction: fold_auction,
         accepted_order_count: fold_fixture.old_folded_count + 3,
         bump: 0,
     };
     let fold_accumulator_state = AggregateAccumulator {
-        version: 1,
+        version: beatex::state::PROTOCOL_VERSION,
         auction: fold_auction,
         folded_order_count: fold_fixture.old_folded_count,
         fold_revision: 4,
@@ -1393,7 +1393,7 @@ fn queued_order_and_replacement_aware_fold_execute_inside_sbf() {
         bump: 0,
     };
     let fold_vk_state = QueueVerificationKey {
-        version: 1,
+        version: beatex::state::PROTOCOL_VERSION,
         market: fold_market,
         circuit_kind: QueueCircuitKind::AggregateFold,
         circuit_version: beatex::queue::AGGREGATE_FOLD_CIRCUIT_VERSION,
@@ -1412,7 +1412,7 @@ fn queued_order_and_replacement_aware_fold_execute_inside_sbf() {
     for (index, order_address) in fold_fixture.order_keys.iter().enumerate().take(3) {
         let order_address = Pubkey::new_from_array(*order_address);
         let order_state = QueuedOrder {
-            version: 1,
+            version: beatex::state::PROTOCOL_VERSION,
             market: fold_market,
             auction: fold_auction,
             owner: owner.pubkey(),
@@ -1426,7 +1426,7 @@ fn queued_order_and_replacement_aware_fold_execute_inside_sbf() {
             ciphertexts: queue_hash::order_bytes(&queue_hash::identity_order()),
             ciphertext_digest: fold_fixture.order_digests[index],
             order_commitment: [0; 32],
-            order_circuit_version: 1,
+            order_circuit_version: 2,
             bump: 0,
         };
         put_anchor_account(&mut svm, order_address, &order_state);
@@ -1510,15 +1510,15 @@ fn aggregate_publication_proof_executes_inside_sbf() {
     svm.set_sysvar(&fixture_clock);
     let current_slot = fixture_clock.slot;
     let market_state = Market {
-        version: 1,
+        version: beatex::state::PROTOCOL_VERSION,
         authority: payer.pubkey(),
         base_mint: Pubkey::new_unique(),
         quote_mint: Pubkey::new_unique(),
         base_vault: Pubkey::new_unique(),
         quote_vault: Pubkey::new_unique(),
-        base_lot_size: 1,
-        quote_lot_size: 1,
-        tick_size: 1,
+        base_unit_size: 100,
+        quote_unit_size: 1,
+        grid_step_bps: 1,
         grid_radius: 8,
         max_order_quantity: 15,
         max_aggregate_quantity: 1_000,
@@ -1538,15 +1538,15 @@ fn aggregate_publication_proof_executes_inside_sbf() {
         submission_duration_slots: 10,
         aggregation_duration_slots: 10,
         decryption_duration_slots: 100,
-        allocation_rule_version: 1,
-        order_circuit_version: 1,
-        claim_circuit_version: 1,
+        allocation_rule_version: 2,
+        order_circuit_version: 2,
+        claim_circuit_version: 2,
         paused: false,
         vault_authority_bump: 0,
         bump: 0,
     };
     let auction_state = Auction {
-        version: 1,
+        version: beatex::state::PROTOCOL_VERSION,
         market,
         auction_id: 0,
         key_epoch,
@@ -1558,11 +1558,11 @@ fn aggregate_publication_proof_executes_inside_sbf() {
         reference_price: 100,
         reference_from_oracle: false,
         oracle_publish_time: 0,
-        tick_size: 1,
+        grid_step_bps: 1,
         grid_size: 17,
-        allocation_rule_version: 1,
-        order_circuit_version: 1,
-        claim_circuit_version: 1,
+        allocation_rule_version: 2,
+        order_circuit_version: 2,
+        claim_circuit_version: 2,
         finalized_order_count: 0,
         aggregate_buy: [[0; 64]; 17],
         aggregate_sell: [[0; 64]; 17],
@@ -1599,13 +1599,13 @@ fn aggregate_publication_proof_executes_inside_sbf() {
         bump: 0,
     };
     let counter_state = SubmissionCounter {
-        version: 1,
+        version: beatex::state::PROTOCOL_VERSION,
         auction,
         accepted_order_count: fixture.accepted_order_count,
         bump: 0,
     };
     let accumulator_state = AggregateAccumulator {
-        version: 1,
+        version: beatex::state::PROTOCOL_VERSION,
         auction,
         folded_order_count: fixture.accepted_order_count,
         fold_revision: 3,
@@ -1614,7 +1614,7 @@ fn aggregate_publication_proof_executes_inside_sbf() {
         bump: 0,
     };
     let vk_state = QueueVerificationKey {
-        version: 1,
+        version: beatex::state::PROTOCOL_VERSION,
         market,
         circuit_kind: QueueCircuitKind::AggregatePublication,
         circuit_version: beatex::queue::AGGREGATE_PUBLICATION_CIRCUIT_VERSION,

@@ -41,30 +41,27 @@ pub mod beatex {
         ctx: Context<InitializeMarket>,
         args: InitializeMarketArgs,
     ) -> Result<()> {
-        // Circuit v1 treats order quantities and prices as raw token units.
-        // Fixing both lot sizes to one prevents the program and proof from
-        // silently interpreting the same witness in different denominations.
         require!(
-            args.base_lot_size == 1,
+            args.base_unit_size == state::BASE_UNIT_SIZE,
             BeatExError::InvalidMarketParameters
         );
         require!(
-            args.quote_lot_size == 1,
+            args.quote_unit_size == state::QUOTE_UNIT_SIZE,
             BeatExError::InvalidMarketParameters
         );
         require!(
             args.allocation_rule_version == allocation::ALLOCATION_RULE_VERSION
-                && args.order_circuit_version == queue::QUEUE_CIRCUIT_VERSION
+                && args.order_circuit_version == queue::ORDER_SUBMISSION_CIRCUIT_VERSION
                 && args.claim_circuit_version == queue::PRIVATE_CLAIM_CIRCUIT_VERSION,
             BeatExError::InvalidMarketParameters
         );
-        require!(args.tick_size > 0, BeatExError::InvalidMarketParameters);
+        require!(args.grid_step_bps > 0, BeatExError::InvalidMarketParameters);
         require!(
             args.market_start_slot >= Clock::get()?.slot,
             BeatExError::InvalidMarketParameters
         );
         require!(
-            args.grid_radius <= state::MAX_GRID_RADIUS,
+            args.grid_radius == state::MAX_GRID_RADIUS,
             BeatExError::InvalidMarketParameters
         );
         require!(
@@ -81,31 +78,44 @@ pub mod beatex {
                 && args.oracle_max_confidence_bps <= 10_000,
             BeatExError::InvalidMarketParameters
         );
-        let price_span = args
-            .tick_size
-            .checked_mul(args.grid_radius as u64)
-            .ok_or_else(|| error!(BeatExError::ArithmeticOverflow))?;
-        args.min_reference_price
-            .checked_sub(price_span)
-            .ok_or_else(|| error!(BeatExError::InvalidMarketParameters))?;
-        let upper_price = args
-            .max_reference_price
-            .checked_add(price_span)
-            .ok_or_else(|| error!(BeatExError::ArithmeticOverflow))?;
         require!(
             args.min_reference_price <= args.max_reference_price,
             BeatExError::InvalidMarketParameters
         );
+        let level_count = u16::from(args.grid_radius) * 2 + 1;
+        let minimum_grid = auction::PriceGrid {
+            reference_price: args.min_reference_price,
+            grid_step_bps: args.grid_step_bps,
+            level_count,
+        };
+        let maximum_grid = auction::PriceGrid {
+            reference_price: args.max_reference_price,
+            grid_step_bps: args.grid_step_bps,
+            level_count,
+        };
+        minimum_grid
+            .validate()
+            .map_err(|_| error!(BeatExError::InvalidMarketParameters))?;
+        maximum_grid
+            .validate()
+            .map_err(|_| error!(BeatExError::InvalidMarketParameters))?;
+        let upper_price = maximum_grid
+            .price_at(level_count - 1)
+            .map_err(|_| error!(BeatExError::InvalidMarketParameters))?;
         // A two-sided contingent order can withdraw its unused reserve and
         // proceeds in the same asset. Bound that worst case to Token-2022's
         // 48-bit confidential-transfer amount.
+        let maximum_transfer = u128::from(allocation::MAX_CONFIDENTIAL_TRANSFER_AMOUNT);
+        let maximum_quantity = u128::from(args.max_order_quantity);
         require!(
-            u128::from(upper_price)
-                .checked_mul(u128::from(args.max_order_quantity))
+            maximum_quantity
+                .checked_mul(u128::from(args.base_unit_size))
                 .and_then(|value| value.checked_mul(2))
-                .is_some_and(|value| {
-                    value <= u128::from(allocation::MAX_CONFIDENTIAL_TRANSFER_AMOUNT)
-                }),
+                .is_some_and(|value| value <= maximum_transfer)
+                && u128::from(upper_price)
+                    .checked_mul(maximum_quantity)
+                    .and_then(|value| value.checked_mul(2))
+                    .is_some_and(|value| value <= maximum_transfer),
             BeatExError::InvalidMarketParameters
         );
 
@@ -116,9 +126,9 @@ pub mod beatex {
         market.quote_mint = ctx.accounts.quote_mint.key();
         market.base_vault = ctx.accounts.base_vault.key();
         market.quote_vault = ctx.accounts.quote_vault.key();
-        market.base_lot_size = args.base_lot_size;
-        market.quote_lot_size = args.quote_lot_size;
-        market.tick_size = args.tick_size;
+        market.base_unit_size = args.base_unit_size;
+        market.quote_unit_size = args.quote_unit_size;
+        market.grid_step_bps = args.grid_step_bps;
         market.grid_radius = args.grid_radius;
         market.max_order_quantity = args.max_order_quantity;
         market.max_aggregate_quantity = args.max_aggregate_quantity;
@@ -306,7 +316,6 @@ pub mod beatex {
                     price.price,
                     price.exponent,
                     market.oracle_exponent_adjustment,
-                    market.tick_size,
                 )?,
                 true,
                 price.publish_time,
@@ -327,7 +336,7 @@ pub mod beatex {
         auction.reference_price = reference_price;
         auction.reference_from_oracle = reference_from_oracle;
         auction.oracle_publish_time = oracle_publish_time;
-        auction.tick_size = market.tick_size;
+        auction.grid_step_bps = market.grid_step_bps;
         auction.grid_size = market.grid_radius * 2 + 1;
         auction.allocation_rule_version = market.allocation_rule_version;
         auction.order_circuit_version = market.order_circuit_version;
@@ -420,7 +429,7 @@ pub mod beatex {
         require!(
             ctx.accounts.deposit_verification_key.circuit_kind == QueueCircuitKind::BalanceDeposit
                 && ctx.accounts.deposit_verification_key.circuit_version
-                    == queue::QUEUE_CIRCUIT_VERSION,
+                    == queue::BALANCE_DEPOSIT_CIRCUIT_VERSION,
             BeatExError::InvalidCircuitVersion
         );
 
@@ -502,7 +511,7 @@ pub mod beatex {
         require!(
             ctx.accounts.deposit_verification_key.circuit_kind == QueueCircuitKind::BalanceDeposit
                 && ctx.accounts.deposit_verification_key.circuit_version
-                    == queue::QUEUE_CIRCUIT_VERSION,
+                    == queue::BALANCE_DEPOSIT_CIRCUIT_VERSION,
             BeatExError::InvalidCircuitVersion
         );
         let balance = &ctx.accounts.private_balance;
@@ -608,7 +617,7 @@ pub mod beatex {
             order_commitment: args.order_commitment,
             committee_key: queue_accounts.key_epoch.babyjub_encryption_pubkey,
             reference_price: auction.reference_price,
-            tick_size: auction.tick_size,
+            grid_step_bps: auction.grid_step_bps,
             ciphertexts: &args.ciphertexts,
             old_base: &queue_accounts.private_balance.encrypted_base,
             old_quote: &queue_accounts.private_balance.encrypted_quote,
@@ -735,7 +744,7 @@ pub mod beatex {
             order_commitment: args.replacement.order_commitment,
             committee_key: ctx.accounts.identity.key_epoch.babyjub_encryption_pubkey,
             reference_price: auction.reference_price,
-            tick_size: auction.tick_size,
+            grid_step_bps: auction.grid_step_bps,
             ciphertexts: &args.replacement.ciphertexts,
             old_base: &args.release.released_encrypted_base,
             old_quote: &args.release.released_encrypted_quote,
@@ -1085,7 +1094,7 @@ pub mod beatex {
             order_commitment: args.next_order.order_commitment,
             committee_key: ctx.accounts.key_epoch.babyjub_encryption_pubkey,
             reference_price: auction.reference_price,
-            tick_size: auction.tick_size,
+            grid_step_bps: auction.grid_step_bps,
             ciphertexts: &args.next_order.ciphertexts,
             old_base: &args.credited_encrypted_base,
             old_quote: &args.credited_encrypted_quote,
@@ -1437,7 +1446,7 @@ pub mod beatex {
         );
         let grid = auction::PriceGrid {
             reference_price: auction.reference_price,
-            tick_size: auction.tick_size,
+            grid_step_bps: auction.grid_step_bps,
             level_count: auction.grid_size as u16,
         };
         auction::validate_aggregate_curves(&grid, &args.demand, &args.supply)
@@ -1478,13 +1487,19 @@ pub mod beatex {
         let grid_size = auction.active_grid_size();
         let grid = auction::PriceGrid {
             reference_price: auction.reference_price,
-            tick_size: auction.tick_size,
+            grid_step_bps: auction.grid_step_bps,
             level_count: auction.grid_size as u16,
         };
-        let result = auction::clear_auction(
+        let tie_break_price = if ctx.accounts.market.last_clearing_price == 0 {
+            auction.reference_price
+        } else {
+            ctx.accounts.market.last_clearing_price
+        };
+        let result = auction::clear_auction_with_tiebreak(
             &grid,
             &auction.decrypted_demand[..grid_size],
             &auction.decrypted_supply[..grid_size],
+            tie_break_price,
         )
         .map_err(|_| error!(BeatExError::InvalidCurves))?;
         auction.clearing_index = result.index as u8;
@@ -2028,9 +2043,9 @@ pub struct PublishAggregateCurvesArgs {
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
 pub struct InitializeMarketArgs {
     pub market_nonce: u64,
-    pub base_lot_size: u64,
-    pub quote_lot_size: u64,
-    pub tick_size: u64,
+    pub base_unit_size: u64,
+    pub quote_unit_size: u64,
+    pub grid_step_bps: u16,
     pub grid_radius: u8,
     pub max_order_quantity: u64,
     pub max_aggregate_quantity: u64,
@@ -3743,13 +3758,8 @@ fn current_auction_id(market: &Market, slot: u64) -> Result<u64> {
         .ok_or_else(|| error!(BeatExError::InvalidMarketParameters))
 }
 
-fn normalize_oracle_price(
-    price: i64,
-    exponent: i32,
-    exponent_adjustment: i8,
-    tick_size: u64,
-) -> Result<u64> {
-    require!(price > 0 && tick_size > 0, BeatExError::InvalidOraclePrice);
+fn normalize_oracle_price(price: i64, exponent: i32, exponent_adjustment: i8) -> Result<u64> {
+    require!(price > 0, BeatExError::InvalidOraclePrice);
     let adjusted_exponent = exponent
         .checked_add(i32::from(exponent_adjustment))
         .ok_or_else(|| error!(BeatExError::InvalidOraclePrice))?;
@@ -3767,14 +3777,7 @@ fn normalize_oracle_price(
             .ok_or_else(|| error!(BeatExError::ArithmeticOverflow))?
             / scale
     };
-    let tick = u128::from(tick_size);
-    let rounded = whole
-        .checked_add(tick / 2)
-        .ok_or_else(|| error!(BeatExError::ArithmeticOverflow))?
-        .checked_div(tick)
-        .and_then(|ticks| ticks.checked_mul(tick))
-        .ok_or_else(|| error!(BeatExError::ArithmeticOverflow))?;
-    u64::try_from(rounded).map_err(|_| error!(BeatExError::InvalidOraclePrice))
+    u64::try_from(whole).map_err(|_| error!(BeatExError::InvalidOraclePrice))
 }
 
 fn validate_reference_price(market: &Market, reference_price: u64) -> Result<()> {
@@ -3782,16 +3785,13 @@ fn validate_reference_price(market: &Market, reference_price: u64) -> Result<()>
         (market.min_reference_price..=market.max_reference_price).contains(&reference_price),
         BeatExError::InvalidOraclePrice
     );
-    let span = market
-        .tick_size
-        .checked_mul(u64::from(market.grid_radius))
-        .ok_or_else(|| error!(BeatExError::ArithmeticOverflow))?;
-    reference_price
-        .checked_sub(span)
-        .ok_or_else(|| error!(BeatExError::InvalidOraclePrice))?;
-    reference_price
-        .checked_add(span)
-        .ok_or_else(|| error!(BeatExError::ArithmeticOverflow))?;
+    auction::PriceGrid {
+        reference_price,
+        grid_step_bps: market.grid_step_bps,
+        level_count: u16::from(market.grid_radius) * 2 + 1,
+    }
+    .validate()
+    .map_err(|_| error!(BeatExError::InvalidOraclePrice))?;
     Ok(())
 }
 
@@ -3922,24 +3922,24 @@ mod temporal_lifecycle_tests {
     use super::normalize_oracle_price;
 
     #[test]
-    fn oracle_price_scales_and_rounds_to_the_nearest_tick() {
+    fn oracle_price_scales_and_rounds_to_the_nearest_quote_unit() {
         assert_eq!(
-            normalize_oracle_price(12_345_678_901_234, -8, 0, 10).unwrap(),
-            123_460
+            normalize_oracle_price(12_345_678_901_234, -8, 0).unwrap(),
+            123_457
         );
-        assert_eq!(normalize_oracle_price(123, 2, 0, 100).unwrap(), 12_300);
-        // $100,000 BTC/USD, converted from 8-decimal BTC and 6-decimal USD
-        // smallest units: 10^13 * 10^(-8 - 2) = 1,000 quote units/base unit.
+        assert_eq!(normalize_oracle_price(123, 2, 0).unwrap(), 12_300);
+        // With 100-satoshi base units and one-micro-tUSD quote units, the
+        // integer price is numerically the USD/tBTC price.
         assert_eq!(
-            normalize_oracle_price(10_000_000_000_000, -8, -2, 1).unwrap(),
-            1_000
+            normalize_oracle_price(10_000_000_000_000, -8, 0).unwrap(),
+            100_000
         );
     }
 
     #[test]
     fn oracle_price_rejects_non_positive_and_unrepresentable_values() {
-        assert!(normalize_oracle_price(0, -8, 0, 10).is_err());
-        assert!(normalize_oracle_price(-1, -8, 0, 10).is_err());
-        assert!(normalize_oracle_price(i64::MAX, 38, 0, 1).is_err());
+        assert!(normalize_oracle_price(0, -8, 0).is_err());
+        assert!(normalize_oracle_price(-1, -8, 0).is_err());
+        assert!(normalize_oracle_price(i64::MAX, 38, 0).is_err());
     }
 }

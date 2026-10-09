@@ -11,7 +11,7 @@ use super::{
     ristretto_bridge::{enforce_batched_pedersen_relation, RistrettoBridgeWitness},
     transcript_hash_gadget, transcript_hash_native,
     transition::{field_bytes, g1_bytes, g2_bytes},
-    Fq, LEVELS, QUANTITY_BITS,
+    Fq, BASE_UNIT_SIZE, LEVELS, QUANTITY_BITS,
 };
 use ark_bn254::Bn254;
 use ark_ff::PrimeField;
@@ -29,10 +29,10 @@ use rand::{CryptoRng, RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use std::ops::Neg;
 
-pub(super) const ORDER_COMMITMENT_DOMAIN: &[u8] = b"BeatEx private contingent order v1";
-const CLAIM_DOMAIN: &[u8] = b"BeatEx private claim v1";
-const REFUND_DOMAIN: &[u8] = b"BeatEx cancellation refund v1";
-pub(super) const NULLIFIER_DOMAIN: &[u8] = b"BeatEx withdrawal nullifier v1";
+pub(super) const ORDER_COMMITMENT_DOMAIN: &[u8] = b"BeatEx private contingent order v2";
+const CLAIM_DOMAIN: &[u8] = b"BeatEx private claim v2";
+const REFUND_DOMAIN: &[u8] = b"BeatEx cancellation refund v2";
+pub(super) const NULLIFIER_DOMAIN: &[u8] = b"BeatEx withdrawal nullifier v2";
 pub(super) const OPAQUE_WITHDRAWAL_FIELDS: usize = 86;
 const AMOUNT_BITS: usize = 48;
 
@@ -77,8 +77,9 @@ impl PrivateWithdrawalWitness {
         buy[LEVELS / 2] = 3;
         let sell = [0u64; LEVELS];
         let (base_payout, quote_payout) = match kind {
-            // D=5, S=3: floor(3*3/5)=1 base and ceil(3*3*100/5)=180 quote.
-            PrivateWithdrawalKind::Claim => (1, 120),
+            // D=5, S=3: floor(3*3/5)=1 base unit (100 satoshis), while
+            // ceil(3*3*100/5)=180 quote is spent from the 300 reserve.
+            PrivateWithdrawalKind::Claim => (BASE_UNIT_SIZE, 120),
             PrivateWithdrawalKind::Refund => (0, 300),
         };
         Self {
@@ -90,9 +91,9 @@ impl PrivateWithdrawalWitness {
             key_epoch: [Fq::from(51u64), Fq::from(52u64)],
             client_order_nonce: 7,
             sequence: 3,
-            allocation_rule_version: 1,
-            order_circuit_version: 1,
-            claim_circuit_version: 1,
+            allocation_rule_version: 2,
+            order_circuit_version: 2,
+            claim_circuit_version: 2,
             buy,
             sell,
             base_reserve: 0,
@@ -139,7 +140,7 @@ impl PrivateWithdrawalWitness {
                 PrivateWithdrawalKind::Claim => CLAIM_DOMAIN,
                 PrivateWithdrawalKind::Refund => REFUND_DOMAIN,
             }),
-            Fq::from(1u64),
+            Fq::from(2u64),
         ];
         payload.extend_from_slice(&self.market);
         payload.extend_from_slice(&self.auction);
@@ -398,9 +399,9 @@ impl ConstraintSynthesizer<Fq> for PrivateWithdrawalCircuit {
             witness.map(|value| u128::from(value.claim_circuit_version)),
             16,
         )?;
-        allocation_version.enforce_equal(&FpVar::constant(Fq::from(1u64)))?;
-        order_version.enforce_equal(&FpVar::constant(Fq::from(1u64)))?;
-        claim_version.enforce_equal(&FpVar::constant(Fq::from(1u64)))?;
+        allocation_version.enforce_equal(&FpVar::constant(Fq::from(2u64)))?;
+        order_version.enforce_equal(&FpVar::constant(Fq::from(2u64)))?;
+        claim_version.enforce_equal(&FpVar::constant(Fq::from(2u64)))?;
 
         let mut buy = Vec::with_capacity(LEVELS);
         let mut sell = Vec::with_capacity(LEVELS);
@@ -565,7 +566,7 @@ impl ConstraintSynthesizer<Fq> for PrivateWithdrawalCircuit {
                 PrivateWithdrawalKind::Claim => CLAIM_DOMAIN,
                 PrivateWithdrawalKind::Refund => REFUND_DOMAIN,
             })),
-            FpVar::constant(Fq::from(1u64)),
+            FpVar::constant(Fq::from(2u64)),
         ];
         statement.extend(market);
         statement.extend(auction);
@@ -670,18 +671,27 @@ pub(super) fn enforce_claim_allocation(
     let (_, rem_b) = alloc_uint(cs.clone(), Some(u128::from(outputs[6])), 64)?;
     let (_, slack_b) = alloc_uint(cs, Some(u128::from(outputs[7])), 64)?;
 
+    let base_unit_size = Fq::from(BASE_UNIT_SIZE);
     let buy_num = buy * supply;
-    gated_eq(&dg, &buy_num, &(&base_credit * demand + &rem_a))?;
+    gated_eq(
+        &dg,
+        &(&buy_num * base_unit_size),
+        &(&base_credit * demand + &rem_a * base_unit_size),
+    )?;
     gated_eq(&dg, demand, &(&rem_a + &slack_a + Fq::from(1u64)))?;
     gated_eq(&dg, &(&quote_debit * demand), &(&buy_num * price + &rem_b))?;
     gated_eq(&dg, demand, &(&rem_b + &slack_b + Fq::from(1u64)))?;
-    gated_eq(&dg, &base_debit, sell)?;
+    gated_eq(&dg, &base_debit, &(sell * base_unit_size))?;
     gated_eq(&dg, &quote_credit, &(sell * price))?;
 
     let sell_num = sell * demand;
-    gated_eq(&sg, &(&base_debit * supply), &(&sell_num + &rem_a))?;
+    gated_eq(
+        &sg,
+        &(&base_debit * supply),
+        &(&sell_num * base_unit_size + &rem_a * base_unit_size),
+    )?;
     gated_eq(&sg, supply, &(&rem_a + &slack_a + Fq::from(1u64)))?;
-    gated_eq(&sg, &base_credit, buy)?;
+    gated_eq(&sg, &base_credit, &(buy * base_unit_size))?;
     gated_eq(&sg, &quote_debit, &(buy * price))?;
     gated_eq(
         &sg,
@@ -690,8 +700,8 @@ pub(super) fn enforce_claim_allocation(
     )?;
     gated_eq(&sg, supply, &(&rem_b + &slack_b + Fq::from(1u64)))?;
 
-    gated_eq(&eq, &base_debit, sell)?;
-    gated_eq(&eq, &base_credit, buy)?;
+    gated_eq(&eq, &base_debit, &(sell * base_unit_size))?;
+    gated_eq(&eq, &base_credit, &(buy * base_unit_size))?;
     gated_eq(&eq, &quote_debit, &(buy * price))?;
     gated_eq(&eq, &quote_credit, &(sell * price))?;
     (base_reserve + &base_credit).enforce_equal(&(base_payout + &base_debit))?;
@@ -747,8 +757,8 @@ fn allocation_terms(witness: &PrivateWithdrawalWitness) -> Result<[u64; 8], Synt
         let quote_debit = quote_n.div_ceil(demand);
         let pad_b = quote_debit * demand - quote_n;
         [
-            sell,
-            base_credit,
+            sell * u128::from(BASE_UNIT_SIZE),
+            base_credit * u128::from(BASE_UNIT_SIZE),
             quote_debit,
             sell * price,
             rem_a,
@@ -764,8 +774,8 @@ fn allocation_terms(witness: &PrivateWithdrawalWitness) -> Result<[u64; 8], Synt
         let quote_credit = quote_n / supply;
         let rem_b = quote_n % supply;
         [
-            base_debit,
-            buy,
+            base_debit * u128::from(BASE_UNIT_SIZE),
+            buy * u128::from(BASE_UNIT_SIZE),
             buy * price,
             quote_credit,
             pad_a,
@@ -774,7 +784,16 @@ fn allocation_terms(witness: &PrivateWithdrawalWitness) -> Result<[u64; 8], Synt
             supply - rem_b - 1,
         ]
     } else {
-        [sell, buy, buy * price, sell * price, 0, 0, 0, 0]
+        [
+            sell * u128::from(BASE_UNIT_SIZE),
+            buy * u128::from(BASE_UNIT_SIZE),
+            buy * price,
+            sell * price,
+            0,
+            0,
+            0,
+            0,
+        ]
     };
     let mut narrowed = [0u64; 8];
     for (destination, value) in narrowed.iter_mut().zip(values) {

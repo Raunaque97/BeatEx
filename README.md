@@ -69,14 +69,44 @@ claim and deposit path.
 
 ### How is an auction's reference price selected?
 
-The first-version policy uses the previous clearing price when the previous
+The version-2 policy uses the previous clearing price when the previous
 clearing volume meets a configured minimum; otherwise it uses a fresh Pyth
 BTC/USD price. The first auction has previous volume zero and therefore uses
-Pyth. An immutable exponent adjustment converts the feed into quote lots per
-base lot (for 8-decimal tBTC / 6-decimal tUSD it is `-2`), then the price is
-rounded to the nearest tick before the 17-level grid is constructed. A stale update, wrong feed,
-excessive confidence interval, or arithmetic overflow makes initialization fail
-closed. The auction records the chosen reference price and its source.
+Pyth. For the 8-decimal tBTC / 6-decimal tUSD market, one base quantity unit is
+100 satoshis and one quote accounting unit is one micro-tUSD. The oracle
+exponent adjustment is therefore `0`, and an integer protocol price of `85_500`
+means approximately 85,500 tUSD per tBTC. A stale update, wrong feed, excessive
+confidence interval, or arithmetic overflow makes initialization fail closed.
+The auction records the chosen reference price and its source.
+
+### How are the 17 price levels defined?
+
+The market fixes `grid_radius = 8` and an immutable percentage step, defaulting
+to `grid_step_bps = 10`. Each auction derives 17 **linear** offsets from one
+reference price: `-80, -70, ... 0, ... +70, +80` basis points. These are not
+recursively compounded percentages.
+
+For index `i` from 0 through 16:
+
+```text
+offset = i - 8
+price[i] = floor(
+  (reference_price * (10_000 + offset * grid_step_bps) + 5_000) / 10_000
+)
+```
+
+The formula uses checked integer arithmetic and rounds to the nearest quote
+unit, with exact halves upward. Initialization rejects overflow and any rounded
+grid with duplicate or non-increasing levels. The Auction account snapshots the
+reference price, basis-point step, and level count; every client derives the
+same exact 17 prices from those immutable fields. That account—not a local
+oracle fetch or command-line argument—is authoritative for the SDK, market
+makers, proofs, and clearing.
+
+Order `buy[i]` and `sell[i]` values are counts of 100-satoshi base units. The
+minimum order increment is therefore 100 satoshis; the version-2 proof permits
+28-bit quantities, while each market may configure a lower maximum. Applications
+accept normal token amounts and perform these integer conversions for users.
 
 Pyth already runs its receiver on Solana Devnet, and its sponsored shard-zero
 BTC/USD feed is available there. BeatEx therefore does not need to deploy a test
@@ -169,8 +199,9 @@ The completed Phase 0 checkpoint currently provides:
 - current-SDK Token-2022 proof-context generation using Solana ZK SDK v7;
   v4 proofs are rejected because the current native proof program applies the
   newer global transcript domain separator;
-- native two-handle grouped-ciphertext validity and strict four-bit range-proof
-  benchmarks in Rust and browser WebAssembly;
+- rejected native two-handle grouped-ciphertext-validity and range-proof
+  benchmarks in Rust and browser WebAssembly (the selected Groth16 path uses
+  the 28-bit order bound);
 - a clean default-stack SBF build with a measured monolithic grid cap of 17
   price levels (19 is the first failing account layout);
 - full production-SBF execution of a 17-level order submission at 514,651 CU,
@@ -228,6 +259,53 @@ WASM runtime and lazily loads only the balance, order, release, and settlement
 proving keys needed by the current action. Folding and aggregate publication
 remain infrastructure provers and are not shipped to traders.
 
+### Native client and Phantom signing
+
+The Rust `beatex` client runs proof generation natively and uses Phantom only
+for wallet ownership and transaction approval. Build the native client and the
+underlying Devnet executor together:
+
+```sh
+cargo build -p beatex-cli -p beatex-devnet-client
+```
+
+Connect once to save the public wallet profile:
+
+```sh
+target/debug/beatex wallet connect
+target/debug/beatex wallet status
+```
+
+The client opens a page served only on a random `127.0.0.1` port. Phantom signs
+a short-lived, origin-bound login challenge; the client verifies the Ed25519
+signature and saves only the wallet name, public key, and advertised Solana
+transaction versions. The session bearer token stays in the URL fragment and
+is never persisted. The local page has no remote scripts.
+
+Open the terminal interface with `target/debug/beatex tui`. The current screen
+shows wallet status and the intended trading actions; interactive forms are
+still being connected. Every existing native Devnet operation is already
+available through the browser-wallet wrapper. Put the ordinary
+`beatex-devnet-client` arguments after `--` and omit `--wallet`; for example:
+
+```sh
+target/debug/beatex devnet -- order \
+  --base-mint BASE_MINT \
+  --quote-mint QUOTE_MINT \
+  --base-source BASE_TOKEN_ACCOUNT \
+  --quote-source QUOTE_TOKEN_ACCOUNT \
+  --state-dir .devnet/state \
+  < order.json
+```
+
+For each execution, the client opens a fresh local signing session and checks
+that Phantom selected the saved public key. The browser page refuses order and
+rollover signing unless the installed wallet advertises transaction version 1.
+The Rust prover prepares the proof-heavy instruction data, the existing sender
+compiles the 4,096-byte-capable v1 transaction, and Phantom signs those exact
+bytes. Returned transactions are rejected if the wallet changed the compiled
+message. The ephemeral session descriptor is deleted when the command exits.
+
 Create or reuse the test assets, deploy the program, initialize the custody
 vaults, 3-of-7 key epoch and all eight versioned verification-key PDAs, and fund
 the two persistent market-maker identities with one command:
@@ -236,18 +314,32 @@ the two persistent market-maker identities with one command:
 scripts/devnet/devnetSetup.sh --wallet /absolute/path/to/devnet-wallet.json
 ```
 
+Before deployment, the setup script derives the configured BeatEx program ID
+and checks it on the selected cluster. A first deployment proceeds normally;
+an existing deployment is displayed and must be approved before it is
+upgraded. Declining keeps the existing program. In a non-interactive shell,
+the safe default is also to keep it; pass `--redeploy` only after explicitly
+authorizing the upgrade. The lower-level `deploy-beatex.sh` enforces the same
+guard when it is run directly.
+
+The setup then rebuilds `target/idl/beatex.json` and publishes it
+as the program's canonical IDL metadata. Existing metadata is fetched first:
+identical JSON is skipped, while a changed IDL requires confirmation. Use
+`--skip-idl` to omit this step or `--allow-idl-update` for an already-approved,
+non-interactive metadata update.
+
 The market-maker process supports either the configured onchain Pyth Devnet
-BTC/USD account or Binance BTC/USDT, applies the same lot-price normalization as
-the program, and generates non-crossed 17-level V-shaped curves. The runner
-starts one process for each source:
+BTC/USD account or Binance BTC/USDT and generates non-crossed 17-level V-shaped
+curves. The runner starts one process for each source:
 
 ```sh
-scripts/devnet/run-market-makers.sh \
-  --reference-price 855 \
-  --tick-size 5
+scripts/devnet/run-market-makers.sh
 ```
 
-The default executor reads the live slot-derived auction, initializes and funds
+Each process reads the live slot-derived Auction account and derives its
+17-price grid from the stored reference and basis-point parameters. There are
+no manual reference-price or absolute-tick arguments.
+The default executor initializes and funds
 the maker's encrypted balance, generates deposit/order/replacement proofs,
 persists the private opening, and sends a version-1 transaction. Use
 `--print-only` to inspect intents without sending them, or `--executor` to
@@ -274,6 +366,41 @@ ledger, and `withdraw` proves a ledger debit and transfers public Token-2022
 funds. The optional `claim` and `refund` commands retain the slower confidential
 Token-2022 bridge. The adapter also assembles the six-instruction atomic
 rollover transaction used by recurring market makers.
+
+### Build and deployment pipeline
+
+The Anchor program is the source of truth for the program ID, protocol units,
+grid parameters, circuit versions, and IDL. Run the pipeline from the repository
+root after changing `programs/beatex`:
+
+```sh
+# SBF + Anchor IDL + generated SDK/Rust protocol artifacts
+pnpm build:contract
+
+# Above plus workspace checks and SDK/prover package builds
+pnpm build:protocol
+
+# Full build, including trader WASM assets and the web application
+pnpm build:all
+```
+
+`scripts/build-pipeline.sh` runs
+`scripts/generate-protocol-artifacts.mjs` automatically. That generator updates
+the frontend SDK constants at
+`packages/sdk/src/protocol/generated.ts`, the Rust prover constants at
+`crates/babyjubjub-groth16-spike/src/generated_protocol.rs`, and the deployment
+manifest at `.devnet/<cluster>/deployment.json`. The web app imports its default
+program ID from the SDK, so it does not carry a second manually-maintained
+address.
+
+`scripts/devnet/deploy-beatex.sh` invokes the contract pipeline before every
+non-skipped build. `scripts/devnet/devnetSetup.sh` invokes the generator again
+after token, market, committee, and verification-key initialization, so the
+new market and vault addresses are captured in the same manifest. Consumers
+such as the CLI and market-maker runner read the state manifests; no frontend,
+prover, CLI, TUI, or bot source file needs to be edited after a redeployment.
+The scripts still require explicit approval before upgrading an existing
+program; this pipeline does not send a deployment transaction by itself.
 
 The default fast lifecycle was executed live in auction 1007. Deposit, order,
 fold, aggregate publication, internal settlement, and public withdrawal all
@@ -381,14 +508,14 @@ not meet the single-order-transaction UX requirement. See
 [`crates/zk-elgamal-bench/RESULTS.md`](./crates/zk-elgamal-bench/RESULTS.md).
 
 The current independent queued-order circuit implements the real 17-level
-order relation plus encrypted balance deductions in 234,166 constraints and
-proves in a 2.196-second native median. Its approximately 3,032-byte complete
+order relation plus encrypted balance deductions in 241,198 constraints and
+proves in a 2.198-second native median. Its approximately 3,032-byte complete
 transaction estimate fits Solana's 4,096-byte v1 limit. Direct
 onchain aggregation is nevertheless rejected: 68 additions exceed the 1.4M CU
 cap even before proof verification, and compressed-point recovery is much more
 expensive. The implemented architecture stores independent accepted orders and
 lets a permissionless bot fold up to four orders into the aggregate with one
-310,870-constraint Groth16 transition proof. Accepted/folded counter equality
+518,962-constraint Groth16 transition proof. Accepted/folded counter equality
 gates decryption after collection, and an incomplete queue can be cancelled at
 the aggregation deadline. See
 [`crates/babyjubjub-groth16-spike/RESULTS.md`](./crates/babyjubjub-groth16-spike/RESULTS.md)

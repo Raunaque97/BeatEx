@@ -16,7 +16,12 @@ cluster='devnet'
 wallet=''
 state_dir=''
 skip_deploy=0
+redeploy=0
+skip_idl=0
+allow_idl_update=0
 program_keypair='.devnet/program/beatex-keypair.json'
+idl_file='target/idl/beatex.json'
+custom_idl=0
 
 usage() {
   cat <<'EOF'
@@ -28,12 +33,17 @@ Options:
   --wallet <KEYPAIR>              Fee payer and test-token mint authority
   --state-dir <DIRECTORY>         Persistent setup state (default: .devnet/<cluster>)
   --program-keypair <KEYPAIR>     Stable BeatEx program keypair
-  --skip-deploy                    Keep the currently deployed program
+  --skip-deploy                   Keep the currently deployed program
+  --redeploy                      Explicitly authorize upgrading an existing program
+  --idl <FILE>                    IDL to publish (default: target/idl/beatex.json)
+  --skip-idl                      Do not generate or publish program metadata
+  --allow-idl-update              Explicitly authorize replacing existing IDL metadata
   -h, --help                       Show this help
 
-The script refuses mainnet. It creates tBTC/tUSD, deploys BeatEx unless asked
-not to, creates two market-maker keypairs, funds them with SOL and test tokens,
-and writes machine-readable address manifests for the bot processes.
+The script refuses mainnet. It checks every configured program before deploying
+and asks before upgrading an existing deployment. It creates tBTC/tUSD, creates
+two market-maker keypairs, funds them with SOL and test tokens, initializes the
+market, and publishes the IDL through Solana Program Metadata.
 EOF
 }
 
@@ -57,6 +67,23 @@ while (( $# > 0 )); do
       ;;
     --skip-deploy)
       skip_deploy=1
+      shift
+      ;;
+    --redeploy)
+      redeploy=1
+      shift
+      ;;
+    --idl)
+      idl_file="${2:?--idl requires a value}"
+      custom_idl=1
+      shift 2
+      ;;
+    --skip-idl)
+      skip_idl=1
+      shift
+      ;;
+    --allow-idl-update)
+      allow_idl_update=1
       shift
       ;;
     -h|--help)
@@ -84,22 +111,101 @@ if [[ -z "$wallet" || ! -f "$wallet" ]]; then
   printf 'A valid --wallet keypair is required.\n' >&2
   exit 2
 fi
+if (( skip_deploy && redeploy )); then
+  printf '%s\n' '--skip-deploy and --redeploy cannot be used together.' >&2
+  exit 2
+fi
 wallet="$(cd "$(dirname "$wallet")" && pwd)/$(basename "$wallet")"
 if [[ -z "$state_dir" ]]; then
   state_dir=".devnet/$cluster"
 fi
+if [[ "$state_dir" != /* ]]; then
+  state_dir="$project_root/$state_dir"
+fi
+if [[ "$program_keypair" != /* ]]; then
+  program_keypair="$project_root/$program_keypair"
+fi
 
 "$script_dir/check-toolchain.sh"
+
+if [[ ! -f "$program_keypair" ]]; then
+  printf 'Program keypair does not exist: %s\n' "$program_keypair" >&2
+  exit 2
+fi
+program_id="$(solana-keygen pubkey "$program_keypair")"
+program_is_deployed=0
+program_status=''
+if program_status="$(solana program show "$program_id" --url "$rpc_url" 2>&1)"; then
+  program_is_deployed=1
+  printf '\nFound existing BeatEx deployment on %s:\n' "$cluster"
+  printf '%s\n' "$program_status"
+elif [[ ! "$program_status" =~ [Aa]ccount.*does[[:space:]]not[[:space:]]exist ]]; then
+  printf 'Could not determine whether BeatEx program %s is deployed on %s:\n%s\n' \
+    "$program_id" "$cluster" "$program_status" >&2
+  exit 1
+fi
+
+if (( program_is_deployed && ! skip_deploy && ! redeploy )); then
+  if [[ -t 0 ]]; then
+    read -r -p 'Redeploy and upgrade BeatEx? [y/N] ' confirmation
+    case "$confirmation" in
+      y|Y|yes|YES|Yes) redeploy=1 ;;
+      *) skip_deploy=1 ;;
+    esac
+  else
+    printf '%s\n' 'Existing deployment left unchanged in non-interactive mode. Pass --redeploy to authorize an upgrade.'
+    skip_deploy=1
+  fi
+elif (( ! program_is_deployed && skip_deploy )); then
+  printf '%s\n' '--skip-deploy was requested, but the configured BeatEx program is not deployed.' >&2
+  exit 1
+fi
+
 "$script_dir/setup-test-tokens.sh" \
   --cluster "$cluster" \
   --wallet "$wallet" \
   --state-dir "$state_dir"
 
 if (( ! skip_deploy )); then
-  "$script_dir/deploy-beatex.sh" \
-    --cluster "$cluster" \
-    --wallet "$wallet" \
+  deployment_args=(
+    --cluster "$cluster"
+    --wallet "$wallet"
     --program-keypair "$program_keypair"
+    --state-dir "$state_dir"
+  )
+  if (( redeploy )); then
+    deployment_args+=(--allow-redeploy)
+  fi
+  "$script_dir/deploy-beatex.sh" "${deployment_args[@]}"
+else
+  printf 'Keeping deployed BeatEx program %s unchanged.\n' "$program_id"
+fi
+
+if (( ! skip_idl )); then
+  if [[ "$idl_file" != /* ]]; then
+    idl_file="$project_root/$idl_file"
+  fi
+  if (( ! custom_idl )); then
+    printf '\nGenerating the current Anchor IDL.\n'
+    (
+      cd "$project_root"
+      anchor idl build
+    )
+  fi
+  if [[ ! -f "$idl_file" ]]; then
+    printf 'IDL file does not exist: %s\n' "$idl_file" >&2
+    exit 1
+  fi
+  idl_args=(
+    --program-id "$program_id"
+    --idl "$idl_file"
+    --wallet "$wallet"
+    --rpc-url "$rpc_url"
+  )
+  if (( allow_idl_update )); then
+    idl_args+=(--allow-update)
+  fi
+  "$script_dir/publish-idl.sh" "${idl_args[@]}"
 fi
 
 config_file="$state_dir/solana-cli.yml"
@@ -199,6 +305,15 @@ done
   --cluster "$cluster" \
   --wallet "$wallet" \
   --state-dir "$state_dir"
+
+artifact_args=(
+  --cluster "$cluster"
+  --state-dir "$state_dir"
+)
+if [[ -f "$idl_file" ]]; then
+  artifact_args+=(--idl "$idl_file")
+fi
+node "$project_root/scripts/generate-protocol-artifacts.mjs" "${artifact_args[@]}"
 
 printf '\nDevnet setup complete.\nAssets: %s\nMarket makers: %s\n' \
   "$addresses_file" "$market_makers_file"

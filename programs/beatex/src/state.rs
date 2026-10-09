@@ -1,9 +1,17 @@
 use anchor_lang::prelude::*;
 
-pub const PROTOCOL_VERSION: u8 = 1;
+pub const PROTOCOL_VERSION: u8 = 2;
 pub const PROOF_TRANSCRIPT_VERSION: u8 = 2;
-/// Prototype SBF limit selected from stack-frame builds. Larger grids will use
-/// sharded curve accounts instead of enlarging this monolithic account.
+/// One private-order quantity unit is one hundred base-token atoms. For the
+/// eight-decimal tBTC market this is one hundred satoshis.
+pub const BASE_UNIT_SIZE: u64 = 100;
+/// One quote unit is one quote-token atom. For six-decimal tUSD this is one
+/// micro-tUSD.
+pub const QUOTE_UNIT_SIZE: u64 = 1;
+pub const DEFAULT_GRID_STEP_BPS: u16 = 10;
+/// Prototype SBF limit selected from stack-frame builds. Larger grids require
+/// a future account-layout and circuit revision instead of enlarging this
+/// monolithic account in protocol v2.
 pub const MAX_GRID_RADIUS: u8 = 8;
 pub const MAX_GRID_SIZE: usize = MAX_GRID_RADIUS as usize * 2 + 1;
 pub const MAX_ORDER_CHUNKS: usize = 8;
@@ -32,15 +40,16 @@ pub struct Market {
     pub quote_mint: Pubkey,
     pub base_vault: Pubkey,
     pub quote_vault: Pubkey,
-    pub base_lot_size: u64,
-    pub quote_lot_size: u64,
-    pub tick_size: u64,
+    pub base_unit_size: u64,
+    pub quote_unit_size: u64,
+    pub grid_step_bps: u16,
     pub grid_radius: u8,
     pub max_order_quantity: u64,
     pub max_aggregate_quantity: u64,
     pub current_key_epoch: Pubkey,
     /// Slot at which deterministic auction zero begins collecting orders.
     pub market_start_slot: u64,
+    /// Quote-token atoms paid per protocol base unit.
     pub last_clearing_price: u64,
     pub last_clearing_volume: u64,
     /// Highest cleared auction id plus one; zero means no auction has cleared.
@@ -52,7 +61,8 @@ pub struct Market {
     pub oracle_feed_id: [u8; 32],
     pub oracle_max_age_seconds: u64,
     pub oracle_max_confidence_bps: u16,
-    /// Added to the Pyth exponent to convert the feed into quote lots per base lot.
+    /// Added to the Pyth exponent to convert the feed into quote units per
+    /// protocol base unit.
     pub oracle_exponent_adjustment: i8,
     /// Reference-price bounds protect grid arithmetic and circuit amount bounds.
     pub min_reference_price: u64,
@@ -81,12 +91,13 @@ pub struct Auction {
     pub submission_end_slot: u64,
     pub aggregation_deadline_slot: u64,
     pub decryption_deadline_slot: u64,
+    /// Quote-token atoms paid per protocol base unit.
     pub reference_price: u64,
     /// True when `reference_price` came from the configured Pyth feed.
     pub reference_from_oracle: bool,
     /// Pyth publish time used for an oracle reference; zero for prior clearing.
     pub oracle_publish_time: i64,
-    pub tick_size: u64,
+    pub grid_step_bps: u16,
     pub grid_size: u8,
     /// Immutable protocol versions captured when the auction opens.
     pub allocation_rule_version: u16,

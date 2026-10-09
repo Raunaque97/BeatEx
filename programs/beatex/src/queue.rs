@@ -17,21 +17,22 @@ pub const QUEUED_CIPHERTEXT_COUNT: usize = QUEUE_PRICE_LEVELS * 2;
 pub const ELGAMAL_CIPHERTEXT_BYTES: usize = 64;
 /// Digest size used to bind ciphertext account data to Groth16 public inputs.
 pub const QUEUE_DIGEST_BYTES: usize = 32;
-pub const QUEUE_CIRCUIT_VERSION: u16 = 1;
+pub const ORDER_SUBMISSION_CIRCUIT_VERSION: u16 = 2;
+pub const BALANCE_DEPOSIT_CIRCUIT_VERSION: u16 = 1;
 pub const AGGREGATE_FOLD_CIRCUIT_VERSION: u16 = 2;
-pub const ORDER_MODIFICATION_CIRCUIT_VERSION: u16 = 1;
-pub const ROLLOVER_SETTLEMENT_CIRCUIT_VERSION: u16 = 1;
-/// Order circuit v1 range-constrains each per-level quantity to four bits.
-pub const MAX_PRIVATE_ORDER_QUANTITY: u64 = 15;
+pub const ORDER_MODIFICATION_CIRCUIT_VERSION: u16 = 2;
+pub const ROLLOVER_SETTLEMENT_CIRCUIT_VERSION: u16 = 2;
+pub const PRIVATE_ORDER_QUANTITY_BITS: u32 = 28;
+pub const MAX_PRIVATE_ORDER_QUANTITY: u64 = (1_u64 << PRIVATE_ORDER_QUANTITY_BITS) - 1;
 /// Version 2 replaces per-entry threshold interpolation with one
 /// transcript-randomized batch equation while preserving full curve output.
 pub const AGGREGATE_PUBLICATION_CIRCUIT_VERSION: u16 = 2;
 /// First private-claim circuit version. Its arithmetic and transcript are
 /// intentionally versioned independently from order submission.
-pub const PRIVATE_CLAIM_CIRCUIT_VERSION: u16 = 1;
+pub const PRIVATE_CLAIM_CIRCUIT_VERSION: u16 = 2;
 /// First cancellation-refund circuit version. A distinct proof kind prevents
 /// a refund proof from being replayed through the settled-auction claim path.
-pub const CANCELLATION_REFUND_CIRCUIT_VERSION: u16 = 1;
+pub const CANCELLATION_REFUND_CIRCUIT_VERSION: u16 = 2;
 
 pub type EncryptedValue = [u8; ELGAMAL_CIPHERTEXT_BYTES];
 pub type EncryptedOrder = [EncryptedValue; QUEUED_CIPHERTEXT_COUNT];
@@ -98,9 +99,8 @@ pub const fn circuit_version(kind: QueueCircuitKind) -> u16 {
         QueueCircuitKind::AggregateFold => AGGREGATE_FOLD_CIRCUIT_VERSION,
         QueueCircuitKind::OrderModification => ORDER_MODIFICATION_CIRCUIT_VERSION,
         QueueCircuitKind::RolloverSettlement => ROLLOVER_SETTLEMENT_CIRCUIT_VERSION,
-        QueueCircuitKind::OrderSubmission | QueueCircuitKind::BalanceDeposit => {
-            QUEUE_CIRCUIT_VERSION
-        }
+        QueueCircuitKind::OrderSubmission => ORDER_SUBMISSION_CIRCUIT_VERSION,
+        QueueCircuitKind::BalanceDeposit => BALANCE_DEPOSIT_CIRCUIT_VERSION,
     }
 }
 
@@ -525,7 +525,7 @@ mod tests {
             ciphertexts: vec![1; QUEUED_CIPHERTEXT_COUNT * ELGAMAL_CIPHERTEXT_BYTES],
             ciphertext_digest: digest,
             order_commitment: [2; QUEUE_DIGEST_BYTES],
-            order_circuit_version: QUEUE_CIRCUIT_VERSION,
+            order_circuit_version: ORDER_SUBMISSION_CIRCUIT_VERSION,
             bump: 3,
         };
         let mut data = Vec::new();

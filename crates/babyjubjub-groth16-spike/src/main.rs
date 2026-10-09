@@ -29,15 +29,23 @@ use rand_chacha::ChaCha20Rng;
 pub mod claim;
 pub mod decryption;
 pub mod deposit;
+mod generated_protocol;
 pub mod release;
 pub mod ristretto_bridge;
 pub mod rollover;
 pub mod transition;
 
+pub use generated_protocol::{
+    AGGREGATE_FOLD_CIRCUIT_VERSION, AGGREGATE_PUBLICATION_CIRCUIT_VERSION,
+    BALANCE_DEPOSIT_CIRCUIT_VERSION, BASE_UNIT_SIZE, BPS_DENOMINATOR,
+    CANCELLATION_REFUND_CIRCUIT_VERSION, DEFAULT_GRID_STEP_BPS, GRID_RADIUS, LEVELS,
+    MAX_ORDER_QUANTITY, ORDER_MODIFICATION_CIRCUIT_VERSION, ORDER_SUBMISSION_CIRCUIT_VERSION,
+    PRIVATE_CLAIM_CIRCUIT_VERSION, PROTOCOL_VERSION, QUANTITY_BITS, QUOTE_UNIT_SIZE,
+    ROLLOVER_SETTLEMENT_CIRCUIT_VERSION,
+};
+
 pub type SolanaProofBytes = ([u8; 64], [u8; 128], [u8; 64], [u8; 32]);
 
-pub const LEVELS: usize = 17;
-const QUANTITY_BITS: usize = 4;
 const PRICE_BITS: usize = 64;
 const QUOTE_COLLATERAL_BITS: usize = PRICE_BITS + QUANTITY_BITS;
 const RANDOMNESS_BITS: usize = JubjubScalar::MODULUS_BIT_SIZE as usize;
@@ -112,7 +120,7 @@ struct OrderWitness {
     buy: [u64; LEVELS],
     sell: [u64; LEVELS],
     reference_price: u64,
-    tick_size: u64,
+    grid_step_bps: u16,
     base_reserve: u128,
     quote_reserve: u128,
     committee_key: EdwardsProjective,
@@ -134,9 +142,10 @@ impl OrderWitness {
         }
 
         let reference_price = 100_000u64;
-        let tick_size = 500u64;
-        let prices = price_grid(reference_price, tick_size).expect("valid deterministic grid");
-        let base_reserve = sell.iter().copied().max().unwrap_or_default() as u128;
+        let grid_step_bps = DEFAULT_GRID_STEP_BPS;
+        let prices = price_grid(reference_price, grid_step_bps).expect("valid deterministic grid");
+        let base_reserve =
+            u128::from(sell.iter().copied().max().unwrap_or_default()) * u128::from(BASE_UNIT_SIZE);
         let quote_reserve = buy
             .iter()
             .zip(prices)
@@ -156,7 +165,7 @@ impl OrderWitness {
             buy,
             sell,
             reference_price,
-            tick_size,
+            grid_step_bps,
             base_reserve,
             quote_reserve,
             committee_key,
@@ -187,7 +196,7 @@ impl OrderWitness {
         let ciphertexts = self.ciphertexts();
         let mut payload = Vec::with_capacity(11 + ciphertexts.len() * 4);
         payload.push(domain_separator());
-        payload.push(Fq::from(1u64));
+        payload.push(Fq::from(2u64));
         payload.extend_from_slice(&self.auction_context);
         payload.extend_from_slice(&self.owner_context);
         payload.push(Fq::from(self.client_order_nonce));
@@ -195,7 +204,7 @@ impl OrderWitness {
         payload.push(committee_key.x);
         payload.push(committee_key.y);
         payload.push(Fq::from(self.reference_price));
-        payload.push(Fq::from(self.tick_size));
+        payload.push(Fq::from(self.grid_step_bps));
         for ciphertext in ciphertexts {
             payload.push(ciphertext.ephemeral.x);
             payload.push(ciphertext.ephemeral.y);
@@ -259,39 +268,29 @@ impl ConstraintSynthesizer<Fq> for OrderCircuit {
         let buy_values = witness.map(|witness| witness.buy);
         let sell_values = witness.map(|witness| witness.sell);
         let reference_value = witness.map(|witness| u128::from(witness.reference_price));
-        let tick_value = witness.map(|witness| u128::from(witness.tick_size));
+        let grid_step_value = witness.map(|witness| u128::from(witness.grid_step_bps));
         let base_reserve_value = witness.map(|witness| witness.base_reserve);
         let quote_reserve_value = witness.map(|witness| witness.quote_reserve);
 
         let (_, reference) = alloc_uint(cs.clone(), reference_value, PRICE_BITS)?;
-        let (_, tick) = alloc_uint(cs.clone(), tick_value, PRICE_BITS)?;
-        let lower_price_value = witness.and_then(|witness| {
-            u128::from(witness.reference_price)
-                .checked_sub((LEVELS / 2) as u128 * u128::from(witness.tick_size))
-        });
-        let upper_price_value = witness.and_then(|witness| {
-            u128::from(witness.reference_price)
-                .checked_add((LEVELS / 2) as u128 * u128::from(witness.tick_size))
-        });
-        let (_, lower_price) = alloc_uint(cs.clone(), lower_price_value, PRICE_BITS)?;
-        let (_, upper_price) = alloc_uint(cs.clone(), upper_price_value, PRICE_BITS)?;
-        lower_price.enforce_equal(&(&reference - &tick * Fq::from((LEVELS / 2) as u64)))?;
-        upper_price.enforce_equal(&(&reference + &tick * Fq::from((LEVELS / 2) as u64)))?;
+        let (_, grid_step) = alloc_uint(cs.clone(), grid_step_value, 14)?;
+        enforce_valid_grid_step(cs.clone(), grid_step_value, &grid_step)?;
 
-        let (base_reserve_bits, base_reserve) =
-            alloc_uint(cs.clone(), base_reserve_value, QUANTITY_BITS)?;
+        let (base_reserve_bits, base_reserve) = alloc_uint(cs.clone(), base_reserve_value, 64)?;
         let (quote_reserve_bits, quote_reserve) =
             alloc_uint(cs.clone(), quote_reserve_value, QUOTE_COLLATERAL_BITS)?;
 
         let prices_native = witness
-            .map(|witness| price_grid(witness.reference_price, witness.tick_size))
+            .map(|witness| price_grid(witness.reference_price, witness.grid_step_bps))
             .transpose()
             .map_err(|_| SynthesisError::Unsatisfiable)?;
         let base_max_index = witness.map(|witness| {
             witness
                 .sell
                 .iter()
-                .position(|value| u128::from(*value) == witness.base_reserve)
+                .position(|value| {
+                    u128::from(*value) * u128::from(BASE_UNIT_SIZE) == witness.base_reserve
+                })
                 .unwrap_or(0)
         });
         let quote_max_index = witness
@@ -319,12 +318,15 @@ impl ConstraintSynthesizer<Fq> for OrderCircuit {
             let (sell_bits, sell) = alloc_uint(cs.clone(), sell_value, QUANTITY_BITS)?;
             (&buy * &sell).enforce_equal(&FpVar::zero())?;
 
-            let signed_offset = index as isize - (LEVELS / 2) as isize;
-            let price = if signed_offset < 0 {
-                &reference - &tick * Fq::from((-signed_offset) as u64)
-            } else {
-                &reference + &tick * Fq::from(signed_offset as u64)
-            };
+            let price = rounded_bps_price_gadget(
+                cs.clone(),
+                &reference,
+                &grid_step,
+                index,
+                reference_value,
+                grid_step_value,
+                prices_native.as_ref().map(|prices| prices[index]),
+            )?;
             let liability = &price * &buy;
             let liability_value = witness
                 .zip(prices_native.as_ref())
@@ -333,7 +335,7 @@ impl ConstraintSynthesizer<Fq> for OrderCircuit {
             let base_slack_value = witness.map(|witness| {
                 witness
                     .base_reserve
-                    .checked_sub(u128::from(witness.sell[index]))
+                    .checked_sub(u128::from(witness.sell[index]) * u128::from(BASE_UNIT_SIZE))
                     .unwrap_or(u128::MAX)
             });
             let quote_slack_value = witness.zip(liability_value).map(|(witness, liability)| {
@@ -345,7 +347,8 @@ impl ConstraintSynthesizer<Fq> for OrderCircuit {
             let (_, base_slack) = alloc_uint(cs.clone(), base_slack_value, QUANTITY_BITS)?;
             let (_, quote_slack) =
                 alloc_uint(cs.clone(), quote_slack_value, QUOTE_COLLATERAL_BITS)?;
-            (&sell + &base_slack).enforce_equal(&base_reserve)?;
+            let sell_atomic = &sell * Fq::from(BASE_UNIT_SIZE);
+            (&sell_atomic + &base_slack).enforce_equal(&base_reserve)?;
             (&liability + &quote_slack).enforce_equal(&quote_reserve)?;
 
             let base_selector = Boolean::new_witness(cs.clone(), || {
@@ -356,7 +359,7 @@ impl ConstraintSynthesizer<Fq> for OrderCircuit {
             })?;
             let base_selector_fp: FpVar<Fq> = base_selector.clone().into();
             let quote_selector_fp: FpVar<Fq> = quote_selector.clone().into();
-            (&base_selector_fp * (&base_reserve - &sell)).enforce_equal(&FpVar::zero())?;
+            (&base_selector_fp * (&base_reserve - &sell_atomic)).enforce_equal(&FpVar::zero())?;
             (&quote_selector_fp * (&quote_reserve - &liability)).enforce_equal(&FpVar::zero())?;
 
             buy_bits_all.push(buy_bits);
@@ -442,14 +445,14 @@ impl ConstraintSynthesizer<Fq> for OrderCircuit {
         })?;
         let mut payload = Vec::with_capacity(11 + ciphertexts.len() * 4);
         payload.push(FpVar::constant(domain_separator()));
-        payload.push(FpVar::constant(Fq::from(1u64)));
+        payload.push(FpVar::constant(Fq::from(2u64)));
         payload.extend(auction_context);
         payload.extend(owner_context);
         payload.push(client_order_nonce);
         payload.push(committee_key.x.clone());
         payload.push(committee_key.y.clone());
         payload.push(reference);
-        payload.push(tick);
+        payload.push(grid_step);
         for (ephemeral, body) in ciphertexts {
             payload.push(ephemeral.x);
             payload.push(ephemeral.y);
@@ -542,19 +545,34 @@ fn encrypt(message: u128, randomness: JubjubScalar, key: EdwardsProjective) -> C
     }
 }
 
-fn price_grid(reference: u64, tick: u64) -> Result<[u128; LEVELS], &'static str> {
-    let center = LEVELS / 2;
+pub fn price_grid(reference: u64, grid_step_bps: u16) -> Result<[u128; LEVELS], &'static str> {
+    if grid_step_bps == 0 {
+        return Err("grid step must be positive");
+    }
+    if u128::from(grid_step_bps) * GRID_RADIUS as u128 >= u128::from(BPS_DENOMINATOR) {
+        return Err("grid step makes the lowest price non-positive");
+    }
     let mut prices = [0u128; LEVELS];
     for (index, price) in prices.iter_mut().enumerate() {
-        *price = if index < center {
-            u128::from(reference)
-                .checked_sub((center - index) as u128 * u128::from(tick))
-                .ok_or("price-grid underflow")?
+        let offset = index as isize - GRID_RADIUS as isize;
+        let distance_bps = offset.unsigned_abs() as u128 * u128::from(grid_step_bps);
+        let factor = if offset < 0 {
+            u128::from(BPS_DENOMINATOR)
+                .checked_sub(distance_bps)
+                .ok_or("price-grid factor underflow")?
         } else {
-            u128::from(reference)
-                .checked_add((index - center) as u128 * u128::from(tick))
-                .ok_or("price-grid overflow")?
+            u128::from(BPS_DENOMINATOR)
+                .checked_add(distance_bps)
+                .ok_or("price-grid factor overflow")?
         };
+        let numerator = u128::from(reference)
+            .checked_mul(factor)
+            .and_then(|value| value.checked_add(u128::from(BPS_DENOMINATOR / 2)))
+            .ok_or("price-grid numerator overflow")?;
+        *price = numerator / u128::from(BPS_DENOMINATOR);
+        if *price == 0 {
+            return Err("price rounds to zero");
+        }
         if *price >= (1u128 << PRICE_BITS) {
             return Err("price exceeds configured bit width");
         }
@@ -562,8 +580,68 @@ fn price_grid(reference: u64, tick: u64) -> Result<[u128; LEVELS], &'static str>
     Ok(prices)
 }
 
+fn enforce_valid_grid_step(
+    cs: ConstraintSystemRef<Fq>,
+    grid_step_value: Option<u128>,
+    grid_step: &FpVar<Fq>,
+) -> Result<(), SynthesisError> {
+    let lower_factor_value = grid_step_value.and_then(|step| {
+        u128::from(BPS_DENOMINATOR).checked_sub(step.checked_mul(GRID_RADIUS as u128)?)
+    });
+    let lower_minus_one_value = lower_factor_value.and_then(|value| value.checked_sub(1));
+    let (_, lower_factor) = alloc_uint(cs.clone(), lower_factor_value, 14)?;
+    let (_, lower_minus_one) = alloc_uint(cs, lower_minus_one_value, 14)?;
+    (&lower_factor + grid_step * Fq::from(GRID_RADIUS as u64))
+        .enforce_equal(&FpVar::constant(Fq::from(BPS_DENOMINATOR)))?;
+    lower_factor.enforce_equal(&(lower_minus_one + Fq::from(1u64)))
+}
+
+fn rounded_bps_price_gadget(
+    cs: ConstraintSystemRef<Fq>,
+    reference: &FpVar<Fq>,
+    grid_step: &FpVar<Fq>,
+    index: usize,
+    reference_value: Option<u128>,
+    grid_step_value: Option<u128>,
+    price_value: Option<u128>,
+) -> Result<FpVar<Fq>, SynthesisError> {
+    let offset = index as isize - GRID_RADIUS as isize;
+    let distance = offset.unsigned_abs() as u64;
+    let factor = if offset < 0 {
+        FpVar::constant(Fq::from(BPS_DENOMINATOR)) - grid_step * Fq::from(distance)
+    } else {
+        FpVar::constant(Fq::from(BPS_DENOMINATOR)) + grid_step * Fq::from(distance)
+    };
+    let numerator = reference * factor + Fq::from(BPS_DENOMINATOR / 2);
+    let remainder_value =
+        reference_value
+            .zip(grid_step_value)
+            .zip(price_value)
+            .map(|((reference, step), price)| {
+                let factor = if offset < 0 {
+                    u128::from(BPS_DENOMINATOR) - u128::from(distance) * step
+                } else {
+                    u128::from(BPS_DENOMINATOR) + u128::from(distance) * step
+                };
+                (reference * factor + u128::from(BPS_DENOMINATOR / 2))
+                    - price * u128::from(BPS_DENOMINATOR)
+            });
+    let (_, price) = alloc_uint(cs.clone(), price_value, PRICE_BITS)?;
+    let (_, remainder) = alloc_uint(cs.clone(), remainder_value, 14)?;
+    let remainder_slack_value = remainder_value.map(|value| {
+        u128::from(BPS_DENOMINATOR - 1)
+            .checked_sub(value)
+            .expect("rounded remainder is below the denominator")
+    });
+    let (_, remainder_slack) = alloc_uint(cs, remainder_slack_value, 14)?;
+    numerator.enforce_equal(&(&price * Fq::from(BPS_DENOMINATOR) + &remainder))?;
+    (&remainder + &remainder_slack)
+        .enforce_equal(&FpVar::constant(Fq::from(BPS_DENOMINATOR - 1)))?;
+    Ok(price)
+}
+
 fn domain_separator() -> Fq {
-    Fq::from_le_bytes_mod_order(b"BeatEx order ciphertext transcript v1")
+    Fq::from_le_bytes_mod_order(b"BeatEx order ciphertext transcript v2")
 }
 
 fn poseidon_parameters() -> PoseidonParameters<Fq> {
@@ -790,6 +868,22 @@ mod tests {
     }
 
     #[test]
+    fn basis_point_grid_uses_half_up_rounding() {
+        let prices = price_grid(10_005, DEFAULT_GRID_STEP_BPS).unwrap();
+        assert_eq!(prices[GRID_RADIUS - 1], 9_995);
+        assert_eq!(prices[GRID_RADIUS], 10_005);
+        assert_eq!(prices[GRID_RADIUS + 1], 10_015);
+    }
+
+    #[test]
+    fn basis_point_grid_rejects_a_non_positive_lower_factor() {
+        assert_eq!(
+            price_grid(100_000, 1_250),
+            Err("grid step makes the lowest price non-positive")
+        );
+    }
+
+    #[test]
     fn rejects_two_sides_at_one_level() {
         let mut witness = OrderWitness::deterministic();
         witness.sell[0] = 1;
@@ -800,6 +894,13 @@ mod tests {
     fn rejects_insufficient_quote_collateral() {
         let mut witness = OrderWitness::deterministic();
         witness.quote_reserve -= 1;
+        assert!(!satisfied(witness));
+    }
+
+    #[test]
+    fn rejects_insufficient_atomic_base_collateral() {
+        let mut witness = OrderWitness::deterministic();
+        witness.base_reserve -= 1;
         assert!(!satisfied(witness));
     }
 

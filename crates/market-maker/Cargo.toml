@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 anchor-lang = "=1.1.2"
 base64 = "0.22.1"
+beatex-program = { path = "../../programs/beatex", features = ["no-entrypoint"] }
 pyth-solana-receiver-sdk = "=2.0.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"

@@ -49,7 +49,7 @@ export interface PrivateBalanceOpening {
   readonly quoteRandomness: Bytes32;
 }
 
-/** Quantities are always base-token lots, on both sides of the order. */
+/** Quantities are counts of base units, on both sides of the order. */
 export interface OrderCurve {
   readonly buy: readonly bigint[];
   readonly sell: readonly bigint[];

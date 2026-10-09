@@ -27,8 +27,8 @@ const TWO: [u8; 32] = {
 // ark-ed-on-bn254. Keeping these reduced constants explicit means the SBF
 // program never needs bigint arithmetic.
 const ORDER_SUBMISSION_DOMAIN: [u8; 32] = [
-    61, 100, 97, 196, 113, 24, 193, 59, 91, 161, 101, 75, 128, 78, 131, 117, 106, 78, 147, 23, 97,
-    98, 139, 131, 224, 40, 219, 209, 79, 115, 220, 31,
+    56, 100, 97, 20, 142, 76, 87, 232, 132, 110, 198, 234, 21, 197, 127, 172, 152, 148, 12, 144,
+    208, 5, 250, 233, 15, 8, 227, 107, 17, 235, 230, 45,
 ];
 const ORDER_CIPHERTEXT_DOMAIN: [u8; 32] = [
     154, 95, 96, 244, 127, 123, 119, 133, 235, 107, 255, 115, 186, 204, 140, 36, 69, 110, 121, 68,
@@ -40,19 +40,19 @@ const BALANCE_DEPOSIT_DOMAIN: [u8; 32] = [
     66, 101, 97, 116, 69, 120, 32, 98, 97, 108, 97, 110, 99, 101, 32, 100, 101, 112, 111, 115, 105,
     116, 32, 118, 49, 0, 0, 0, 0, 0, 0, 0,
 ];
-const COLLATERAL_RELEASE_DOMAIN: [u8; 32] = *b"BeatEx collateral release v1\0\0\0\0";
-const ROLLOVER_SETTLEMENT_DOMAIN: [u8; 32] = *b"BeatEx rollover credit v1\0\0\0\0\0\0\0";
+const COLLATERAL_RELEASE_DOMAIN: [u8; 32] = *b"BeatEx collateral release v2\0\0\0\0";
+const ROLLOVER_SETTLEMENT_DOMAIN: [u8; 32] = *b"BeatEx rollover credit v2\0\0\0\0\0\0\0";
 const AGGREGATE_PUBLICATION_DOMAIN: [u8; 32] = [
     127, 140, 212, 251, 15, 85, 102, 242, 234, 78, 218, 28, 27, 68, 89, 72, 136, 155, 32, 56, 121,
     130, 126, 98, 114, 162, 223, 31, 24, 175, 167, 8,
 ];
 const PRIVATE_CLAIM_DOMAIN: [u8; 32] = [
     66, 101, 97, 116, 69, 120, 32, 112, 114, 105, 118, 97, 116, 101, 32, 99, 108, 97, 105, 109, 32,
-    118, 49, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    118, 50, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 ];
 const CANCELLATION_REFUND_DOMAIN: [u8; 32] = [
     66, 101, 97, 116, 69, 120, 32, 99, 97, 110, 99, 101, 108, 108, 97, 116, 105, 111, 110, 32, 114,
-    101, 102, 117, 110, 100, 32, 118, 49, 0, 0, 0,
+    101, 102, 117, 110, 100, 32, 118, 50, 0, 0, 0,
 ];
 const RISTRETTO_BRIDGE_DOMAIN: [u8; 32] = [
     154, 216, 184, 238, 238, 231, 196, 56, 82, 47, 154, 41, 150, 46, 110, 25, 49, 227, 251, 180,
@@ -71,7 +71,7 @@ pub struct OrderStatement<'a> {
     pub order_commitment: [u8; 32],
     pub committee_key: [u8; 32],
     pub reference_price: u64,
-    pub tick_size: u64,
+    pub grid_step_bps: u16,
     pub ciphertexts: &'a [u8],
     pub old_base: &'a EncryptedValue,
     pub old_quote: &'a EncryptedValue,
@@ -209,7 +209,7 @@ pub struct PrivateWithdrawalStatement<'a> {
 pub fn order_statement_digest(statement: &OrderStatement<'_>) -> Result<[u8; 32]> {
     let mut payload = Vec::with_capacity(150);
     payload.push(ORDER_SUBMISSION_DOMAIN);
-    payload.push(ONE);
+    payload.push(TWO);
     payload.extend(pubkey_fields(statement.auction));
     payload.extend(pubkey_fields(statement.owner));
     payload.push(u64_field(statement.client_order_nonce));
@@ -217,7 +217,7 @@ pub fn order_statement_digest(statement: &OrderStatement<'_>) -> Result<[u8; 32]
     payload.push(statement.order_commitment);
     append_point(&mut payload, &statement.committee_key)?;
     payload.push(u64_field(statement.reference_price));
-    payload.push(u64_field(statement.tick_size));
+    payload.push(u64_field(u64::from(statement.grid_step_bps)));
     append_order(&mut payload, statement.ciphertexts)?;
     for ciphertext in [
         statement.old_base,
@@ -352,7 +352,7 @@ pub fn collateral_release_statement_digest(
     validate_field(&statement.order_commitment)?;
     let mut payload = Vec::with_capacity(40);
     payload.push(COLLATERAL_RELEASE_DOMAIN);
-    payload.push(ONE);
+    payload.push(TWO);
     for key in [
         statement.market,
         statement.auction,
@@ -387,7 +387,7 @@ pub fn rollover_settlement_statement_digest(
     );
     let mut payload = Vec::with_capacity(64);
     payload.push(ROLLOVER_SETTLEMENT_DOMAIN);
-    payload.push(ONE);
+    payload.push(TWO);
     for key in [
         statement.market,
         statement.auction,
@@ -490,7 +490,7 @@ pub fn private_withdrawal_statement_digest(
         WithdrawalKind::Claim => PRIVATE_CLAIM_DOMAIN,
         WithdrawalKind::Refund => CANCELLATION_REFUND_DOMAIN,
     })?;
-    transcript.push(ONE)?;
+    transcript.push(TWO)?;
     for key in [
         statement.market,
         statement.auction,
@@ -1269,7 +1269,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "generates a deterministic 234k-constraint Groth16 setup"]
+    #[ignore = "generates a deterministic 241k-constraint Groth16 setup"]
     fn order_statement_matches_and_verifies_exact_circuit_fixture() {
         let fixture =
             beatex_babyjubjub_groth16_spike::transition::deterministic_solana_fixture().unwrap();
@@ -1283,7 +1283,7 @@ mod tests {
             order_commitment: fixture.order_commitment,
             committee_key: fixture.committee_key,
             reference_price: fixture.reference_price,
-            tick_size: fixture.tick_size,
+            grid_step_bps: fixture.grid_step_bps,
             ciphertexts: &ciphertexts,
             old_base: &fixture.old_base,
             old_quote: &fixture.old_quote,
@@ -1317,7 +1317,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "generates a deterministic 311k-constraint Groth16 setup"]
+    #[ignore = "generates a deterministic 519k-constraint Groth16 setup"]
     fn fold_statement_matches_and_verifies_exact_circuit_fixture() {
         let fixture =
             beatex_babyjubjub_groth16_spike::transition::deterministic_fold_solana_fixture()

@@ -29,6 +29,8 @@ check_command() {
 }
 
 printf 'BeatEx Devnet toolchain\n\n'
+check_command cargo 'Rust/Cargo toolchain'
+check_command rustc 'Rust compiler'
 check_command anchor 'Anchor CLI 1.1.2'
 check_command solana 'Solana/Agave CLI 3.1.10'
 check_command solana-keygen 'bundled with Solana/Agave CLI 3.1.10'

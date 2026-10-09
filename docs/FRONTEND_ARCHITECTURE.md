@@ -80,6 +80,14 @@ Proof progress is UI state; witnesses and private order openings are not.
 - A submitted transaction invalidates only the affected market, auction,
   balance, and order keys after confirmation.
 - Auction timing is derived from on-chain slots. Browser time is display-only.
+- Price selectors render the exact 17 entries derived from the current
+  Auction's snapshotted reference price, basis-point step, and level count. The
+  browser must not derive a live grid from Pyth, Binance, a cached reference
+  price, or a configurable absolute tick.
+- The tBTC/tUSD amount boundary converts human token values to 100-satoshi base
+  units and one-micro-tUSD quote units. It rejects fractional base units before
+  proving. The displayed basis-point offsets are explanatory; stored integer
+  prices remain authoritative.
 - Every transaction screen shows `building`, `proving`, `awaiting-signature`,
   `submitted`, `confirmed`, and `failed` separately.
 - Proof work remains cancellable at the UI boundary, with the WASM worker's

@@ -32,9 +32,9 @@ use {
     wasm_bindgen::prelude::*,
 };
 
-const API_VERSION: u32 = 1;
-const CIRCUIT_VERSION: u16 = 1;
-const BACKEND: &str = "beatex-arkworks-groth16-wasm-v1";
+const API_VERSION: u32 = 2;
+const CIRCUIT_VERSION: u16 = 2;
+const BACKEND: &str = "beatex-arkworks-groth16-wasm-v2";
 
 type Bytes32 = [u8; 32];
 
@@ -132,7 +132,7 @@ struct OrderRequest {
     owner: Bytes32,
     client_order_nonce: u64,
     reference_price: u64,
-    tick_size: u64,
+    grid_step_bps: u16,
     committee_key: Bytes32,
     curve: OrderCurve,
     old_balance: BalanceOpening,
@@ -145,7 +145,7 @@ struct NextOrderRequest {
     owner: Bytes32,
     client_order_nonce: u64,
     reference_price: u64,
-    tick_size: u64,
+    grid_step_bps: u16,
     committee_key: Bytes32,
     curve: OrderCurve,
 }
@@ -312,7 +312,7 @@ struct RolloverOutput {
 /// One in-memory runtime for every proof needed by a trader frontend.
 ///
 /// Key bytes must be SHA-256-authenticated Arkworks canonical-uncompressed
-/// `ProvingKey<Bn254>` artifacts for circuit version 1. Each artifact is
+/// `ProvingKey<Bn254>` artifacts for circuit version 2. Each artifact is
 /// decoded exactly once. The official TypeScript loader performs the required
 /// digest and byte-length checks before calling this lower-level API.
 #[wasm_bindgen]
@@ -554,7 +554,7 @@ fn order_request(request: OrderRequest) -> Result<CoreOrderRequest, JsValue> {
         owner: request.owner,
         client_order_nonce: request.client_order_nonce,
         reference_price: request.reference_price,
-        tick_size: request.tick_size,
+        grid_step_bps: request.grid_step_bps,
         committee_key: request.committee_key,
         buy,
         sell,
@@ -572,7 +572,7 @@ fn next_order_request(
         owner: request.owner,
         client_order_nonce: request.client_order_nonce,
         reference_price: request.reference_price,
-        tick_size: request.tick_size,
+        grid_step_bps: request.grid_step_bps,
         committee_key: request.committee_key,
         buy,
         sell,
@@ -796,7 +796,7 @@ mod tests {
     fn output_metadata_is_versioned() {
         let value = metadata(12.5);
         assert_eq!(value.backend, BACKEND);
-        assert_eq!(value.circuit_version, 1);
+        assert_eq!(value.circuit_version, 2);
         assert_eq!(value.proving_time_ms, 12.5);
     }
 }

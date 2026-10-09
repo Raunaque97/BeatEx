@@ -176,15 +176,15 @@ fn fixture_market(
         .encryption_pubkey
         .to_bytes();
     let market_state = Market {
-        version: 1,
+        version: beatex::state::PROTOCOL_VERSION,
         authority,
         base_mint,
         quote_mint,
         base_vault,
         quote_vault,
-        base_lot_size: 1,
-        quote_lot_size: 1,
-        tick_size: 1,
+        base_unit_size: 100,
+        quote_unit_size: 1,
+        grid_step_bps: 1,
         grid_radius: 1,
         max_order_quantity: beatex::queue::MAX_PRIVATE_ORDER_QUANTITY,
         max_aggregate_quantity: 10_000,
@@ -204,9 +204,9 @@ fn fixture_market(
         submission_duration_slots: 10,
         aggregation_duration_slots: 10,
         decryption_duration_slots: 10,
-        allocation_rule_version: 1,
-        order_circuit_version: 1,
-        claim_circuit_version: 1,
+        allocation_rule_version: 2,
+        order_circuit_version: 2,
+        claim_circuit_version: 2,
         paused: false,
         vault_authority_bump,
         bump: 0,
@@ -453,7 +453,7 @@ fn vault_pda_transfers_with_preverified_context_accounts() {
     put_system_account(&mut svm, vault_authority);
 
     let auction_state = Auction {
-        version: 1,
+        version: beatex::state::PROTOCOL_VERSION,
         market,
         auction_id: 1,
         key_epoch,
@@ -465,11 +465,11 @@ fn vault_pda_transfers_with_preverified_context_accounts() {
         reference_price: 1,
         reference_from_oracle: false,
         oracle_publish_time: 0,
-        tick_size: 1,
+        grid_step_bps: 1,
         grid_size: 3,
-        allocation_rule_version: 1,
-        order_circuit_version: 1,
-        claim_circuit_version: 1,
+        allocation_rule_version: 2,
+        order_circuit_version: 2,
+        claim_circuit_version: 2,
         finalized_order_count: 1,
         aggregate_buy: [[0; 64]; beatex::state::MAX_GRID_SIZE],
         aggregate_sell: [[0; 64]; beatex::state::MAX_GRID_SIZE],
@@ -484,7 +484,7 @@ fn vault_pda_transfers_with_preverified_context_accounts() {
         bump: 0,
     };
     let order_state = Order {
-        version: 1,
+        version: beatex::state::PROTOCOL_VERSION,
         market,
         auction,
         owner: authority.pubkey(),
@@ -497,7 +497,7 @@ fn vault_pda_transfers_with_preverified_context_accounts() {
         encrypted_sell: [[0; 64]; beatex::state::MAX_GRID_SIZE],
         base_collateral_commitment: [0; 32],
         quote_collateral_commitment: [0; 32],
-        order_circuit_version: 1,
+        order_circuit_version: 2,
         claim_nullifier_commitment: [0; 32],
         aggregated: true,
         bump: 0,
@@ -622,7 +622,7 @@ fn public_deposit_is_proved_and_kept_in_the_public_custody_balance() {
     );
     key_epoch_state.babyjub_encryption_pubkey = fixture.committee_key;
     let balance_state = EncryptedPrivateBalance {
-        version: 1,
+        version: beatex::state::PROTOCOL_VERSION,
         market,
         owner: owner.pubkey(),
         key_epoch,
@@ -635,7 +635,7 @@ fn public_deposit_is_proved_and_kept_in_the_public_custody_balance() {
         bump: 0,
     };
     let vk_state = QueueVerificationKey {
-        version: 1,
+        version: beatex::state::PROTOCOL_VERSION,
         market,
         circuit_kind: QueueCircuitKind::BalanceDeposit,
         circuit_version: 1,
@@ -822,7 +822,7 @@ fn public_withdrawal_debits_encrypted_balance_and_public_vaults_atomically() {
         .unwrap();
     let key = prover.verification_key().unwrap();
     let balance_state = EncryptedPrivateBalance {
-        version: 1,
+        version: beatex::state::PROTOCOL_VERSION,
         market,
         owner: owner.pubkey(),
         key_epoch,
@@ -835,7 +835,7 @@ fn public_withdrawal_debits_encrypted_balance_and_public_vaults_atomically() {
         bump: 0,
     };
     let vk_state = QueueVerificationKey {
-        version: 1,
+        version: beatex::state::PROTOCOL_VERSION,
         market,
         circuit_kind: QueueCircuitKind::BalanceDeposit,
         circuit_version: 1,
@@ -969,7 +969,7 @@ fn production_private_claim_reaches_groth16_verification_before_any_token_cpi() 
         quote_vault,
     );
     let mut auction_state = Auction {
-        version: 1,
+        version: beatex::state::PROTOCOL_VERSION,
         market,
         auction_id: 1,
         key_epoch,
@@ -981,11 +981,11 @@ fn production_private_claim_reaches_groth16_verification_before_any_token_cpi() 
         reference_price: 1,
         reference_from_oracle: false,
         oracle_publish_time: 0,
-        tick_size: 1,
+        grid_step_bps: 1,
         grid_size: 3,
-        allocation_rule_version: 1,
-        order_circuit_version: 1,
-        claim_circuit_version: 1,
+        allocation_rule_version: 2,
+        order_circuit_version: 2,
+        claim_circuit_version: 2,
         finalized_order_count: 1,
         aggregate_buy: [[0; 64]; beatex::state::MAX_GRID_SIZE],
         aggregate_sell: [[0; 64]; beatex::state::MAX_GRID_SIZE],
@@ -1003,7 +1003,7 @@ fn production_private_claim_reaches_groth16_verification_before_any_token_cpi() 
     let mut order_commitment = [0u8; 32];
     order_commitment[0] = 1;
     let order_state = QueuedOrder {
-        version: 1,
+        version: beatex::state::PROTOCOL_VERSION,
         market,
         auction,
         owner: payer.pubkey(),
@@ -1017,11 +1017,11 @@ fn production_private_claim_reaches_groth16_verification_before_any_token_cpi() 
         ciphertexts: vec![0; beatex::queue::QUEUED_CIPHERTEXT_COUNT * 64],
         ciphertext_digest: [0; 32],
         order_commitment,
-        order_circuit_version: 1,
+        order_circuit_version: 2,
         bump: 0,
     };
     let active_order_state = ActiveOrder {
-        version: 1,
+        version: beatex::state::PROTOCOL_VERSION,
         market,
         auction,
         owner: payer.pubkey(),
@@ -1033,7 +1033,7 @@ fn production_private_claim_reaches_groth16_verification_before_any_token_cpi() 
     let valid_fixture =
         beatex_babyjubjub_groth16_spike::deposit::deterministic_solana_fixture().unwrap();
     let vk_state = QueueVerificationKey {
-        version: 1,
+        version: beatex::state::PROTOCOL_VERSION,
         market,
         circuit_kind: QueueCircuitKind::PrivateClaim,
         circuit_version: beatex::queue::PRIVATE_CLAIM_CIRCUIT_VERSION,

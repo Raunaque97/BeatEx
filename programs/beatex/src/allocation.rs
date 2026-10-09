@@ -1,28 +1,32 @@
 //! Versioned private allocation arithmetic shared by the claim circuit and
 //! the on-chain transcript policy.
 //!
-//! A buy quantity is always denominated in base-token units. At the clearing
+//! A buy quantity is always denominated in protocol base units. At the clearing
 //! index only `buy` and `sell` at that exact index participate; quantities at
 //! other price levels are not cumulative. The long side is prorated and is
 //! rounded against the trader so the shared vault can never become insolvent.
 
-/// First exact-index pro-rata allocation rule.
-pub const ALLOCATION_RULE_VERSION: u16 = 1;
+use crate::state::BASE_UNIT_SIZE;
+
+/// Version 2 converts base-unit quantities into base-token atoms before vault
+/// debits and credits. Quote arithmetic already uses quote-token atoms because
+/// the public price is quote units per base unit.
+pub const ALLOCATION_RULE_VERSION: u16 = 2;
 /// Token-2022 confidential transfers encode a 48-bit amount as three 16-bit
 /// limbs. Claims must fit the same range.
 pub const MAX_CONFIDENTIAL_TRANSFER_AMOUNT: u64 = (1_u64 << 48) - 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AllocationInput {
-    /// Trader buy quantity at the clearing index, in base-token units.
+    /// Trader buy quantity at the clearing index, in 100-atom base units.
     pub buy: u64,
-    /// Trader sell quantity at the clearing index, in base-token units.
+    /// Trader sell quantity at the clearing index, in 100-atom base units.
     pub sell: u64,
     /// Public aggregate demand at the clearing index.
     pub demand: u64,
     /// Public aggregate supply at the clearing index.
     pub supply: u64,
-    /// Quote-token units paid per base-token unit.
+    /// Quote-token atoms paid per 100-atom base unit.
     pub clearing_price: u64,
     /// Base collateral reserved by the order.
     pub base_reserve: u64,
@@ -52,7 +56,7 @@ pub enum AllocationError {
 
 pub type AllocationResult<T> = core::result::Result<T, AllocationError>;
 
-/// Evaluate allocation rule v1 using checked integer arithmetic.
+/// Evaluate allocation rule v2 using checked integer arithmetic.
 ///
 /// When demand exceeds supply, buyers are long: their base credit rounds down
 /// and their quote debit rounds up. When supply exceeds demand, sellers are
@@ -72,28 +76,31 @@ pub fn allocate(input: AllocationInput) -> AllocationResult<AllocationOutput> {
     let supply = u128::from(input.supply);
     let price = u128::from(input.clearing_price);
 
-    let (base_debit, base_credit, quote_debit, quote_credit) = if input.demand > input.supply {
-        // Buyers are prorated; sellers execute in full.
-        let buyer_numerator = checked_mul(buy, supply)?;
-        let base_credit = buyer_numerator / demand;
-        let quote_debit = ceil_div(checked_mul(buyer_numerator, price)?, demand)?;
-        (sell, base_credit, quote_debit, checked_mul(sell, price)?)
-    } else if input.supply > input.demand {
-        // Sellers are prorated; buyers execute in full.
-        let seller_numerator = checked_mul(sell, demand)?;
-        let base_debit = ceil_div(seller_numerator, supply)?;
-        let quote_credit = checked_mul(seller_numerator, price)? / supply;
-        (base_debit, buy, checked_mul(buy, price)?, quote_credit)
-    } else {
-        // Includes the zero-volume case.
-        (
-            sell,
-            buy,
-            checked_mul(buy, price)?,
-            checked_mul(sell, price)?,
-        )
-    };
+    let (base_debit_units, base_credit_units, quote_debit, quote_credit) =
+        if input.demand > input.supply {
+            // Buyers are prorated; sellers execute in full.
+            let buyer_numerator = checked_mul(buy, supply)?;
+            let base_credit = buyer_numerator / demand;
+            let quote_debit = ceil_div(checked_mul(buyer_numerator, price)?, demand)?;
+            (sell, base_credit, quote_debit, checked_mul(sell, price)?)
+        } else if input.supply > input.demand {
+            // Sellers are prorated; buyers execute in full.
+            let seller_numerator = checked_mul(sell, demand)?;
+            let base_debit = ceil_div(seller_numerator, supply)?;
+            let quote_credit = checked_mul(seller_numerator, price)? / supply;
+            (base_debit, buy, checked_mul(buy, price)?, quote_credit)
+        } else {
+            // Includes the zero-volume case.
+            (
+                sell,
+                buy,
+                checked_mul(buy, price)?,
+                checked_mul(sell, price)?,
+            )
+        };
 
+    let base_debit = checked_mul(base_debit_units, u128::from(BASE_UNIT_SIZE))?;
+    let base_credit = checked_mul(base_credit_units, u128::from(BASE_UNIT_SIZE))?;
     let base_payout = u128::from(input.base_reserve)
         .checked_sub(base_debit)
         .ok_or(AllocationError::InsufficientBaseReserve)?
@@ -151,7 +158,7 @@ mod tests {
             demand,
             supply,
             clearing_price: 7,
-            base_reserve: 100,
+            base_reserve: 10_000,
             quote_reserve: 10_000,
         }
     }
@@ -159,29 +166,29 @@ mod tests {
     #[test]
     fn balanced_market_executes_both_sides_exactly() {
         let buyer = allocate(input(3, 0, 10, 10)).unwrap();
-        assert_eq!((buyer.base_credit, buyer.quote_debit), (3, 21));
+        assert_eq!((buyer.base_credit, buyer.quote_debit), (300, 21));
         let seller = allocate(input(0, 4, 10, 10)).unwrap();
-        assert_eq!((seller.base_debit, seller.quote_credit), (4, 28));
+        assert_eq!((seller.base_debit, seller.quote_credit), (400, 28));
     }
 
     #[test]
     fn long_buy_side_rounds_against_buyers() {
         let result = allocate(input(2, 0, 3, 2)).unwrap();
-        assert_eq!(result.base_credit, 1); // floor(4/3)
+        assert_eq!(result.base_credit, 100); // floor(4/3) base units
         assert_eq!(result.quote_debit, 10); // ceil(28/3)
     }
 
     #[test]
     fn long_sell_side_rounds_against_sellers() {
         let result = allocate(input(0, 2, 2, 3)).unwrap();
-        assert_eq!(result.base_debit, 2); // ceil(4/3)
+        assert_eq!(result.base_debit, 200); // ceil(4/3) base units
         assert_eq!(result.quote_credit, 9); // floor(28/3)
     }
 
     #[test]
     fn zero_volume_returns_reserves() {
         let result = allocate(input(0, 0, 0, 0)).unwrap();
-        assert_eq!(result.base_payout, 100);
+        assert_eq!(result.base_payout, 10_000);
         assert_eq!(result.quote_payout, 10_000);
     }
 
@@ -200,7 +207,7 @@ mod tests {
     #[test]
     fn collateral_and_token_limits_are_enforced() {
         let mut insolvent = input(0, 2, 2, 3);
-        insolvent.base_reserve = 1;
+        insolvent.base_reserve = 100;
         assert_eq!(
             allocate(insolvent),
             Err(AllocationError::InsufficientBaseReserve)
@@ -220,11 +227,11 @@ mod tests {
             for supply in 1_u64..20 {
                 if demand > supply {
                     let total = allocate(input(demand, 0, demand, supply)).unwrap();
-                    assert_eq!(total.base_credit, supply);
+                    assert_eq!(total.base_credit, supply * BASE_UNIT_SIZE);
                     assert!(u128::from(total.quote_debit) >= u128::from(supply) * 7);
                 } else if supply > demand {
                     let total = allocate(input(0, supply, demand, supply)).unwrap();
-                    assert_eq!(total.base_debit, demand);
+                    assert_eq!(total.base_debit, demand * BASE_UNIT_SIZE);
                     assert!(u128::from(total.quote_credit) <= u128::from(demand) * 7);
                 }
             }

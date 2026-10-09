@@ -26,7 +26,7 @@ use rand::{CryptoRng, RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use std::ops::Neg;
 
-const ROLLOVER_DOMAIN: &[u8] = b"BeatEx rollover credit v1";
+const ROLLOVER_DOMAIN: &[u8] = b"BeatEx rollover credit v2";
 const BALANCE_BITS: usize = 64;
 
 #[derive(Clone, Debug)]
@@ -107,7 +107,7 @@ impl RolloverSettlementWitness {
 
     pub fn digest(&self) -> Result<Fq, SynthesisError> {
         let claim = &self.claim;
-        let mut payload = vec![Fq::from_le_bytes_mod_order(ROLLOVER_DOMAIN), Fq::from(1u64)];
+        let mut payload = vec![Fq::from_le_bytes_mod_order(ROLLOVER_DOMAIN), Fq::from(2u64)];
         payload.extend_from_slice(&claim.market);
         payload.extend_from_slice(&claim.auction);
         payload.extend_from_slice(&claim.order);
@@ -208,9 +208,9 @@ impl ConstraintSynthesizer<Fq> for RolloverSettlementCircuit {
             claim.map(|value| u128::from(value.claim_circuit_version)),
             16,
         )?;
-        allocation_version.enforce_equal(&FpVar::one())?;
-        order_version.enforce_equal(&FpVar::one())?;
-        claim_version.enforce_equal(&FpVar::one())?;
+        allocation_version.enforce_equal(&FpVar::constant(Fq::from(2u64)))?;
+        order_version.enforce_equal(&FpVar::constant(Fq::from(2u64)))?;
+        claim_version.enforce_equal(&FpVar::constant(Fq::from(2u64)))?;
 
         let mut buy = Vec::with_capacity(LEVELS);
         let mut sell = Vec::with_capacity(LEVELS);
@@ -388,7 +388,7 @@ impl ConstraintSynthesizer<Fq> for RolloverSettlementCircuit {
 
         let mut statement = vec![
             FpVar::constant(Fq::from_le_bytes_mod_order(ROLLOVER_DOMAIN)),
-            FpVar::one(),
+            FpVar::constant(Fq::from(2u64)),
         ];
         statement.extend(market);
         statement.extend(auction);

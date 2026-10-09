@@ -51,9 +51,9 @@ export interface MarketAccount {
   quoteMint: Address;
   baseVault: Address;
   quoteVault: Address;
-  baseLotSize: bigint;
-  quoteLotSize: bigint;
-  tickSize: bigint;
+  baseUnitSize: bigint;
+  quoteUnitSize: bigint;
+  gridStepBps: number;
   gridRadius: number;
   maxOrderQuantity: bigint;
   maxAggregateQuantity: bigint;
@@ -89,9 +89,9 @@ export function decodeMarket(data: Uint8Array): MarketAccount {
   const quoteMint = reader.address();
   const baseVault = reader.address();
   const quoteVault = reader.address();
-  const baseLotSize = reader.u64();
-  const quoteLotSize = reader.u64();
-  const tickSize = reader.u64();
+  const baseUnitSize = reader.u64();
+  const quoteUnitSize = reader.u64();
+  const gridStepBps = reader.u16();
   const gridRadius = reader.u8();
   const maxOrderQuantity = reader.u64();
   const maxAggregateQuantity = reader.u64();
@@ -125,9 +125,9 @@ export function decodeMarket(data: Uint8Array): MarketAccount {
     quoteMint,
     baseVault,
     quoteVault,
-    baseLotSize,
-    quoteLotSize,
-    tickSize,
+    baseUnitSize,
+    quoteUnitSize,
+    gridStepBps,
     gridRadius,
     maxOrderQuantity,
     maxAggregateQuantity,
@@ -169,7 +169,7 @@ export interface AuctionAccount {
   referencePrice: bigint;
   referenceFromOracle: boolean;
   oraclePublishTime: bigint;
-  tickSize: bigint;
+  gridStepBps: number;
   gridSize: number;
   allocationRuleVersion: number;
   orderCircuitVersion: number;
@@ -202,7 +202,7 @@ export function decodeAuction(data: Uint8Array): AuctionAccount {
   const referencePrice = reader.u64();
   const referenceFromOracle = reader.bool();
   const oraclePublishTime = reader.i64();
-  const tickSize = reader.u64();
+  const gridStepBps = reader.u16();
   const gridSize = reader.u8();
   const allocationRuleVersion = reader.u16();
   const orderCircuitVersion = reader.u16();
@@ -236,7 +236,7 @@ export function decodeAuction(data: Uint8Array): AuctionAccount {
     referencePrice,
     referenceFromOracle,
     oraclePublishTime,
-    tickSize,
+    gridStepBps,
     gridSize,
     allocationRuleVersion,
     orderCircuitVersion,

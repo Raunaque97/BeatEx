@@ -57,9 +57,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let specs = [
         "balance-v1.pk",
-        "order-v1.pk",
-        "release-v1.pk",
-        "settlement-v1.pk",
+        "order-v2.pk",
+        "release-v2.pk",
+        "settlement-v2.pk",
     ];
     for file in specs {
         reject_existing(&output_dir.join(file))?;
@@ -92,7 +92,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let manifest = Manifest {
         schema_version: 1,
-        backend: "beatex-arkworks-groth16-wasm-v1",
+        backend: "beatex-arkworks-groth16-wasm-v2",
         proving_key_encoding: "arkworks-canonical-uncompressed-v1",
         runtime: AssetDescriptor {
             url: RUNTIME_FILE,
@@ -105,15 +105,15 @@ fn main() -> Result<(), Box<dyn Error>> {
                 proving_key: balance,
             },
             order: CircuitEntry {
-                circuit_version: 1,
+                circuit_version: 2,
                 proving_key: order,
             },
             release: CircuitEntry {
-                circuit_version: 1,
+                circuit_version: 2,
                 proving_key: release,
             },
             settlement: CircuitEntry {
-                circuit_version: 1,
+                circuit_version: 2,
                 proving_key: settlement,
             },
         },

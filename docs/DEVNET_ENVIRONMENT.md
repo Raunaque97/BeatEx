@@ -90,7 +90,10 @@ scripts/devnet/setup-test-tokens.sh \
 Devnet keys and addresses are isolated under `.devnet/devnet/`. The script
 explicitly refuses any cluster other than localnet or Devnet.
 
-The October 2026 Devnet checkpoint deployed BeatEx and created:
+The following addresses belong to the October 2026 version-1 checkpoint. The
+token mints may be reused, but its program build, market, vault configuration,
+key epoch, verifier keys, and generated manifests predate the version-2 unit
+and linear-bps-grid migration and must not be treated as a current deployment:
 
 | Item | Devnet address |
 | --- | --- |
@@ -116,6 +119,20 @@ market-maker wallets:
 Private keypairs stay under ignored `.devnet/devnet/market-makers/`; the public
 manifest is regenerated at `.devnet/devnet/market-makers.tsv`.
 
+Market makers do not accept a local reference price or an absolute tick size.
+They discover the slot-derived auction and derive its 17-level price grid from
+the snapshotted reference price and basis-point step
+before constructing a curve:
+
+```sh
+scripts/devnet/run-market-makers.sh
+```
+
+If no current Auction account exists, a process may submit the permissionless
+initialization instruction and then re-read the created account. A locally
+fetched Pyth or Binance price influences a maker's desired quantities only; it
+never replaces the Auction account's price levels.
+
 The reference oracle is Pyth's sponsored BTC/USD shard-zero price-feed
 account, which is available on Solana Devnet:
 
@@ -125,7 +142,8 @@ account, which is available on Solana Devnet:
 | Feed ID | `e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43` |
 | Receiver owner | `rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ` |
 
-The current 972,376-byte program artifact at `target/deploy-v0/beatex.so` has
+The legacy checkpoint's 972,376-byte program artifact at
+`target/deploy-v0/beatex.so` has
 SHA-256
 `e8d377290afe956253ba747375977c8ba2e0392239bb8121443085c70725a3e7`.
 It was built without test-fixture features after the production artifact passed
@@ -137,11 +155,23 @@ capacity. The deployment transaction is
 
 The account's presence and receiver ownership were checked directly against
 Devnet. BeatEx does not need to deploy its own oracle for the named test assets;
-the program interprets tBTC/tUSD as the test BTC/USD market. Its market config
-uses `oracle_exponent_adjustment = -2` to convert 8-decimal tBTC and 6-decimal
-tUSD smallest units before rounding to the configured tick. The Devnet market
-allows a 600-second oracle age because the sponsored Devnet feed updates less
-frequently than its production counterpart.
+the program interprets tBTC/tUSD as the test BTC/USD market. The replacement
+version-2 market configuration is:
+
+```text
+base_unit_size             = 100 tBTC atoms = 100 satoshis
+quote_unit_size            = 1 tUSD atom = 1 micro-tUSD
+grid_radius                = 8
+grid_step_bps              = 10
+oracle_exponent_adjustment = 0
+```
+
+This produces 17 linear offsets from -80 through +80 bps around each auction's
+reference price. The Auction snapshots the reference, step, and level count;
+all clients derive the same exact half-up-rounded prices from those fields, and
+the snapshot is authoritative. The Devnet market allows a
+600-second oracle age because the sponsored Devnet feed updates less frequently
+than its production counterpart.
 
 Before public Devnet testing, replace the default metadata URI with a hosted JSON
 base URI:
@@ -165,6 +195,25 @@ setup script checks this minimum before creating any new state.
 
 ## Build and deploy BeatEx
 
+### Reproducible build artifacts
+
+Run the repository pipeline after changing the Anchor program:
+
+```sh
+pnpm build:contract   # SBF, IDL, generated protocol files, deployment manifest
+pnpm build:protocol   # contract artifacts plus Rust/TypeScript package builds
+pnpm build:all        # also builds trader WASM assets and the web application
+```
+
+The pipeline derives values from `Anchor.toml`,
+`programs/beatex/src/state.rs`, and `programs/beatex/src/queue.rs`. It writes
+the generated SDK and prover files and records the current IDL hash and any
+known market/vault/key addresses in `.devnet/<cluster>/deployment.json`.
+`deploy-beatex.sh` runs the contract-only pipeline before deploying, while
+`devnetSetup.sh` regenerates the manifest after market initialization. This
+keeps frontend, CLI, TUI, prover, and market-maker consumers on the same
+program ID and protocol configuration without hand-editing addresses.
+
 For the locally validated v0 build and deployment:
 
 ```sh
@@ -173,6 +222,14 @@ scripts/devnet/deploy-beatex.sh \
   --wallet /absolute/path/to/devnet-wallet.json
 ```
 
+Both this command and the enclosing `devnetSetup.sh` inspect the configured
+program ID with `solana program show` before deployment. If it is already
+deployed, an interactive run asks before upgrading it. Declining leaves the
+current program unchanged. An unattended setup also leaves it unchanged unless
+`--redeploy` was supplied after explicit approval. `deploy-beatex.sh` requires
+the corresponding lower-level `--allow-redeploy` flag when called directly in
+an unattended workflow.
+
 The compiled `declare_id!`, both entries in `Anchor.toml`, and the program
 keypair must resolve to the same address. The local checkpoint explicitly
 verifies this before deployment and keeps its ignored backup at
@@ -180,7 +237,7 @@ verifies this before deployment and keeps its ignored backup at
 funded isolated Devnet wallet, and retain the program keypair. The deployment
 script deliberately refuses mainnet.
 
-The current program uses large v1 transactions for queued orders. The v1
+BeatEx uses large Solana version-1 transactions for queued orders. The v1
 transaction feature is active on Devnet. `clients/v1-transaction/send.mjs`
 builds, signs, size-checks, sends, and confirms these 4,096-byte-cap transactions
 with explicit compute, loaded-account-data, heap, and priority-fee configuration.
@@ -194,6 +251,12 @@ v1-capable current validator for the complete large-transaction flow.
 configures the Token-2022 custody vaults, transfers their ownership to the vault PDA,
 initializes the market and committee, and installs every verifier key. The
 ignored `.devnet/devnet/market.tsv` manifest records all resulting addresses.
+It also regenerates `target/idl/beatex.json` with `anchor idl build` and
+publishes it with `@solana-program/program-metadata`. The
+publication helper fetches the canonical IDL first, skips semantically
+identical JSON, and asks before replacing a different or unconfirmed value.
+Use `--skip-idl` to omit publication or `--allow-idl-update` only for an
+explicitly approved unattended update.
 `scripts/devnet/run-market-makers.sh` uses the stateful proof/sign/send adapter
 by default; `--print-only` keeps the strategy inspection mode. The same adapter
 provides `fold`, `publish`, and `cancel` commands plus `settle-balance`,
@@ -206,7 +269,11 @@ binding, and the final state mutation. The preparation and binding handlers use
 the instructions sysvar to authenticate the complete atomic chain; no reusable
 proof receipt or partial rollover state is stored.
 
-## Live settlement checkpoint
+## Legacy version-1 settlement checkpoint
+
+The transactions below document the superseded version-1 deployment. They are
+retained as historical execution evidence, not as validation of the version-2
+unit, grid, transcript, and verifier-key migration.
 
 The default fast-ledger path completed auction 1007 against the deployed
 program:

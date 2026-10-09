@@ -7,15 +7,20 @@ import {
   address,
   appendTransactionMessageInstructions,
   assertIsTransactionWithBlockhashLifetime,
+  assertIsFullySignedTransaction,
+  compileTransaction,
   createKeyPairSignerFromBytes,
   createSolanaRpc,
   createSolanaRpcSubscriptions,
   createTransactionMessage,
   getSignatureFromTransaction,
+  getTransactionDecoder,
   getTransactionEncoder,
+  partiallySignTransactionWithSigners,
   pipe,
   sendAndConfirmTransactionFactory,
   setTransactionMessageConfig,
+  setTransactionMessageFeePayer,
   setTransactionMessageFeePayerSigner,
   setTransactionMessageLifetimeUsingBlockhash,
   signTransactionMessageWithSigners,
@@ -29,7 +34,7 @@ function usage() {
 
 Reads one JSON instruction bundle from stdin:
 {
-  "keypair": "/absolute/path/to/owner.json",
+  "keypair": "/absolute/path/to/owner.json-or-browser-session.json",
   "signerKeypairs": ["/absolute/path/to/additional-signer.json"],
   "rpcUrl": "https://api.devnet.solana.com",
   "instructions": [{
@@ -45,6 +50,88 @@ Reads one JSON instruction bundle from stdin:
 
 The fee payer and any signerKeypairs may be marked as signers. --check-only
 validates the bundle without reading keypairs or contacting RPC.`);
+}
+
+function timingSafeEqual(left, right) {
+  if (left.length !== right.length) return false;
+  let difference = 0;
+  for (let index = 0; index < left.length; index += 1) {
+    difference |= left[index] ^ right[index];
+  }
+  return difference === 0;
+}
+
+function validateBrowserSession(value, path) {
+  if (value?.version !== 1 || value?.type !== "browser-wallet") {
+    throw new Error(`wallet file is neither a Solana keypair nor a BeatEx browser session: ${path}`);
+  }
+  const walletAddress = address(value.address);
+  const bridgeUrl = new URL(value.bridgeUrl);
+  if (bridgeUrl.protocol !== "http:" ||
+      (bridgeUrl.hostname !== "127.0.0.1" && bridgeUrl.hostname !== "localhost")) {
+    throw new Error("browser wallet bridge must use loopback HTTP");
+  }
+  if (bridgeUrl.username || bridgeUrl.password || bridgeUrl.search || bridgeUrl.hash) {
+    throw new Error("browser wallet bridge URL must not contain credentials, query, or fragment");
+  }
+  if (typeof value.sessionToken !== "string" || !/^[A-Za-z0-9_-]{32,}$/.test(value.sessionToken)) {
+    throw new Error("browser wallet session token is invalid");
+  }
+  return {
+    kind: "browser",
+    address: walletAddress,
+    bridgeUrl: bridgeUrl.toString().replace(/\/$/, ""),
+    sessionToken: value.sessionToken,
+  };
+}
+
+async function readWallet(path) {
+  const value = JSON.parse(await readFile(path, "utf8"));
+  if (Array.isArray(value)) {
+    const keypairBytes = Uint8Array.from(value);
+    if (keypairBytes.length !== 64) {
+      throw new Error(`Solana keypair JSON must contain 64 bytes: ${path}`);
+    }
+    return { kind: "keypair", signer: await createKeyPairSignerFromBytes(keypairBytes) };
+  }
+  return validateBrowserSession(value, path);
+}
+
+async function signWithBrowser(session, transaction, label) {
+  const encoded = new Uint8Array(getTransactionEncoder().encode(transaction));
+  const response = await fetch(`${session.bridgeUrl}/api/sign-transaction`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${session.sessionToken}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      transactionBase64: Buffer.from(encoded).toString("base64"),
+      chain: "solana:devnet",
+      label,
+    }),
+    signal: AbortSignal.timeout(180_000),
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(result.error ?? `browser wallet bridge returned HTTP ${response.status}`);
+  }
+  if (typeof result.signedTransactionBase64 !== "string") {
+    throw new Error("browser wallet bridge returned no signed transaction");
+  }
+  const signedBytes = Buffer.from(result.signedTransactionBase64, "base64");
+  if (signedBytes.toString("base64") !== result.signedTransactionBase64) {
+    throw new Error("browser wallet bridge returned non-canonical base64");
+  }
+  const signed = getTransactionDecoder().decode(signedBytes);
+  if (!timingSafeEqual(signed.messageBytes, transaction.messageBytes)) {
+    throw new Error("wallet modified the BeatEx transaction message");
+  }
+  assertIsFullySignedTransaction(signed);
+  return Object.freeze({
+    ...signed,
+    lifetimeConstraint: transaction.lifetimeConstraint,
+  });
 }
 
 async function readStdin() {
@@ -160,11 +247,15 @@ async function main() {
     }
     return createKeyPairSignerFromBytes(keypairBytes);
   }
-  const payer = await readSigner(bundle.keypair);
+  const wallet = await readWallet(bundle.keypair);
   const additionalSigners = await Promise.all((bundle.signerKeypairs ?? []).map(readSigner));
-  const signers = new Map([[payer.address, payer]]);
+  const payerAddress = wallet.kind === "keypair" ? wallet.signer.address : wallet.address;
+  const signers = new Map();
+  if (wallet.kind === "keypair") signers.set(wallet.signer.address, wallet.signer);
   for (const signer of additionalSigners) {
-    if (signers.has(signer.address)) throw new Error(`duplicate signer ${signer.address}`);
+    if (signer.address === payerAddress || signers.has(signer.address)) {
+      throw new Error(`duplicate signer ${signer.address}`);
+    }
     signers.set(signer.address, signer);
   }
   const rpcUrl = bundle.rpcUrl ?? DEFAULT_RPC_URL;
@@ -176,7 +267,8 @@ async function main() {
     const accounts = instruction.accounts.map((accountMeta) => {
       const signer = accountMeta.signer;
       const accountSigner = signer ? signers.get(accountMeta.address) : undefined;
-      if (signer && !accountSigner) {
+      const isBrowserSigner = wallet.kind === "browser" && accountMeta.address === wallet.address;
+      if (signer && !accountSigner && !isBrowserSigner) {
         throw new Error(`missing keypair for signer ${accountMeta.address}`);
       }
       const role = accountMeta.writable
@@ -186,7 +278,7 @@ async function main() {
         : signer
           ? AccountRole.READONLY_SIGNER
           : AccountRole.READONLY;
-      return signer
+      return accountSigner
         ? { address: accountSigner.address, role, signer: accountSigner }
         : { address: address(accountMeta.address), role };
     });
@@ -198,7 +290,9 @@ async function main() {
   });
   const transactionMessage = pipe(
     createTransactionMessage({ version: 1 }),
-    (message) => setTransactionMessageFeePayerSigner(payer, message),
+    (message) => wallet.kind === "keypair"
+      ? setTransactionMessageFeePayerSigner(wallet.signer, message)
+      : setTransactionMessageFeePayer(payerAddress, message),
     (message) => setTransactionMessageLifetimeUsingBlockhash(latestBlockhash, message),
     (message) => appendTransactionMessageInstructions(instructions, message),
     (message) =>
@@ -212,24 +306,30 @@ async function main() {
         message,
       ),
   );
-  const transaction = await signTransactionMessageWithSigners(transactionMessage);
+  const transaction = wallet.kind === "keypair"
+    ? await signTransactionMessageWithSigners(transactionMessage)
+    : await partiallySignTransactionWithSigners(additionalSigners, compileTransaction(transactionMessage));
   assertIsTransactionWithBlockhashLifetime(transaction);
   const encoded = getTransactionEncoder().encode(transaction);
   if (encoded.length > MAX_V1_BYTES) {
     throw new Error(`v1 transaction is ${encoded.length} bytes; maximum is ${MAX_V1_BYTES}`);
   }
+  const signedTransaction = wallet.kind === "browser"
+    ? await signWithBrowser(wallet, transaction, bundle.label ?? "BeatEx transaction")
+    : transaction;
   try {
-    await sendAndConfirmTransactionFactory({ rpc, rpcSubscriptions })(transaction, {
+    await sendAndConfirmTransactionFactory({ rpc, rpcSubscriptions })(signedTransaction, {
       commitment: "confirmed",
     });
   } catch (error) {
     try {
       const simulation = await rpc
-        .simulateTransaction(Buffer.from(encoded).toString("base64"), {
+        .simulateTransaction(
+          Buffer.from(getTransactionEncoder().encode(signedTransaction)).toString("base64"), {
           commitment: "confirmed",
           encoding: "base64",
           sigVerify: false,
-        })
+          })
         .send();
       if (simulation.value.logs) console.error(simulation.value.logs.join("\n"));
       if (simulation.value.unitsConsumed !== undefined) {
@@ -242,8 +342,8 @@ async function main() {
   }
   console.log(
     JSON.stringify({
-      signature: getSignatureFromTransaction(transaction),
-      transactionBytes: encoded.length,
+      signature: getSignatureFromTransaction(signedTransaction),
+      transactionBytes: getTransactionEncoder().encode(signedTransaction).length,
     }),
   );
 }

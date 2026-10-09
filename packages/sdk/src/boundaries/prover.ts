@@ -51,7 +51,7 @@ export interface OrderProofRequest {
   readonly owner: Bytes32;
   readonly clientOrderNonce: bigint;
   readonly referencePrice: bigint;
-  readonly tickSize: bigint;
+  readonly gridStepBps: number;
   readonly committeeKey: Bytes32;
   readonly curve: OrderCurve;
   readonly oldBalance: PrivateBalanceOpening;

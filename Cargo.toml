@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/beatex-cli",
     "crates/babyjubjub-groth16-spike",
     "crates/auction-sim",
     "crates/devnet-client",

@@ -35,31 +35,49 @@ This matches the privacy boundary of Solana's Confidential Balances reasonably w
 
 General encrypted price comparison is expensive, needs FHE and unnecessary with a public price grid design.
 
-Before an auction opens, the market fixes a finite set of valid prices:
+Before an auction opens, the market fixes a finite set of valid prices. Version
+2 uses 17 linear basis-point offsets around one reference price: with the
+default 10-bps step, the levels run from -80 bps through +80 bps. Each level is
+computed from the same reference price; percentages are not compounded from
+one level to the next.
 
 ```text
-99 | 100 | 101 | 102 | 103
+offset(i) = i - 8
+price[i] = floor(
+  (reference_price * (10_000 + offset(i) * 10) + 5_000) / 10_000
+)
 ```
 
 The grid itself is public. What remains confidential is where an order sits on that grid and how much liquidity it contributes.
 
 Asset `A` is the base asset and asset `B` is the quote asset. Every order
-quantity is denominated in base-asset `A` lots; prices are quote-asset `B` lots
-per base lot.
+quantity is a count of the market's smallest executable base units, and prices
+are quote accounting units per base unit. For the tBTC/tUSD market, one base
+unit is 100 satoshis and one quote unit is one micro-tUSD. Thus an integer price
+of `85_500` means 85,500 tUSD per tBTC, and the minimum non-zero order quantity
+is 100 satoshis.
 
 An order is a contingent schedule. Each entry states the amount of base asset
 `A` the trader will buy or sell if that exact index becomes the clearing price.
 Entries are not cumulative across prices. For example:
 
 ```text
-Price in B/A:        99   100   101   102   103
-Buy A if it clears:   6    10     4     0     0
-Sell A if it clears:  0     0     0     3     8
+Grid index:            6     7     8     9    10
+Price in B/A:       85329 85415 85500 85586 85671
+Buy A units:            6    10     4     0     0
+Sell A units:           0     0     0     3     8
 ```
 
-If price `100` clears, this order may buy `10` units of `A`; none of its other
-entries execute. If price `103` clears, it may sell `8` units of `A`. The two
-vectors are encrypted, and at any one index at most one side may be non-zero.
+If price `85_415` clears, this order may buy `10` base units of `A`; none of its
+other entries execute. If price `85_671` clears, it may sell `8` base units of
+`A`. The two vectors are encrypted, and at any one index at most one side may
+be non-zero.
+
+Auction initialization snapshots the reference price, basis-point step, and
+level count onchain. Those fields deterministically produce the exact rounded
+17-price grid, and the Auction account is the authority for traders, proofs,
+clearing, and market makers; clients do not supply a reference price or an
+absolute tick size.
 
 Now clearing no longer requires comparing encrypted prices. The protocol only has to **add encrypted numbers at each public price point**.
 
@@ -67,7 +85,7 @@ Now clearing no longer requires comparing encrypted prices. The protocol only ha
 
 The same representation naturally supports more than simple limit orders.
 
-A market maker can quote different quantities at several ticks and submit an entire supply or demand curve rather than creating many independent orders. The client converts that curve into the same encrypted grid representation.
+A market maker can quote different quantities at several price levels and submit an entire supply or demand curve rather than creating many independent orders. The client converts that curve into the same encrypted grid representation.
 
 This makes the order format useful to professional liquidity providers without changing the clearing mechanism.
 
@@ -279,7 +297,12 @@ Key rotation and committee membership can therefore evolve independently of the 
 
 Token-2022 balances are logically `u64`, but confidential transfer amounts are encoded as a 48-bit value split into a low 16-bit component and a high 32-bit component. This exists because directly decrypting arbitrary 64-bit ElGamal plaintexts is impractical.
 
-The market should therefore operate in explicit **lot units** and choose token decimals/lot sizes such that individual collateral transfers remain comfortably within the confidential-transfer range.
+The market should therefore operate in explicit integer **asset units** and
+choose unit sizes such that individual collateral transfers remain comfortably
+within the confidential-transfer range. For tBTC/tUSD those sizes are fixed to
+100 satoshis and one micro-tUSD respectively. Order quantities are counts of
+base units and are range-constrained to 28 bits, with a lower market-specific
+maximum when required.
 
 This is an encoding constraint rather than a change to the auction model.
 

@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>BeatEx wallet connection</title>
+  <style>
+    :root { color-scheme: dark; font: 16px/1.5 system-ui, sans-serif; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #0b0e14; color: #f5f7fb; }
+    main { width: min(30rem, calc(100% - 2rem)); padding: 2rem; border: 1px solid #2a3040; border-radius: 1rem; background: #121722; }
+    h1 { margin-top: 0; font-size: 1.5rem; }
+    p { color: #b8c0d4; }
+    button { width: 100%; padding: .85rem 1rem; border: 0; border-radius: .65rem; background: #8a6cff; color: white; font: inherit; font-weight: 700; cursor: pointer; }
+    button:disabled { opacity: .55; cursor: wait; }
+    #status { min-height: 1.5rem; margin-bottom: 0; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Connect Phantom to BeatEx</h1>
+  <p>Your wallet signs a short-lived login message. BeatEx stores only the wallet name, public address, and supported transaction versions.</p>
+  <button id="connect" type="button">Connect Phantom</button>
+  <p id="status" role="status">Waiting for approval.</p>
+</main>
+<script>
+(() => {
+  'use strict';
+  const status = document.getElementById('status');
+  const button = document.getElementById('connect');
+  const params = new URLSearchParams(location.hash.slice(1));
+  const token = params.get('token');
+  history.replaceState(null, '', location.pathname);
+  const wallets = new Map();
+  const listeners = { register: new Set(), unregister: new Set() };
+
+  function bytesToBase64(bytes) {
+    let binary = '';
+    for (let index = 0; index < bytes.length; index += 0x8000) {
+      binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000));
+    }
+    return btoa(binary);
+  }
+  function base64ToBytes(value) {
+    const binary = atob(value);
+    return Uint8Array.from(binary, character => character.charCodeAt(0));
+  }
+  async function api(path, options = {}) {
+    const response = await fetch(path, {
+      ...options,
+      headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json', ...(options.headers || {}) },
+    });
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({ error: `HTTP ${response.status}` }));
+      throw new Error(body.error || `HTTP ${response.status}`);
+    }
+    return response.status === 204 ? null : response.json();
+  }
+  function rememberWallet(wallet) {
+    if (wallet && wallet.name && wallet.features && !wallets.has(wallet.name)) {
+      wallets.set(wallet.name, wallet);
+      for (const listener of listeners.register) listener(wallet);
+    }
+  }
+  const registry = Object.freeze({
+    register(...registered) {
+      registered.forEach(rememberWallet);
+      return () => registered.forEach(wallet => {
+        if (wallets.delete(wallet.name)) {
+          for (const listener of listeners.unregister) listener(wallet);
+        }
+      });
+    },
+    get() { return [...wallets.values()]; },
+    on(event, listener) {
+      const collection = listeners[event];
+      if (!collection) return () => {};
+      collection.add(listener);
+      return () => collection.delete(listener);
+    },
+  });
+  class WalletStandardAppReadyEvent extends Event {
+    constructor() { super('wallet-standard:app-ready'); }
+    get detail() { return registry; }
+  }
+  window.addEventListener('wallet-standard:register-wallet', event => {
+    event.detail(registry);
+  });
+  window.dispatchEvent(new WalletStandardAppReadyEvent());
+
+  function phantomWallet() {
+    return [...wallets.values()].find(wallet => wallet.name.toLowerCase().includes('phantom'));
+  }
+  function supportedVersions(wallet) {
+    const feature = wallet.features['solana:signTransaction'];
+    return Array.from(feature && feature.supportedTransactionVersions || []).filter(version => version === 'legacy' || version === 0 || version === 1);
+  }
+  async function pollSigningRequests(wallet, account) {
+    for (;;) {
+      let request;
+      try { request = await api('/api/request'); }
+      catch (error) { status.textContent = `Signing bridge stopped: ${error.message}`; return; }
+      if (!request) continue;
+      try {
+        const payload = base64ToBytes(request.payloadBase64);
+        let signed;
+        if (request.kind === 'message') {
+          const feature = wallet.features['solana:signMessage'];
+          if (!feature) throw new Error('Wallet does not support message signing');
+          const [output] = await feature.signMessage({ account, message: payload });
+          signed = output.signature;
+        } else {
+          const feature = wallet.features['solana:signTransaction'];
+          if (!feature) throw new Error('Wallet does not support transaction signing');
+          if (!supportedVersions(wallet).includes(1)) throw new Error('Phantom does not advertise transaction version 1');
+          status.textContent = request.label ? `Approve in Phantom: ${request.label}` : 'Approve the transaction in Phantom.';
+          const [output] = await feature.signTransaction({ account, transaction: payload, chain: request.chain });
+          signed = output.signedTransaction;
+        }
+        await api('/api/response', { method: 'POST', body: JSON.stringify({ id: request.id, signedPayloadBase64: bytesToBase64(signed) }) });
+      } catch (error) {
+        await api('/api/response', { method: 'POST', body: JSON.stringify({ id: request.id, error: String(error && error.message || error) }) });
+      }
+    }
+  }
+  button.addEventListener('click', async () => {
+    button.disabled = true;
+    try {
+      if (!token) throw new Error('Missing local session token');
+      await new Promise(resolve => setTimeout(resolve, 200));
+      const wallet = phantomWallet();
+      if (!wallet) throw new Error('Phantom was not found. Install or unlock Phantom, then reload this page.');
+      const connect = wallet.features['standard:connect'];
+      const signMessage = wallet.features['solana:signMessage'];
+      if (!connect || !signMessage) throw new Error('Phantom does not expose the required wallet features');
+      const output = await connect.connect();
+      const account = output.accounts && output.accounts[0] || wallet.accounts && wallet.accounts[0];
+      if (!account) throw new Error('Phantom did not provide an account');
+      const challenge = await api('/api/challenge', {
+        method: 'POST',
+        body: JSON.stringify({ walletName: wallet.name, address: account.address, supportedTransactionVersions: supportedVersions(wallet) }),
+      });
+      const [signed] = await signMessage.signMessage({ account, message: base64ToBytes(challenge.messageBase64) });
+      await api('/api/connect', {
+        method: 'POST',
+        body: JSON.stringify({ address: account.address, signatureBase64: bytesToBase64(signed.signature) }),
+      });
+      status.textContent = `Connected ${account.address}. Keep this page open for transaction approvals.`;
+      pollSigningRequests(wallet, account);
+    } catch (error) {
+      status.textContent = String(error && error.message || error);
+      button.disabled = false;
+    }
+  });
+})();
+</script>
+</body>
+</html>

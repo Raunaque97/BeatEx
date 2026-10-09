@@ -114,7 +114,7 @@ test(
       owner,
       clientOrderNonce: 7n,
       referencePrice: 100_000n,
-      tickSize: 500n,
+      gridStepBps: 10,
       committeeKey,
       curve,
       oldBalance: initialBalance,
@@ -190,7 +190,7 @@ test(
       owner,
       clientOrderNonce: 8n,
       referencePrice: 100_000n,
-      tickSize: 500n,
+      gridStepBps: 10,
       committeeKey,
       curve,
     };

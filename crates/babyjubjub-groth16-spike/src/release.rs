@@ -19,8 +19,8 @@ use rand::{CryptoRng, RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use std::ops::Neg;
 
-const RELEASE_DOMAIN: &[u8] = b"BeatEx collateral release v1";
-const ORDER_COMMITMENT_DOMAIN: &[u8] = b"BeatEx private contingent order v1";
+const RELEASE_DOMAIN: &[u8] = b"BeatEx collateral release v2";
+const ORDER_COMMITMENT_DOMAIN: &[u8] = b"BeatEx private contingent order v2";
 const BALANCE_BITS: usize = 64;
 
 #[derive(Clone, Debug)]
@@ -119,7 +119,7 @@ impl CollateralReleaseWitness {
     }
 
     pub fn digest(&self) -> Fq {
-        let mut payload = vec![Fq::from_le_bytes_mod_order(RELEASE_DOMAIN), Fq::from(1u64)];
+        let mut payload = vec![Fq::from_le_bytes_mod_order(RELEASE_DOMAIN), Fq::from(2u64)];
         payload.extend_from_slice(&self.market_context);
         payload.extend_from_slice(&self.auction_context);
         payload.extend_from_slice(&self.active_order_context);
@@ -277,7 +277,7 @@ impl ConstraintSynthesizer<Fq> for CollateralReleaseCircuit {
 
         let mut statement = vec![
             FpVar::constant(Fq::from_le_bytes_mod_order(RELEASE_DOMAIN)),
-            FpVar::constant(Fq::from(1u64)),
+            FpVar::constant(Fq::from(2u64)),
         ];
         statement.extend(market);
         statement.extend(auction);
@@ -510,7 +510,7 @@ impl CollateralReleaseProver {
             .buy
             .iter()
             .chain(&request.sell)
-            .any(|quantity| *quantity > 15)
+            .any(|quantity| *quantity > MAX_ORDER_QUANTITY)
         {
             return Err(std::io::Error::other("invalid private order quantities").into());
         }

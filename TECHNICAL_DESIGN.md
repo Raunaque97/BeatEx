@@ -6,7 +6,7 @@
 
 **Milestone:** Working prototype on test chain
 
-**Last updated:** 2026-10-08
+**Last updated:** 2026-10-09
 
 **Companion document:** [`fbaWithSol.md`](./fbaWithSol.md)
 
@@ -53,7 +53,7 @@ The prototype does not attempt to provide:
 - A queue event is immutable. A trader may atomically replace or cancel the active order by appending a proved encrypted delta.
 - Committee members provide decryption shares to a committee proof coordinator. Shares, DLEQ transcripts, private setup material, and secret shares never go onchain.
 - A threshold of three committee members is trusted not to collude before sealing. A threshold collusion can reveal private order data but cannot move escrowed tokens without authorization from the auction program PDA.
-- Grid size is a benchmarked parameter rather than a hard-coded design claim. The first SBF account-layout benchmark tested 17, 19, 21, 25, and 33 levels. With boxed Anchor accounts and the standard 4 KiB stack frame, 17 levels builds cleanly while 19 is the first monolithic layout whose `Auction` deserializer exceeds the frame. The prototype therefore caps the grid at 17 levels; larger grids require sharded curve accounts.
+- Protocol v2 fixes `grid_radius = 8`, hence exactly 17 price levels. The first SBF account-layout benchmark tested 17, 19, 21, 25, and 33 levels. With boxed Anchor accounts and the standard 4 KiB stack frame, 17 levels builds cleanly while 19 is the first monolithic layout whose `Auction` deserializer exceeds the frame. A later protocol version may adopt a different account layout and circuit before supporting a larger grid.
 
 ---
 
@@ -206,13 +206,13 @@ The native ZK ElGamal Proof Program was evaluated next. A batched two-handle gro
 
 The native composition was benchmarked in Rust and through the official `@solana/zk-sdk` browser-WASM package. For 17 levels (34 quantities), browser proof generation took 87.3 ms median and produced 17 validity proofs plus five range proofs. With two validity proofs packed per transaction and one range proof per transaction, verification requires about 14 proof transactions before order writes. Even 65 levels generated in 334.8 ms, but needs about 52 proof transactions. Full results are in `crates/zk-elgamal-bench/RESULTS.md`.
 
-The selected design uses exponential ElGamal on Baby Jubjub, whose base field is the BN254 Groth16 field. The original order-only relation measured 172,830 constraints. The implemented independent queued-order relation additionally proves encrypted private-balance deductions and measures 234,166 constraints, a 2.196-second native proving median, and a 43.9 MB compressed proving key. Its estimated complete transaction is about 3,032 bytes and fits the 4,096-byte Solana v1 limit. See `crates/babyjubjub-groth16-spike/RESULTS.md`.
+The selected design uses exponential ElGamal on Baby Jubjub, whose base field is the BN254 Groth16 field. With the protocol's 28-bit per-level quantity bound, the order-only relation measures 179,610 constraints. The implemented independent queued-order relation additionally proves encrypted private-balance deductions and measures 241,198 constraints, a 2.198-second native proving median, and a 45.1 MB compressed proving key. Its estimated complete transaction is about 3,032 bytes and fits the 4,096-byte Solana v1 limit. See `crates/babyjubjub-groth16-spike/RESULTS.md`.
 
 Direct Baby Jubjub aggregation on Solana does not fit. With aggregate coordinates already stored as raw Montgomery limbs, 32 measured additions consume 679,757 CU and the measured slope extrapolates 68 additions to approximately 1.441M CU before Groth16 or program overhead. The actual 68-add instruction exceeds the 1.4M cap. Compressed-point recovery is the harder blocker: Arkworks costs 1,123,011 CU for one point, while a `sol_big_mod_exp`-assisted Tonelli-Shanks implementation still costs 498,909 CU for one representative point. Uncompressed input cannot avoid recovery because 68 affine points alone occupy 4,352 bytes, already beyond the v1 transaction limit. See `crates/babyjub-sbf-spike/README.md`.
 
 Standard BN254 G1 ElGamal was also tested because Solana can add and decompress G1 points natively. Its real one-ciphertext Groth16 relation requires 7,229,904 constraints due to `Fq` arithmetic emulated inside `Fr`; it is worse than Ristretto and is rejected. See `crates/bn254-g1-groth16-spike/README.md`.
 
-The selected architecture is an independent order queue plus permissionless proven folds. A trader transaction creates one immutable encrypted-order PDA, verifies the 17-level order and encrypted balance transition, and increments a lightweight `accepted_order_count`; it never reads or writes the encrypted aggregate. A bot continuously folds one to four accepted orders into the aggregate while collection is open or after sealing. The 310,870-constraint fold circuit proves all Baby Jubjub additions offchain and binds the old/new aggregate, exact queued-order ciphertext digests, auction, and count transition to one Poseidon public input. The program marks those orders `Folded` and increments `folded_order_count` only after verification. Settlement requires exact equality of the two counters after collection. If equality is not reached by the aggregation deadline, anyone can cancel the auction and unlock/refund collateral. No optimistic challenge period or sharded order transition is used.
+The selected architecture is an independent order queue plus permissionless proven folds. A trader transaction creates one immutable encrypted-order PDA, verifies the 17-level order and encrypted balance transition, and increments a lightweight `accepted_order_count`; it never reads or writes the encrypted aggregate. A bot continuously folds one to four accepted orders into the aggregate while collection is open or after sealing. The current 28-bit fold circuit measures 518,962 constraints, proves all Baby Jubjub additions offchain, and binds the old/new aggregate, exact queued-order ciphertext digests, auction, and count transition to one Poseidon public input. The program marks those orders `Folded` and increments `folded_order_count` only after verification. Settlement requires exact equality of the two counters after collection. If equality is not reached by the aggregation deadline, anyone can cancel the auction and unlock/refund collateral. No optimistic challenge period or sharded order transition is used.
 
 An October 2026 browser feasibility test found that SP1 v6.8.1's complete local prover does not compile for `wasm32-unknown-unknown`. After browser randomness was enabled, the official dependency graph failed in the native Tokio/`mio` networking and process stack; the terminal Groth16 stage also depends on Go/cgo or Docker. SP1's verifier supports WASM, but its prover does not. As a browser-native control, a direct Arkworks Groth16 arithmetic circuit completed median proofs in 28.4 ms for 3 levels and 131.5 ms for 17 levels on an Apple M4 in Chrome 152. The exact Ristretto binding then measured 5,176,032 constraints for one ciphertext and 175,564,998 for a 17-level two-sided order, ruling out setup and proving for that direct circuit. Full measurements and limitations are in `crates/browser-prover-bench/RESULTS.md`.
 
@@ -373,47 +373,91 @@ CU in SBF.
 
 ## 7. Market and price-grid model
 
-### 7.1 Lot units
+### 7.1 Integer asset units
 
-All program arithmetic uses integer lots:
+All program arithmetic uses integer units. The protocol and user interfaces use
+the term **unit**, not "lot":
 
 - asset `A` is the base asset and asset `B` is the quote asset;
-- `base_lot_size`: smallest executable base quantity;
-- `quote_lot_size`: smallest quote quantity;
-- `price_lots`: quote lots per base lot;
-- `buy[i]` and `sell[i]`: quantities of base asset `A`, expressed in base
-  lots. `buy[i]` is not an amount of quote asset `B`.
+- `base_unit_size`: number of base-token atoms in one executable quantity unit;
+- `quote_unit_size`: number of quote-token atoms in one accounting unit;
+- `price`: quote units paid for one base unit;
+- `buy[i]` and `sell[i]`: quantities of base asset `A`, expressed as counts of
+  base units. `buy[i]` is not an amount of quote asset `B`.
+
+The tBTC/tUSD v2 market fixes:
+
+```text
+base token decimals  = 8
+base_unit_size       = 100 atoms = 100 satoshis = 0.000001 tBTC
+quote token decimals = 6
+quote_unit_size      = 1 atom = 0.000001 tUSD
+```
+
+Consequently, the integer protocol price is numerically the tUSD price of one
+tBTC: at 85,500 tUSD/tBTC, one 100-satoshi base unit is worth 85,500
+micro-tUSD quote units, so `price = 85_500`. The minimum non-zero order quantity
+is one base unit, or 100 satoshis. SDKs and applications convert human-readable
+token amounts to these exact integer units and reject fractional-unit input;
+traders should not have to perform this conversion manually.
 
 Intermediate multiplication uses checked `u128` arithmetic:
 
 ```text
-quote_liability = price_lots * base_quantity_lots
+quote_liability_units = price * base_quantity_units
+base_collateral_atoms = base_quantity_units * base_unit_size
+quote_collateral_atoms = quote_liability_units * quote_unit_size
 ```
 
 Configuration must ensure that individual confidential transfers remain within Token-2022's supported confidential-transfer amount range and that aggregate recovery stays within the configured discrete-log bound.
 
-### 7.2 Odd-sized grid
+### 7.2 Fixed 17-level linear-bps grid
 
-Every auction has:
-
-```text
-N = 2*k + 1
-```
-
-price levels. Index `k` is the reference price, normally the previous auction's clearing price. There are `k` ticks below and `k` ticks above it.
+Protocol v2 fixes `grid_radius = 8`, `grid_size = 17`, and defaults
+`grid_step_bps = 10`. Index 8 is the reference price. The other levels are
+linear basis-point offsets from that same reference, not recursively compounded
+percentages:
 
 ```text
-price(i) = reference_price + (i - k) * tick_size
+offset(i)     = i - 8                              // -8 through +8
+multiplier(i) = 10_000 + offset(i) * grid_step_bps
+price(i)      = floor(
+                  (reference_price * multiplier(i) + 5_000) / 10_000
+                )
 ```
 
-All grid parameters are fixed before the auction opens and included in proof domains.
+The `+ 5_000` rule rounds to the nearest integer quote unit, with an exact half
+rounded upward. Every multiply and add uses checked `u128` arithmetic before the
+result is range-checked and converted to the stored integer type. Auction
+initialization rejects a non-positive multiplier, overflow, an out-of-bounds
+level, or any rounded grid that is not strictly increasing. This last check
+prevents low-price configurations from creating duplicate levels.
+
+At the default 10-bps step the offsets are `-80, -70, ... 0, ... +70, +80`
+bps, a total band of approximately `reference_price ± 0.8%`. For a reference
+of 85,500, the exact integer grid is:
+
+```text
+84,816  84,902  84,987  85,073  85,158  85,244  85,329  85,415  85,500
+85,586  85,671  85,757  85,842  85,928  86,013  86,099  86,184
+```
+
+`grid_step_bps` is immutable market configuration. `initialize_auction`
+computes the exact array once and stores it in the Auction account. The Auction
+account is the authoritative grid for orders, proofs, market makers, SDKs, and
+the clearing program; clients must read it and must not reconstruct a live grid
+from command-line values or a separately fetched oracle price. The stored grid
+and its construction parameters are included in proof domains.
 
 For the first auction, `reference_price` is normalized from the configured Pyth
-feed because the previous clearing volume is zero.
+feed because the previous clearing volume is zero. With 8-decimal tBTC,
+6-decimal tUSD, a 100-atom base unit, and a one-atom quote unit, the tBTC/tUSD
+oracle exponent adjustment is `0`; the normalized integer reference price is
+approximately the displayed tUSD/tBTC price.
 
 ### 7.3 Out-of-grid markets
 
-An auction cannot clear outside its grid. If executable liquidity is concentrated at an edge, the result is still deterministic. The first-version reference policy uses the previous clearing price when the previous clearing volume meets the configured minimum and otherwise uses a fresh Pyth BTC/USD price; the first auction therefore uses Pyth because its previous volume is zero. Oracle-relative circuit breakers remain a later hardening item.
+An auction cannot clear outside its grid. If executable liquidity is concentrated at an edge, the result is still deterministic. The version-2 reference policy uses the previous clearing price when the previous clearing volume meets the configured minimum and otherwise uses a fresh Pyth BTC/USD price; the first auction therefore uses Pyth because its previous volume is zero. Oracle-relative circuit breakers remain a later hardening item.
 
 ---
 
@@ -438,7 +482,7 @@ it may contribute to at most one side.
 
 ### 8.2 Private validity constraints
 
-For every tick `i`, the submission proof enforces:
+For every price level `i`, the submission proof enforces:
 
 ```text
 buy_i >= 0
@@ -451,7 +495,10 @@ Because exactly one clearing index is selected, per-level exclusivity prevents
 a single order from buying and selling at the realized clearing price. It does
 not prevent coordinated wash trading through separate orders or identities.
 
-Every value must be within market-configured per-level and per-order bounds.
+Every order quantity is range-constrained to 28 bits, so the protocol-level
+ceiling is `2^28 - 1` base units per entry. A market must configure a lower
+`max_order_quantity` when its collateral, aggregate-recovery, or risk bounds
+require it. For tBTC/tUSD, each quantity unit is 100 satoshis.
 
 ### 8.3 Collateral requirements
 
@@ -463,7 +510,7 @@ required_quote_collateral = max_i(price_i * buy_i)
 ```
 
 Here base collateral is asset `A`, quote collateral is asset `B`, and every
-`buy_i` and `sell_i` is denominated in base-asset `A` lots. Only one clearing
+`buy_i` and `sell_i` is denominated in base-asset `A` units. Only one clearing
 price is selected, so liabilities are maxima across possible outcomes, not sums
 across all grid points.
 
@@ -572,7 +619,7 @@ aggregate is immutable without another stored phase.
 
 The selected lifecycle is temporal rather than a sequence of manually cranked
 phase labels. The market authority configures the base mint, quote mint, oracle,
-lot/tick grid, schedule, proof versions, committee epoch policy, and safety
+integer asset units, linear-bps grid, schedule, proof versions, committee epoch policy, and safety
 bounds once when starting the market. It does not open or seal each auction.
 
 For market start slot `S`, collection interval `I`, and current slot `s`, the
@@ -654,28 +701,38 @@ The clearing price maximizes executable volume. Ties are resolved by:
 1. selecting the price closest to the previous clearing price;
 2. if two prices are equally distant, selecting the lower price.
 
-Because the grid is centered on the previous clearing price, this is implemented by scanning:
-
-```text
-k, k-1, k+1, k-2, k+2, ... 0, 2k
-```
-
-The program updates the winner only when a strictly greater volume is found. The first occurrence of an equal maximum therefore wins, implementing both tie-breakers.
+The program computes each candidate's checked grid price, executable volume, and
+absolute distance from the tie-break price, then keeps the greatest volume;
+equal-volume candidates are compared by distance and finally by price. The
+first auction uses its reference price as the tie-break because no previous
+clearing exists. Later auctions always use the previous clearing price, even
+when the new reference came from the oracle fallback. A zigzag traversal around
+the center remains available as an allocation-free helper for symmetric grids,
+but is not used as a substitute for the price-distance comparison when the
+oracle reference differs from the previous clearing price.
 
 Pseudocode:
 
 ```text
-best_index  = k
-best_volume = min(D[k], S[k])
+best_index = 0
+best_volume = 0
+best_distance = MAX_U64
 
-for index in zigzag_indices(k):
+for index in 0..2k:
+    price = grid.price_at(index)
     volume = min(D[index], S[index])
-    if volume > best_volume:
+    distance = abs(price - tie_break_price)
+    if volume > best_volume or (volume == best_volume and
+       (distance < best_distance or
+        (distance == best_distance and price < grid.price_at(best_index)))):
         best_index  = index
         best_volume = volume
+        best_distance = distance
 ```
 
-If every price has zero executable volume, the center/reference price remains the clearing price and clearing volume is zero.
+If every price has zero executable volume, the closest grid price to the
+tie-break price is selected (the first auction therefore normally selects the
+center/reference price) and clearing volume is zero.
 
 All arithmetic is checked. A malformed plaintext curve, out-of-range aggregate, or overflow aborts finalization.
 
@@ -683,7 +740,7 @@ All arithmetic is checked. A malformed plaintext curve, out-of-range aggregate, 
 
 ## 12. Allocation and rounding
 
-Allocation rule v1 is frozen as exact-index pro-rata. `buy[i]` is always the
+Allocation rule v2 is frozen as exact-index pro-rata. `buy[i]` is always the
 amount of base token requested at price `P[i]`; its quote liability is
 `buy[i] * P[i]`. Only `buy[c]` and `sell[c]` at the clearing index `c`
 participate. There is no cumulative price-priority curve.
@@ -701,8 +758,12 @@ demand, aggregate supply, and price at `c`:
 Every division is constrained by quotient, remainder, denominator, and a
 strict remainder bound. Rounding is deliberately adverse to the long side, so
 integer dust remains in the shared market vault and can never make it
-insolvent. The prototype fixes both lot sizes to one token unit and constrains
-each private payout to Token-2022's 48-bit confidential-transfer range.
+insolvent. For tBTC/tUSD, every base quantity is a count of 100-satoshi units
+and every quote quantity is a count of one-micro-tUSD units. Base payouts and
+reserves multiply the private base-unit count by 100 token atoms; quote payouts
+and reserves multiply the private quote-unit count by one token atom. Each
+private payout remains constrained to Token-2022's 48-bit
+confidential-transfer range.
 
 ---
 
@@ -839,10 +900,10 @@ quote_mint
 base_vault
 quote_vault
 vault_authority_bump
-base_lot_size
-quote_lot_size
-tick_size
-grid_radius_k
+base_unit_size
+quote_unit_size
+grid_radius                  // fixed to 8 in protocol v2
+grid_step_bps                // 10 by default; immutable per market
 max_order_quantity
 max_aggregate_quantity
 current_key_epoch
@@ -858,11 +919,15 @@ min_reference_price
 max_reference_price
 market_start_slot
 timing configuration
-allocation_rule_version
-order_circuit_version
-claim_circuit_version
+allocation_rule_version       // 2
+order_circuit_version          // 2
+claim_circuit_version          // 2
 paused flag
 ```
+
+Protocol version 2 also governs order replacement/cancellation and atomic
+rollover statements. A version-1 proof, verifier key, account, or cached private
+opening is not valid against these unit and grid semantics.
 
 Suggested seeds:
 
@@ -905,8 +970,10 @@ submission_end_slot
 aggregation_deadline_slot
 decryption_deadline_slot
 reference_price
-tick_size
-grid_size
+grid_radius                  // 8
+grid_step_bps
+grid_size                    // 17
+price_levels[17]             // authoritative, rounded integer grid
 decrypted demand vector
 decrypted supply vector
 clearing_index
@@ -984,7 +1051,10 @@ Suggested seeds:
 
 - records the Token-2022 mint/vault addresses and creates market state plus the vault-authority PDA configuration;
 - defers full mint, account, confidential-extension, and epoch-key validation to deposit, apply-pending, and settlement handlers, where every token CPI is checked against the active market state;
-- stores lot, grid, timing, and bound parameters.
+- stores integer-unit, linear-bps-grid, timing, and bound parameters;
+- for tBTC/tUSD, requires a 100-satoshi base unit and one-micro-tUSD quote unit;
+- fixes `grid_radius = 8` for protocol v2 and stores immutable
+  `grid_step_bps` (10 by default).
 
 `initialize_key_epoch`
 
@@ -1009,7 +1079,9 @@ Suggested seeds:
 
 - is permissionless and accepts only the current slot-derived auction ID;
 - atomically creates the auction, accepted-event counter, and encrypted aggregate accumulator, initializing all 34 aggregate ciphertexts to the canonical Baby Jubjub identity;
-- fixes the derived submission, aggregation and publication deadlines, grid, key epoch, and proof versions;
+- fixes the derived submission, aggregation and publication deadlines, exact 17
+  rounded price levels, key epoch, and proof versions. It rejects arithmetic
+  overflow or a duplicate/non-increasing rounded level;
 - uses the immediately preceding auction's clearing price when it is settled and its volume meets `minimum_reference_volume`; otherwise it validates and normalizes a fresh Pyth price, including for auction zero.
 
 `cancel_pending_auction`
@@ -1053,7 +1125,10 @@ Suggested seeds:
 - accepts the 17-level plaintext demand/supply vectors, three sorted participant IDs, and one aggregate-publication Groth16 proof;
 - binds the selected registered public shares and proves three private Baby Jubjub share relations plus the batched threshold-decryption equation;
 - is permissionless to relay even though producing the witness requires the committee;
-- writes the public aggregate curves, runs deterministic max-volume and zigzag tie-breaking, stores the clearing result, updates the market's last clearing price and volume, and changes `Pending` to `Settled` atomically.
+- writes the public aggregate curves, runs deterministic max-volume and
+  previous-clearing-price tie-breaking, stores the clearing result, updates the
+  market's last clearing price and volume, and changes `Pending` to `Settled`
+  atomically.
 
 The existing `finalize_decrypted_entry` / `finalize_decryption` Ristretto instructions are retained only for the earlier threshold feasibility harness. They are not the selected Baby Jubjub queue path.
 
@@ -1174,10 +1249,12 @@ The implementation and tests must preserve these invariants:
 
 ### 19.1 Pure Rust tests
 
-- price-grid construction and zigzag order for multiple `k` values;
+- exact 17-level linear-bps construction, half-up rounding, strict ordering,
+  and zigzag traversal around index 8;
 - maximum-volume clearing and all tie cases;
 - zero-volume auctions;
-- lot and price overflow boundaries;
+- base/quote-unit conversion, price rounding, duplicate-level rejection, and
+  checked `u128` overflow boundaries;
 - arbitrary contingent order schedules and per-level side-exclusivity constraints;
 - collateral maximum calculations;
 - twisted ElGamal add/subtract/multiply round trips;
@@ -1239,7 +1316,8 @@ For grid sizes `N = 5, 9, 17, 33`, record:
 - clearing CU;
 - Token-2022 proof-generation and end-to-end settlement latency.
 
-The supported Devnet grid is selected from measured results.
+Protocol v2's 17-level grid was selected from these measured results. The grid
+width comes from immutable `grid_step_bps`, not an absolute price increment.
 
 ### 19.5 Current SBF measurements
 
@@ -1304,7 +1382,7 @@ Checkpoint: complete in pure Rust and LiteSVM SBF tests.
 - exact accepted/folded completeness gate and aggregation timeout;
 - v1 transaction-size and SBF CU benchmarks.
 
-Checkpoint: the Anchor state machine, onchain Poseidon statement reconstruction, authority-installed versioned verification keys, 234,166-constraint order circuit, and 310,870-constraint fold circuit are implemented. Exact host transcript tests and full LiteSVM instruction execution pass on the default 4 KiB SBF stack. Against the production SBF artifact, a real 17-level order submission consumes 514,651 CU, a replacement-aware three-order fold consumes 614,480 CU, and active-order cancellation consumes 419,817 CU with a 256 KiB heap request.
+Checkpoint: the Anchor state machine, onchain Poseidon statement reconstruction, authority-installed versioned verification keys, 241,198-constraint order circuit, and 518,962-constraint four-order fold circuit are implemented. Exact host transcript tests and full LiteSVM instruction execution pass on the default 4 KiB SBF stack. Against the production SBF artifact, a real 17-level order submission consumes 514,651 CU, a replacement-aware three-order fold consumes 614,480 CU, and active-order cancellation consumes 419,817 CU with a 256 KiB heap request.
 
 ### Phase 3: committee decryption
 
@@ -1416,7 +1494,7 @@ The Devnet run should also include negative tests: corrupted publication proof, 
 
 ## 22. Known risks and unresolved decisions
 
-### 22.1 Frozen in claim circuit v1
+### 22.1 Frozen in claim circuit v2
 
 - Exact-index pro-rata allocation with adverse long-side rounding.
 - Rounding residuals remain in the shared market vault.

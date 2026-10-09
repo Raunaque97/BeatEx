@@ -3,20 +3,24 @@ use std::{
     error::Error,
     io::Write,
     process::{Command, Stdio},
+    str::FromStr,
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use {
-    anchor_lang::AccountDeserialize,
+    anchor_lang::{prelude::Pubkey, AccountDeserialize},
     base64::{engine::general_purpose::STANDARD as BASE64, Engine},
     pyth_solana_receiver_sdk::price_update::PriceUpdateV2,
     serde::{Deserialize, Serialize},
 };
 
 const LEVELS: usize = 17;
-const PYTH_BTC_USD_FEED: &str = "e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43";
-const PYTH_DEVNET_BTC_USD_ACCOUNT: &str = "4cSM2e6rvbGQUFiJbqytoVMi5GgghSMr8LwVrT9VPSPo";
-const DEVNET_RPC_URL: &str = "https://api.devnet.solana.com";
+const BPS_DENOMINATOR: u128 = 10_000;
+const BASE_TOKEN_DECIMALS: u32 = 8;
+const EXPECTED_BASE_UNIT_SIZE: u64 = 100;
+const EXPECTED_QUOTE_UNIT_SIZE: u64 = 1;
+const CIRCUIT_QUANTITY_MAX: u64 = (1 << 28) - 1;
+const DEFAULT_RPC_URL: &str = "https://api.devnet.solana.com";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PriceSource {
@@ -27,12 +31,11 @@ enum PriceSource {
 #[derive(Debug)]
 struct Config {
     source: PriceSource,
-    reference_price: u64,
-    tick_size: u64,
-    oracle_exponent_adjustment: i8,
-    base_quantity: u64,
-    slope_quantity: u64,
-    max_quantity: u64,
+    rpc_url: String,
+    market: Pubkey,
+    base_quantity: String,
+    slope_quantity: String,
+    max_quantity: String,
     interval: Duration,
     executor: Option<String>,
     once: bool,
@@ -42,9 +45,12 @@ struct Config {
 struct OrderIntent {
     source: &'static str,
     observed_price: String,
-    expected_price_lots: u64,
+    expected_price: u64,
     reference_price: u64,
-    tick_size: u64,
+    grid_step_bps: u16,
+    grid_size: u8,
+    base_unit_size: u64,
+    quote_unit_size: u64,
     client_order_nonce: u64,
     buy: [u64; LEVELS],
     sell: [u64; LEVELS],
@@ -56,12 +62,12 @@ struct BinanceTicker {
 }
 
 #[derive(Deserialize)]
-struct RpcResponse {
-    result: RpcResult,
+struct RpcResponse<T> {
+    result: T,
 }
 
 #[derive(Deserialize)]
-struct RpcResult {
+struct RpcAccountResult {
     value: Option<RpcAccount>,
 }
 
@@ -72,12 +78,13 @@ struct RpcAccount {
 
 fn usage() {
     eprintln!(
-        "Usage: beatex-market-maker --source pyth|binance --reference-price N --tick-size N \
-         [--oracle-exponent-adjustment N] [--base-quantity N] [--slope-quantity N] \
-         [--max-quantity N] [--interval-seconds N] [--executor COMMAND] [--once]\n\n\
-         The executor receives one JSON order intent on stdin and must exit successfully only \
-         after the corresponding submit/replace/rollover transaction is confirmed. Without an \
-         executor, intents are printed as JSON lines."
+        "Usage: beatex-market-maker --source pyth|binance --market ADDRESS \
+         [--rpc-url URL] [--base-quantity TBTC] [--slope-quantity TBTC] \
+         [--max-quantity TBTC] [--interval-seconds N] [--executor COMMAND] [--once]\n\n\
+         Quantities are human tBTC decimal strings. The bot reads the current Market and \
+         Auction before every order and uses the auction's reference price, basis-point \
+         grid step, and grid size. The executor receives JSON on stdin and must return only \
+         after the submit, replace, or rollover transaction is confirmed."
     );
 }
 
@@ -108,20 +115,13 @@ fn parse_config() -> Result<Config, Box<dyn Error>> {
     };
     Ok(Config {
         source,
-        reference_price: value("--reference-price")?.parse()?,
-        tick_size: value("--tick-size")?.parse()?,
-        oracle_exponent_adjustment: optional("--oracle-exponent-adjustment")
-            .unwrap_or_else(|| "-2".to_owned())
-            .parse()?,
-        base_quantity: optional("--base-quantity")
-            .unwrap_or_else(|| "1".to_owned())
-            .parse()?,
-        slope_quantity: optional("--slope-quantity")
-            .unwrap_or_else(|| "1".to_owned())
-            .parse()?,
-        max_quantity: optional("--max-quantity")
-            .unwrap_or_else(|| "15".to_owned())
-            .parse()?,
+        rpc_url: optional("--rpc-url")
+            .or_else(|| env::var("BEATEX_RPC_URL").ok())
+            .unwrap_or_else(|| DEFAULT_RPC_URL.to_owned()),
+        market: Pubkey::from_str(&value("--market")?)?,
+        base_quantity: optional("--base-quantity").unwrap_or_else(|| "0.0001".to_owned()),
+        slope_quantity: optional("--slope-quantity").unwrap_or_else(|| "0.0001".to_owned()),
+        max_quantity: optional("--max-quantity").unwrap_or_else(|| "0.001".to_owned()),
         interval: Duration::from_secs(
             optional("--interval-seconds")
                 .unwrap_or_else(|| "10".to_owned())
@@ -149,12 +149,16 @@ fn fetch_json(url: &str) -> Result<Vec<u8>, Box<dyn Error>> {
     Ok(output.stdout)
 }
 
-fn fetch_pyth_account() -> Result<PriceUpdateV2, Box<dyn Error>> {
+fn rpc_request<T: for<'de> Deserialize<'de>>(
+    rpc_url: &str,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<T, Box<dyn Error>> {
     let request = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
-        "method": "getAccountInfo",
-        "params": [PYTH_DEVNET_BTC_USD_ACCOUNT, {"encoding": "base64"}],
+        "method": method,
+        "params": params,
     })
     .to_string();
     let output = Command::new("curl")
@@ -168,19 +172,95 @@ fn fetch_pyth_account() -> Result<PriceUpdateV2, Box<dyn Error>> {
             "Content-Type: application/json",
             "--data",
             &request,
-            DEVNET_RPC_URL,
+            rpc_url,
         ])
         .output()?;
     if !output.status.success() {
         return Err(format!("Solana RPC request failed with {}", output.status).into());
     }
-    let response: RpcResponse = serde_json::from_slice(&output.stdout)?;
-    let account = response.result.value.ok_or("Pyth account does not exist")?;
+    Ok(serde_json::from_slice::<RpcResponse<T>>(&output.stdout)?.result)
+}
+
+fn fetch_account_bytes(rpc_url: &str, address: &Pubkey) -> Result<Option<Vec<u8>>, Box<dyn Error>> {
+    let result: RpcAccountResult = rpc_request(
+        rpc_url,
+        "getAccountInfo",
+        serde_json::json!([address.to_string(), {"encoding": "base64"}]),
+    )?;
+    let Some(account) = result.value else {
+        return Ok(None);
+    };
     if account.data.1 != "base64" {
         return Err(format!("unexpected Solana account encoding {}", account.data.1).into());
     }
-    let bytes = BASE64.decode(account.data.0)?;
-    PriceUpdateV2::try_deserialize(&mut bytes.as_slice()).map_err(Into::into)
+    Ok(Some(BASE64.decode(account.data.0)?))
+}
+
+fn fetch_anchor_account<T: AccountDeserialize>(
+    rpc_url: &str,
+    address: &Pubkey,
+) -> Result<Option<T>, Box<dyn Error>> {
+    fetch_account_bytes(rpc_url, address)?
+        .map(|bytes| T::try_deserialize(&mut bytes.as_slice()).map_err(Into::into))
+        .transpose()
+}
+
+fn prepare_current_auction(executor: Option<&str>) -> Result<(), Box<dyn Error>> {
+    let Some(executor) = executor else {
+        return Ok(());
+    };
+    let status = Command::new(executor)
+        .env("BEATEX_MARKET_MAKER_ACTION", "initialize-auction")
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()?;
+    if !status.success() {
+        return Err(format!("auction initializer failed with {status}").into());
+    }
+    Ok(())
+}
+
+fn current_grid(config: &Config) -> Result<(beatex::Market, beatex::Auction), Box<dyn Error>> {
+    let market = fetch_anchor_account::<beatex::Market>(&config.rpc_url, &config.market)?
+        .ok_or("market account does not exist")?;
+    if market.base_unit_size != EXPECTED_BASE_UNIT_SIZE
+        || market.quote_unit_size != EXPECTED_QUOTE_UNIT_SIZE
+    {
+        return Err(format!(
+            "unsupported token unit sizes: expected base={} and quote={}, found base={} and quote={}",
+            EXPECTED_BASE_UNIT_SIZE,
+            EXPECTED_QUOTE_UNIT_SIZE,
+            market.base_unit_size,
+            market.quote_unit_size
+        )
+        .into());
+    }
+    let slot: u64 = rpc_request(&config.rpc_url, "getSlot", serde_json::json!([]))?;
+    if slot < market.market_start_slot {
+        return Err("market has not reached its start slot".into());
+    }
+    let auction_id = (slot - market.market_start_slot) / market.submission_duration_slots;
+    let (auction_address, _) = Pubkey::find_program_address(
+        &[
+            b"auction",
+            config.market.as_ref(),
+            &auction_id.to_le_bytes(),
+        ],
+        &beatex::ID,
+    );
+    let auction = fetch_anchor_account::<beatex::Auction>(&config.rpc_url, &auction_address)?
+        .ok_or("current auction is not initialized")?;
+    if auction.market != config.market || auction.auction_id != auction_id {
+        return Err("current auction account does not match the market schedule".into());
+    }
+    if usize::from(auction.grid_size) > LEVELS
+        || auction.grid_size == 0
+        || auction.grid_size % 2 == 0
+    {
+        return Err("current auction has an unsupported grid size".into());
+    }
+    Ok((market, auction))
 }
 
 fn checked_pow10(exponent: u32) -> Result<u128, Box<dyn Error>> {
@@ -189,24 +269,10 @@ fn checked_pow10(exponent: u32) -> Result<u128, Box<dyn Error>> {
         .ok_or_else(|| "decimal exponent is too large".into())
 }
 
-fn round_to_tick(value: u128, tick_size: u64) -> Result<u64, Box<dyn Error>> {
-    if tick_size == 0 {
-        return Err("tick size must be positive".into());
-    }
-    let tick = u128::from(tick_size);
-    let rounded = value
-        .checked_add(tick / 2)
-        .and_then(|value| value.checked_div(tick))
-        .and_then(|ticks| ticks.checked_mul(tick))
-        .ok_or("price rounding overflow")?;
-    Ok(u64::try_from(rounded)?)
-}
-
 fn scaled_integer_price(
     digits: u128,
     exponent: i32,
     exponent_adjustment: i8,
-    tick_size: u64,
 ) -> Result<u64, Box<dyn Error>> {
     let exponent = exponent
         .checked_add(i32::from(exponent_adjustment))
@@ -218,36 +284,59 @@ fn scaled_integer_price(
     } else {
         digits.checked_add(scale / 2).ok_or("price overflow")? / scale
     };
-    round_to_tick(value, tick_size)
+    Ok(u64::try_from(value)?)
 }
 
 fn decimal_parts(value: &str) -> Result<(u128, i32), Box<dyn Error>> {
     let (whole, fractional) = value.split_once('.').unwrap_or((value, ""));
-    if whole.starts_with('-') || !whole.chars().all(|c| c.is_ascii_digit()) {
-        return Err("price must be a positive decimal".into());
-    }
-    if !fractional.chars().all(|c| c.is_ascii_digit()) {
+    if whole.starts_with('-')
+        || whole.is_empty()
+        || !whole.chars().all(|character| character.is_ascii_digit())
+        || !fractional
+            .chars()
+            .all(|character| character.is_ascii_digit())
+    {
         return Err("price must be a positive decimal".into());
     }
     let digits = format!("{whole}{fractional}").parse::<u128>()?;
     Ok((digits, -(i32::try_from(fractional.len())?)))
 }
 
-fn expected_price(config: &Config) -> Result<(u64, String), Box<dyn Error>> {
+fn decimal_token_units(value: &str, decimals: u32, unit_size: u64) -> Result<u64, Box<dyn Error>> {
+    let (digits, exponent) = decimal_parts(value)?;
+    let effective_exponent = exponent
+        .checked_add(i32::try_from(decimals)?)
+        .ok_or("quantity exponent overflow")?;
+    if effective_exponent < 0 {
+        return Err("quantity has too many decimal places".into());
+    }
+    let atoms = digits
+        .checked_mul(checked_pow10(effective_exponent as u32)?)
+        .ok_or("quantity overflow")?;
+    if atoms % u128::from(unit_size) != 0 {
+        return Err("quantity is not an exact multiple of the base unit size".into());
+    }
+    Ok(u64::try_from(atoms / u128::from(unit_size))?)
+}
+
+fn expected_price(
+    config: &Config,
+    market: &beatex::Market,
+) -> Result<(u64, String), Box<dyn Error>> {
     match config.source {
         PriceSource::Pyth => {
-            let update = fetch_pyth_account()?;
+            let bytes = fetch_account_bytes(&config.rpc_url, &market.oracle_price_account)?
+                .ok_or("configured Pyth account does not exist")?;
+            let update = PriceUpdateV2::try_deserialize(&mut bytes.as_slice())?;
             let price = update.price_message;
-            let expected_feed = hex_to_32(PYTH_BTC_USD_FEED)?;
-            if price.feed_id != expected_feed || price.price <= 0 {
+            if price.feed_id != market.oracle_feed_id || price.price <= 0 {
                 return Err("Pyth account contains the wrong feed or a non-positive price".into());
             }
             Ok((
                 scaled_integer_price(
                     u128::from(price.price as u64),
                     price.exponent,
-                    config.oracle_exponent_adjustment,
-                    config.tick_size,
+                    market.oracle_exponent_adjustment,
                 )?,
                 format!("{}e{}@{}", price.price, price.exponent, price.publish_time),
             ))
@@ -258,57 +347,74 @@ fn expected_price(config: &Config) -> Result<(u64, String), Box<dyn Error>> {
             )?)?;
             let (digits, exponent) = decimal_parts(&response.price)?;
             Ok((
-                scaled_integer_price(
-                    digits,
-                    exponent,
-                    config.oracle_exponent_adjustment,
-                    config.tick_size,
-                )?,
+                scaled_integer_price(digits, exponent, market.oracle_exponent_adjustment)?,
                 response.price,
             ))
         }
     }
 }
 
-fn hex_to_32(value: &str) -> Result<[u8; 32], Box<dyn Error>> {
-    if value.len() != 64 {
-        return Err("feed id must contain 64 hex digits".into());
+fn grid_prices(auction: &beatex::Auction) -> Result<[u64; LEVELS], Box<dyn Error>> {
+    let mut prices = [0u64; LEVELS];
+    let center = i64::from(auction.grid_size / 2);
+    let mut previous = None;
+    for (index, price) in prices
+        .iter_mut()
+        .enumerate()
+        .take(usize::from(auction.grid_size))
+    {
+        let offset = i64::try_from(index)? - center;
+        let multiplier = i64::try_from(BPS_DENOMINATOR)?
+            .checked_add(
+                offset
+                    .checked_mul(i64::from(auction.grid_step_bps))
+                    .ok_or("grid multiplier overflow")?,
+            )
+            .ok_or("grid multiplier overflow")?;
+        if multiplier <= 0 {
+            return Err("grid contains a non-positive multiplier".into());
+        }
+        let numerator = u128::from(auction.reference_price)
+            .checked_mul(multiplier as u128)
+            .and_then(|value| value.checked_add(BPS_DENOMINATOR / 2))
+            .ok_or("grid price overflow")?;
+        *price = u64::try_from(numerator / BPS_DENOMINATOR)?;
+        if previous.is_some_and(|previous| *price <= previous) {
+            return Err("grid contains duplicate or unordered integer prices".into());
+        }
+        previous = Some(*price);
     }
-    let mut bytes = [0u8; 32];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
-        bytes[index] = u8::from_str_radix(std::str::from_utf8(pair)?, 16)?;
-    }
-    Ok(bytes)
+    Ok(prices)
 }
 
 fn v_shape(
-    config: &Config,
+    auction: &beatex::Auction,
     expected: u64,
+    base_quantity: u64,
+    slope_quantity: u64,
+    max_quantity: u64,
 ) -> Result<([u64; LEVELS], [u64; LEVELS]), Box<dyn Error>> {
-    let radius = (LEVELS / 2) as u64;
-    let lower = config
-        .reference_price
-        .checked_sub(
-            radius
-                .checked_mul(config.tick_size)
-                .ok_or("grid overflow")?,
-        )
-        .ok_or("grid underflow")?;
+    let prices = grid_prices(auction)?;
+    let denominator = u128::from(auction.reference_price)
+        .checked_mul(u128::from(auction.grid_step_bps))
+        .ok_or("distance overflow")?;
+    if denominator == 0 {
+        return Err("grid distance denominator is zero".into());
+    }
     let mut buy = [0u64; LEVELS];
     let mut sell = [0u64; LEVELS];
-    for index in 0..LEVELS {
-        let price = lower
-            .checked_add(
-                (index as u64)
-                    .checked_mul(config.tick_size)
-                    .ok_or("grid overflow")?,
-            )
-            .ok_or("grid overflow")?;
-        let distance = price.abs_diff(expected) / config.tick_size;
-        let quantity = config
-            .base_quantity
-            .saturating_add(config.slope_quantity.saturating_mul(distance))
-            .min(config.max_quantity);
+    for index in 0..usize::from(auction.grid_size) {
+        let price = prices[index];
+        let distance = u64::try_from(
+            u128::from(price.abs_diff(expected))
+                .checked_mul(BPS_DENOMINATOR)
+                .and_then(|value| value.checked_add(denominator / 2))
+                .ok_or("distance overflow")?
+                / denominator,
+        )?;
+        let quantity = base_quantity
+            .saturating_add(slope_quantity.saturating_mul(distance))
+            .min(max_quantity);
         if price < expected {
             buy[index] = quantity;
         } else if price > expected {
@@ -322,6 +428,7 @@ fn dispatch(intent: &OrderIntent, executor: Option<&str>) -> Result<(), Box<dyn 
     let encoded = serde_json::to_vec(intent)?;
     if let Some(executor) = executor {
         let mut child = Command::new(executor)
+            .env("BEATEX_MARKET_MAKER_ACTION", "order")
             .stdin(Stdio::piped())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -343,12 +450,39 @@ fn dispatch(intent: &OrderIntent, executor: Option<&str>) -> Result<(), Box<dyn 
 
 fn run() -> Result<(), Box<dyn Error>> {
     let config = parse_config()?;
-    if config.base_quantity > config.max_quantity || config.max_quantity > 15 {
-        return Err("quantities must satisfy base <= max <= 15".into());
-    }
     loop {
-        let (expected, observed) = expected_price(&config)?;
-        let (buy, sell) = v_shape(&config, expected)?;
+        prepare_current_auction(config.executor.as_deref())?;
+        let (market, auction) = current_grid(&config)?;
+        let base_quantity = decimal_token_units(
+            &config.base_quantity,
+            BASE_TOKEN_DECIMALS,
+            market.base_unit_size,
+        )?;
+        let slope_quantity = decimal_token_units(
+            &config.slope_quantity,
+            BASE_TOKEN_DECIMALS,
+            market.base_unit_size,
+        )?;
+        let max_quantity = decimal_token_units(
+            &config.max_quantity,
+            BASE_TOKEN_DECIMALS,
+            market.base_unit_size,
+        )?;
+        let configured_max = market.max_order_quantity.min(CIRCUIT_QUANTITY_MAX);
+        if base_quantity > max_quantity || max_quantity > configured_max {
+            return Err(format!(
+                "quantities must satisfy base <= max <= {configured_max} base units"
+            )
+            .into());
+        }
+        let (expected, observed) = expected_price(&config, &market)?;
+        let (buy, sell) = v_shape(
+            &auction,
+            expected,
+            base_quantity,
+            slope_quantity,
+            max_quantity,
+        )?;
         let nonce = u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())?;
         let intent = OrderIntent {
             source: match config.source {
@@ -356,9 +490,12 @@ fn run() -> Result<(), Box<dyn Error>> {
                 PriceSource::Binance => "binance",
             },
             observed_price: observed,
-            expected_price_lots: expected,
-            reference_price: config.reference_price,
-            tick_size: config.tick_size,
+            expected_price: expected,
+            reference_price: auction.reference_price,
+            grid_step_bps: auction.grid_step_bps,
+            grid_size: auction.grid_size,
+            base_unit_size: market.base_unit_size,
+            quote_unit_size: market.quote_unit_size,
             client_order_nonce: nonce,
             buy,
             sell,
@@ -382,24 +519,44 @@ fn main() {
 mod tests {
     use super::*;
 
-    fn config() -> Config {
-        Config {
-            source: PriceSource::Pyth,
-            reference_price: 100,
-            tick_size: 5,
-            oracle_exponent_adjustment: 0,
-            base_quantity: 1,
-            slope_quantity: 2,
-            max_quantity: 15,
-            interval: Duration::from_secs(1),
-            executor: None,
-            once: true,
+    fn auction(reference_price: u64, grid_step_bps: u16) -> beatex::Auction {
+        beatex::Auction {
+            version: beatex::state::PROTOCOL_VERSION,
+            market: Pubkey::new_unique(),
+            auction_id: 0,
+            key_epoch: Pubkey::new_unique(),
+            state: beatex::AuctionState::Pending,
+            open_slot: 0,
+            submission_end_slot: 1,
+            aggregation_deadline_slot: 2,
+            decryption_deadline_slot: 3,
+            reference_price,
+            reference_from_oracle: true,
+            oracle_publish_time: 0,
+            grid_step_bps,
+            grid_size: 17,
+            allocation_rule_version: 2,
+            order_circuit_version: 2,
+            claim_circuit_version: 2,
+            finalized_order_count: 0,
+            aggregate_buy: [[0; 64]; LEVELS],
+            aggregate_sell: [[0; 64]; LEVELS],
+            decrypted_demand: [0; LEVELS],
+            decrypted_supply: [0; LEVELS],
+            decrypted_entry_bitmap: 0,
+            clearing_index: 0,
+            clearing_price: 0,
+            clearing_volume: 0,
+            base_residual: 0,
+            quote_residual: 0,
+            bump: 0,
         }
     }
 
     #[test]
     fn curve_is_two_sided_v_without_crossed_level() {
-        let (buy, sell) = v_shape(&config(), 100).unwrap();
+        let auction = auction(100_000, 25);
+        let (buy, sell) = v_shape(&auction, 100_000, 1, 2, 15).unwrap();
         assert_eq!(buy[8], 0);
         assert_eq!(sell[8], 0);
         assert!(buy[..8].iter().all(|quantity| *quantity > 0));
@@ -413,12 +570,31 @@ mod tests {
     }
 
     #[test]
-    fn price_normalization_matches_program_policy() {
+    fn grid_uses_half_up_basis_point_prices() {
+        let prices = grid_prices(&auction(99_950, 25)).unwrap();
+        assert_eq!(prices[8], 99_950);
+        assert_eq!(prices[9], 100_200);
+    }
+
+    #[test]
+    fn duplicate_integer_prices_are_rejected() {
+        assert!(grid_prices(&auction(100, 1)).is_err());
+    }
+
+    #[test]
+    fn human_base_quantity_uses_one_hundred_satoshi_units() {
+        assert_eq!(decimal_token_units("0.000001", 8, 100).unwrap(), 1);
+        assert_eq!(decimal_token_units("1.25", 8, 100).unwrap(), 1_250_000);
+        assert!(decimal_token_units("0.00000001", 8, 100).is_err());
+    }
+
+    #[test]
+    fn price_normalization_matches_equal_micro_units() {
         assert_eq!(
-            scaled_integer_price(10_000_000_000_000, -8, -2, 1).unwrap(),
-            1000
+            scaled_integer_price(10_000_000_000_000, -8, 0).unwrap(),
+            100_000
         );
         let (digits, exponent) = decimal_parts("100000.25").unwrap();
-        assert_eq!(scaled_integer_price(digits, exponent, -2, 1).unwrap(), 1000);
+        assert_eq!(scaled_integer_price(digits, exponent, 0).unwrap(), 100_000);
     }
 }

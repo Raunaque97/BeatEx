@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+project_root="$(cd "$script_dir/../.." && pwd)"
+
 cluster='localnet'
 wallet=''
 program_keypair='.devnet/program/beatex-keypair.json'
+state_dir=''
 skip_build=0
+allow_redeploy=0
 
 usage() {
   cat <<'EOF'
@@ -15,11 +20,15 @@ Options:
   --cluster localnet|devnet       Target cluster (default: localnet)
   --wallet <KEYPAIR>              Fee payer and upgrade authority (required)
   --program-keypair <KEYPAIR>     Stable BeatEx program keypair
+  --state-dir <DIRECTORY>         Deployment manifest directory (default: .devnet/<cluster>)
   --skip-build                    Deploy the existing target/deploy-v0/beatex.so
+  --allow-redeploy                Explicitly authorize upgrading an existing program
   -h, --help                      Show this help
 
 The script refuses mainnet and validates that the program keypair, Anchor.toml,
 and Rust declare_id! all name the same program before building or deploying.
+If the program already exists, an interactive confirmation is required unless
+--allow-redeploy was supplied by an enclosing, already-confirmed workflow.
 EOF
 }
 
@@ -37,8 +46,16 @@ while (( $# > 0 )); do
       program_keypair="${2:?--program-keypair requires a value}"
       shift 2
       ;;
+    --state-dir)
+      state_dir="${2:?--state-dir requires a value}"
+      shift 2
+      ;;
     --skip-build)
       skip_build=1
+      shift
+      ;;
+    --allow-redeploy)
+      allow_redeploy=1
       shift
       ;;
     -h|--help)
@@ -66,12 +83,22 @@ if [[ -z "$wallet" || ! -f "$wallet" ]]; then
   printf 'A valid --wallet keypair is required.\n' >&2
   exit 2
 fi
+wallet="$(cd "$(dirname "$wallet")" && pwd)/$(basename "$wallet")"
+if [[ "$program_keypair" != /* ]]; then
+  program_keypair="$project_root/$program_keypair"
+fi
+if [[ -z "$state_dir" ]]; then
+  state_dir="$project_root/.devnet/$cluster"
+elif [[ "$state_dir" != /* ]]; then
+  state_dir="$project_root/$state_dir"
+fi
 if [[ ! -f "$program_keypair" ]]; then
   printf 'Program keypair does not exist: %s\n' "$program_keypair" >&2
   exit 2
 fi
+cd "$project_root"
 
-required_commands=(solana solana-keygen)
+required_commands=(solana solana-keygen node)
 if (( ! skip_build )); then
   required_commands+=(cargo-build-sbf)
 fi
@@ -105,13 +132,47 @@ if [[ -z "$declared_id" || "$declared_id" != "$localnet_id" || "$declared_id" !=
   exit 1
 fi
 
-if (( ! skip_build )); then
-  cargo-build-sbf --arch v0 \
-    --manifest-path programs/beatex/Cargo.toml \
-    --sbf-out-dir target/deploy-v0
+program_status=''
+if program_status="$(solana program show "$program_key_id" --url "$rpc_url" 2>&1)"; then
+  printf 'BeatEx program %s is already deployed on %s.\n' "$program_key_id" "$cluster"
+  if (( ! allow_redeploy )); then
+    if [[ ! -t 0 ]]; then
+      printf '%s\n' 'Refusing an unattended redeploy. Re-run interactively or pass --allow-redeploy after explicit approval.' >&2
+      exit 1
+    fi
+    read -r -p 'Redeploy and upgrade this program? [y/N] ' confirmation
+    case "$confirmation" in
+      y|Y|yes|YES|Yes) ;;
+      *)
+        printf 'Deployment left unchanged.\n'
+        exit 0
+        ;;
+    esac
+  fi
+elif [[ "$program_status" =~ [Aa]ccount.*does[[:space:]]not[[:space:]]exist ]]; then
+  printf 'BeatEx program %s is not deployed on %s; this will be its first deployment.\n' \
+    "$program_key_id" "$cluster"
+else
+  printf 'Could not determine whether BeatEx program %s is deployed on %s:\n%s\n' \
+    "$program_key_id" "$cluster" "$program_status" >&2
+  exit 1
 fi
 
-solana program deploy target/deploy-v0/beatex.so \
+if (( ! skip_build )); then
+  "$script_dir/../build-pipeline.sh" --contract-only \
+    --cluster "$cluster"
+fi
+
+solana program deploy "$project_root/target/deploy-v0/beatex.so" \
   --program-id "$program_keypair" \
   --keypair "$wallet" \
   --url "$rpc_url"
+
+generator_args=(
+  --cluster "$cluster"
+  --state-dir "$state_dir"
+)
+if [[ -f "$project_root/target/idl/beatex.json" ]]; then
+  generator_args+=(--idl "$project_root/target/idl/beatex.json")
+fi
+node "$project_root/scripts/generate-protocol-artifacts.mjs" "${generator_args[@]}"

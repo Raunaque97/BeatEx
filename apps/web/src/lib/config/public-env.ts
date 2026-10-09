@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { GENERATED_PROGRAM_ID } from "@beatex/sdk";
 
 const publicEnvSchema = z.object({
   cluster: z.enum(["localnet", "devnet"]).default("devnet"),
@@ -7,7 +8,7 @@ const publicEnvSchema = z.object({
   programId: z
     .string()
     .min(32)
-    .default("2P37xv7CzDv7pSet6LaXJDq4m1auW3pZ8PzPLtErfsVd"),
+    .default(GENERATED_PROGRAM_ID),
   proverManifestUrl: z
     .string()
     .min(1)

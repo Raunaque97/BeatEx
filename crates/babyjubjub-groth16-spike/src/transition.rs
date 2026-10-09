@@ -11,8 +11,8 @@ use ark_r1cs_std::prelude::{CondSelectGadget, ToBitsGadget};
 use ark_serialize::Compress;
 use std::ops::Neg;
 
-const TRANSITION_DOMAIN: &[u8] = b"BeatEx queued order submission v1";
-const ORDER_COMMITMENT_DOMAIN: &[u8] = b"BeatEx private contingent order v1";
+const TRANSITION_DOMAIN: &[u8] = b"BeatEx queued order submission v2";
+const ORDER_COMMITMENT_DOMAIN: &[u8] = b"BeatEx private contingent order v2";
 const BALANCE_BITS: usize = 64;
 const FOLD_BATCH_SIZE: usize = 4;
 const ORDER_EVENT_DOMAIN: &[u8] = b"BeatEx queue event v2";
@@ -31,9 +31,9 @@ impl TransitionWitness {
     fn deterministic() -> Self {
         let order = OrderWitness::deterministic();
         // Keep this private. It prevents dictionary attacks against the small
-        // four-bit order space when the commitment is stored in the order PDA.
+        // bounded order space when the commitment is stored in the order PDA.
         let order_salt = Fq::from_le_bytes_mod_order(&[0x91; 32]);
-        let old_base_balance = 100u64;
+        let old_base_balance = 10_000u64;
         let old_quote_balance = 10_000_000u64;
         let balance_randomness = [
             JubjubScalar::from(0xb001u64),
@@ -102,14 +102,14 @@ impl TransitionWitness {
     fn digest(&self) -> Fq {
         let mut payload = Vec::with_capacity(16 + ORDER_CIPHERTEXTS * 4);
         payload.push(Fq::from_le_bytes_mod_order(TRANSITION_DOMAIN));
-        payload.push(Fq::from(1u64));
+        payload.push(Fq::from(2u64));
         payload.extend_from_slice(&self.order.auction_context);
         payload.extend_from_slice(&self.order.owner_context);
         payload.push(Fq::from(self.order.client_order_nonce));
         payload.push(self.order_commitment());
         append_wire_point_native(&mut payload, self.order.committee_key.into_affine());
         payload.push(Fq::from(self.order.reference_price));
-        payload.push(Fq::from(self.order.tick_size));
+        payload.push(Fq::from(self.order.grid_step_bps));
         for ciphertext in self.order.ciphertexts().into_iter().take(ORDER_CIPHERTEXTS) {
             append_wire_point_native(&mut payload, ciphertext.ephemeral);
             append_wire_point_native(&mut payload, ciphertext.body);
@@ -152,26 +152,15 @@ impl ConstraintSynthesizer<Fq> for TransitionCircuit {
         let buy_values = order.map(|order| order.buy);
         let sell_values = order.map(|order| order.sell);
         let reference_value = order.map(|order| u128::from(order.reference_price));
-        let tick_value = order.map(|order| u128::from(order.tick_size));
+        let grid_step_value = order.map(|order| u128::from(order.grid_step_bps));
         let base_reserve_value = order.map(|order| order.base_reserve);
         let quote_reserve_value = order.map(|order| order.quote_reserve);
 
         let (_, reference) = alloc_uint(cs.clone(), reference_value, PRICE_BITS)?;
-        let (_, tick) = alloc_uint(cs.clone(), tick_value, PRICE_BITS)?;
-        let lower_price_value = order.and_then(|order| {
-            u128::from(order.reference_price)
-                .checked_sub((LEVELS / 2) as u128 * u128::from(order.tick_size))
-        });
-        let upper_price_value = order.and_then(|order| {
-            u128::from(order.reference_price)
-                .checked_add((LEVELS / 2) as u128 * u128::from(order.tick_size))
-        });
-        let (_, lower_price) = alloc_uint(cs.clone(), lower_price_value, PRICE_BITS)?;
-        let (_, upper_price) = alloc_uint(cs.clone(), upper_price_value, PRICE_BITS)?;
-        lower_price.enforce_equal(&(&reference - &tick * Fq::from((LEVELS / 2) as u64)))?;
-        upper_price.enforce_equal(&(&reference + &tick * Fq::from((LEVELS / 2) as u64)))?;
+        let (_, grid_step) = alloc_uint(cs.clone(), grid_step_value, 14)?;
+        enforce_valid_grid_step(cs.clone(), grid_step_value, &grid_step)?;
 
-        let (_, base_reserve) = alloc_uint(cs.clone(), base_reserve_value, QUANTITY_BITS)?;
+        let (_, base_reserve) = alloc_uint(cs.clone(), base_reserve_value, BALANCE_BITS)?;
         let (_, quote_reserve) = alloc_uint(cs.clone(), quote_reserve_value, BALANCE_BITS)?;
         let old_base_balance_value = witness.map(|witness| u128::from(witness.old_base_balance));
         let old_quote_balance_value = witness.map(|witness| u128::from(witness.old_quote_balance));
@@ -198,14 +187,16 @@ impl ConstraintSynthesizer<Fq> for TransitionCircuit {
         (&new_base_balance + &base_reserve).enforce_equal(&old_base_balance)?;
         (&new_quote_balance + &quote_reserve).enforce_equal(&old_quote_balance)?;
         let prices_native = order
-            .map(|order| price_grid(order.reference_price, order.tick_size))
+            .map(|order| price_grid(order.reference_price, order.grid_step_bps))
             .transpose()
             .map_err(|_| SynthesisError::Unsatisfiable)?;
         let base_max_index = order.map(|order| {
             order
                 .sell
                 .iter()
-                .position(|value| u128::from(*value) == order.base_reserve)
+                .position(|value| {
+                    u128::from(*value) * u128::from(BASE_UNIT_SIZE) == order.base_reserve
+                })
                 .unwrap_or(0)
         });
         let quote_max_index = order.zip(prices_native.as_ref()).map(|(order, prices)| {
@@ -230,12 +221,15 @@ impl ConstraintSynthesizer<Fq> for TransitionCircuit {
             let (sell_bits, sell) = alloc_uint(cs.clone(), sell_value, QUANTITY_BITS)?;
             (&buy * &sell).enforce_equal(&FpVar::zero())?;
 
-            let signed_offset = index as isize - (LEVELS / 2) as isize;
-            let price = if signed_offset < 0 {
-                &reference - &tick * Fq::from((-signed_offset) as u64)
-            } else {
-                &reference + &tick * Fq::from(signed_offset as u64)
-            };
+            let price = rounded_bps_price_gadget(
+                cs.clone(),
+                &reference,
+                &grid_step,
+                index,
+                reference_value,
+                grid_step_value,
+                prices_native.as_ref().map(|prices| prices[index]),
+            )?;
             let liability = &price * &buy;
             let liability_value = order
                 .zip(prices_native.as_ref())
@@ -243,7 +237,7 @@ impl ConstraintSynthesizer<Fq> for TransitionCircuit {
             let base_slack_value = order.map(|order| {
                 order
                     .base_reserve
-                    .checked_sub(u128::from(order.sell[index]))
+                    .checked_sub(u128::from(order.sell[index]) * u128::from(BASE_UNIT_SIZE))
                     .unwrap_or(u128::MAX)
             });
             let quote_slack_value = order.zip(liability_value).map(|(order, liability)| {
@@ -252,10 +246,11 @@ impl ConstraintSynthesizer<Fq> for TransitionCircuit {
                     .checked_sub(liability)
                     .unwrap_or(u128::MAX)
             });
-            let (_, base_slack) = alloc_uint(cs.clone(), base_slack_value, QUANTITY_BITS)?;
+            let (_, base_slack) = alloc_uint(cs.clone(), base_slack_value, BALANCE_BITS)?;
             let (_, quote_slack) =
                 alloc_uint(cs.clone(), quote_slack_value, QUOTE_COLLATERAL_BITS)?;
-            (&sell + &base_slack).enforce_equal(&base_reserve)?;
+            let sell_atomic = &sell * Fq::from(BASE_UNIT_SIZE);
+            (&sell_atomic + &base_slack).enforce_equal(&base_reserve)?;
             (&liability + &quote_slack).enforce_equal(&quote_reserve)?;
 
             let base_selector = Boolean::new_witness(cs.clone(), || {
@@ -266,7 +261,7 @@ impl ConstraintSynthesizer<Fq> for TransitionCircuit {
             })?;
             let base_selector_fp: FpVar<Fq> = base_selector.into();
             let quote_selector_fp: FpVar<Fq> = quote_selector.into();
-            (&base_selector_fp * (&base_reserve - &sell)).enforce_equal(&FpVar::zero())?;
+            (&base_selector_fp * (&base_reserve - &sell_atomic)).enforce_equal(&FpVar::zero())?;
             (&quote_selector_fp * (&quote_reserve - &liability)).enforce_equal(&FpVar::zero())?;
 
             buy_bits_all.push(buy_bits);
@@ -359,14 +354,14 @@ impl ConstraintSynthesizer<Fq> for TransitionCircuit {
         transition_payload.push(FpVar::constant(Fq::from_le_bytes_mod_order(
             TRANSITION_DOMAIN,
         )));
-        transition_payload.push(FpVar::constant(Fq::from(1u64)));
+        transition_payload.push(FpVar::constant(Fq::from(2u64)));
         transition_payload.extend(auction_context);
         transition_payload.extend(owner_context);
         transition_payload.push(client_order_nonce);
         transition_payload.push(order_commitment);
         append_wire_point_gadget(&mut transition_payload, &committee_key)?;
         transition_payload.push(reference);
-        transition_payload.push(tick);
+        transition_payload.push(grid_step);
 
         for (order_ephemeral, order_body) in order_ciphertexts {
             append_wire_point_gadget(&mut transition_payload, &order_ephemeral)?;
@@ -762,7 +757,7 @@ pub struct SolanaTransitionFixture {
     pub order_commitment: [u8; 32],
     pub committee_key: [u8; 32],
     pub reference_price: u64,
-    pub tick_size: u64,
+    pub grid_step_bps: u16,
     pub ciphertexts: [[u8; 64]; ORDER_CIPHERTEXTS],
     pub old_base: [u8; 64],
     pub old_quote: [u8; 64],
@@ -803,7 +798,7 @@ pub struct OrderProofRequest {
     pub owner: [u8; 32],
     pub client_order_nonce: u64,
     pub reference_price: u64,
-    pub tick_size: u64,
+    pub grid_step_bps: u16,
     pub committee_key: [u8; 32],
     pub buy: [u64; LEVELS],
     pub sell: [u64; LEVELS],
@@ -1047,14 +1042,14 @@ impl OrderProver {
         request: OrderProofRequest,
         rng: &mut R,
     ) -> Result<OrderProofOutput, Box<dyn std::error::Error>> {
-        if request.tick_size == 0 {
-            return Err(std::io::Error::other("tick size must be positive").into());
+        if request.grid_step_bps == 0 {
+            return Err(std::io::Error::other("grid step must be positive").into());
         }
         if request
             .buy
             .iter()
             .chain(&request.sell)
-            .any(|quantity| *quantity > 15)
+            .any(|quantity| *quantity > MAX_ORDER_QUANTITY)
             || request
                 .buy
                 .iter()
@@ -1063,9 +1058,16 @@ impl OrderProver {
         {
             return Err(std::io::Error::other("invalid private order quantities").into());
         }
-        let prices = price_grid(request.reference_price, request.tick_size)
+        let prices = price_grid(request.reference_price, request.grid_step_bps)
             .map_err(std::io::Error::other)?;
-        let base_reserve = request.sell.iter().copied().max().unwrap_or_default();
+        let base_reserve = request
+            .sell
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or_default()
+            .checked_mul(BASE_UNIT_SIZE)
+            .ok_or_else(|| std::io::Error::other("base reserve overflow"))?;
         let quote_reserve = request
             .buy
             .iter()
@@ -1091,7 +1093,7 @@ impl OrderProver {
             buy: request.buy,
             sell: request.sell,
             reference_price: request.reference_price,
-            tick_size: request.tick_size,
+            grid_step_bps: request.grid_step_bps,
             base_reserve: u128::from(base_reserve),
             quote_reserve: u128::from(quote_reserve),
             committee_key: committee_key.into_group(),
@@ -1224,7 +1226,7 @@ fn transition_solana_fixture(
         order_commitment: field_bytes_le(witness.order_commitment()),
         committee_key: wire_point_bytes(witness.order.committee_key.into_affine()),
         reference_price: witness.order.reference_price,
-        tick_size: witness.order.tick_size,
+        grid_step_bps: witness.order.grid_step_bps,
         ciphertexts: order_ciphertexts,
         old_base: balance_ciphertexts[0],
         old_quote: balance_ciphertexts[1],
@@ -1598,7 +1600,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "generates a full 234k-constraint Groth16 proof; run in release mode"]
+    #[ignore = "generates a full 241k-constraint Groth16 proof; run in release mode"]
     fn arbitrary_order_prover_generates_a_verified_transition() {
         let prover = OrderProver::deterministic_devnet().unwrap();
         let mut buy = [0u64; LEVELS];
@@ -1610,12 +1612,12 @@ mod tests {
             owner: [0xb2; 32],
             client_order_nonce: 19,
             reference_price: 100_000,
-            tick_size: 500,
+            grid_step_bps: DEFAULT_GRID_STEP_BPS,
             committee_key: deterministic_committee_key_bytes(),
             buy,
             sell,
             old_balance: PrivateBalanceOpening {
-                base_value: 100,
+                base_value: 1_000,
                 quote_value: 10_000_000,
                 base_randomness: [0; 32],
                 quote_randomness: [0; 32],
@@ -1623,10 +1625,10 @@ mod tests {
         };
         let mut rng = ChaCha20Rng::from_seed([0xd7; 32]);
         let output = prover.prove(request, &mut rng).unwrap();
-        assert_eq!(output.base_reserve, 5);
-        assert_eq!(output.quote_reserve, 7 * 97_500);
-        assert_eq!(output.new_balance.base_value, 95);
-        assert_eq!(output.new_balance.quote_value, 10_000_000 - 7 * 97_500);
+        assert_eq!(output.base_reserve, 5 * BASE_UNIT_SIZE);
+        assert_eq!(output.quote_reserve, 7 * 99_500);
+        assert_eq!(output.new_balance.base_value, 500);
+        assert_eq!(output.new_balance.quote_value, 10_000_000 - 7 * 99_500);
         assert_ne!(output.order_commitment, [0; 32]);
         assert_ne!(output.public_input, [0; 32]);
     }

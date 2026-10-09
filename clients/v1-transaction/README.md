@@ -34,10 +34,29 @@ npm run check
 printf '%s' "$INSTRUCTION_BUNDLE" | node send.mjs --check-only
 ```
 
-Remove `--check-only` to read the keypair, fetch a recent blockhash, sign, and
-confirm the transaction. The sender supports additional instruction signers via
-`signerKeypairs` and rejects missing signers, non-canonical base64, invalid
-resource limits, and encoded transactions above 4,096 bytes.
+Remove `--check-only` to read the signer, fetch a recent blockhash, sign, and
+confirm the transaction. `keypair` may also point at the short-lived session
+descriptor created by the native `beatex` client:
+
+```json
+{
+  "version": 1,
+  "type": "browser-wallet",
+  "address": "...",
+  "bridgeUrl": "http://127.0.0.1:49152",
+  "sessionToken": "..."
+}
+```
+
+In that mode the sender compiles and locally pre-signs the transaction, asks
+the loopback bridge to obtain Phantom's v1 signature, and rejects the result if
+the compiled message changed or any required signature is missing. The bridge
+URL must be loopback HTTP and the bearer token is valid only for the running
+client process. The descriptor is deleted when that process exits.
+
+The sender supports additional instruction signers via `signerKeypairs` and
+rejects missing signers, non-canonical base64, invalid resource limits, and
+encoded transactions above 4,096 bytes.
 
 The order/fold/claim clients remain responsible for reading protocol accounts,
 generating proofs, serializing the Anchor instruction, and supplying the exact

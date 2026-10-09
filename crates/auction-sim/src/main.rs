@@ -37,8 +37,8 @@ fn main() {
     let buys = [[10, 10, 6, 0, 0], [5, 5, 5, 0, 0], [0, 0, 0, 0, 0]];
     let sells = [[0, 0, 0, 4, 4], [0, 0, 0, 3, 6], [0, 0, 2, 2, 2]];
     let grid = PriceGrid {
-        reference_price: 100,
-        tick_size: 5,
+        reference_price: 10_000,
+        grid_step_bps: 1_000,
         level_count: 5,
     };
 

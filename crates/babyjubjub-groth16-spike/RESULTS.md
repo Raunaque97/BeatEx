@@ -1,6 +1,6 @@
 # Baby Jubjub circuit result
 
-Measured on the development machine in release mode on 2026-10-04. Times are
+Measured on the development machine in release mode on 2026-10-09. Times are
 three-round medians for proving and verification and 21-round medians for
 encryption preprocessing.
 
@@ -8,26 +8,26 @@ encryption preprocessing.
 
 | Component | R1CS constraints |
 | --- | ---: |
-| 17-level order and exact collateral maxima | 1,879 |
-| 36 Baby Jubjub ElGamal encryptions | 163,429 |
+| 17-level order, 28-bit quantities, and exact collateral maxima | 5,059 |
+| 36 Baby Jubjub ElGamal encryptions | 167,029 |
 | Chained width-13 Poseidon transcript | 7,522 |
-| **Total** | **172,830** |
+| **Total** | **179,610** |
 
 The 36 ciphertexts are 34 independent order ciphertexts plus encrypted
 `R_A` and `R_B`. The circuit has one Groth16 public input (the transcript
 digest), two instance variables including the constant-one variable, and
-172,746 witness variables.
+179,492 witness variables.
 
 ## Host timings and sizes
 
 | Measurement | Result |
 | --- | ---: |
-| Encrypt 36 values | 3.170 ms |
-| Encrypt and compute transcript | 6.140 ms |
-| Circuit-specific setup | 1,772.072 ms |
-| Groth16 proving | 1,955.966 ms |
-| Groth16 host verification | 0.721 ms |
-| Compressed proving key | 36,028,592 bytes |
+| Encrypt 36 values | 3.321 ms |
+| Encrypt and compute transcript | 6.301 ms |
+| Circuit-specific setup | 1,778.267 ms |
+| Groth16 proving | 1,917.166 ms |
+| Groth16 host verification | 0.690 ms |
+| Compressed proving key | 37,107,952 bytes |
 | Compressed Arkworks proof | 128 bytes |
 | Solana uncompressed Groth16 proof | 256 bytes |
 | 72 compressed Baby Jubjub points | 2,304 bytes |
@@ -38,9 +38,11 @@ instructions and other transaction framing.
 
 ## What this proves
 
-- Every order quantity is four-bit and therefore in `0..=15`.
+- Every order quantity is bounded to the protocol's 28-bit range (markets may
+  configure a lower maximum).
 - Buy and sell cannot both be nonzero at one price level.
-- Prices follow the 17-level public reference/tick grid without field wrap.
+- Prices follow the 17-level public reference plus linear basis-point grid
+  without field wrap.
 - `R_A` and `R_B` are the exact maxima required by the contingent order.
 - Every order and reserve value is correctly encrypted under the same
   prime-order committee key with independent randomness.
@@ -50,13 +52,13 @@ instructions and other transaction framing.
 
 - Chrome proving time and peak memory have not been measured for this circuit.
   The production wrapper has been exercised in single-threaded Node WASM; its
-  final 234k-constraint queued-order result is recorded below.
+  final 241k-constraint queued-order result is recorded below.
 - The direct onchain path was benchmarked separately in
   `crates/babyjub-sbf-spike`. Sixty-eight additions alone exceed the 1.4M CU
   transaction cap, and syscall-assisted compressed-point recovery costs about
   499k CU for one representative point. Direct Baby Jubjub aggregation is
   therefore rejected for the one-transaction order path.
-- Real-browser time and peak memory for the final 234k-constraint queued-order
+- Real-browser time and peak memory for the final 241k-constraint queued-order
   circuit remain to be measured.
 - Compression and subgroup-validation rules must become protocol constants;
   they must not depend implicitly on a future Arkworks serialization change.
@@ -90,16 +92,16 @@ auction is still collecting orders.
 
 | Measurement | Result |
 | --- | ---: |
-| Queued-order constraints | 234,166 |
-| Queued-order setup | 2,164.339 ms |
-| Queued-order proving median | 2,195.519 ms |
-| Queued-order host verification median | 0.710 ms |
-| Queued-order compressed proving key | 43,932,592 bytes |
-| Four-order fold constraints | 310,870 |
-| Four-order fold setup | 4,386.628 ms |
-| Four-order fold proving median | 3,842.399 ms |
-| Four-order fold host verification median | 0.709 ms |
-| Four-order fold compressed proving key | 56,365,360 bytes |
+| Queued-order constraints | 241,198 |
+| Queued-order setup | 2,211.735 ms |
+| Queued-order proving median | 2,198.033 ms |
+| Queued-order host verification median | 0.728 ms |
+| Queued-order compressed proving key | 45,052,272 bytes |
+| Four-order fold constraints | 518,962 |
+| Four-order fold setup | 6,782.131 ms |
+| Four-order fold proving median | 6,037.696 ms |
+| Four-order fold host verification median | 0.764 ms |
+| Four-order fold compressed proving key | 82,870,960 bytes |
 | Raw queued-order payload | 2,624 bytes |
 | Estimated complete queued-order Solana v1 transaction | about 3,032 bytes |
 | Raw fold payload | 2,464 bytes |
@@ -213,7 +215,7 @@ can therefore be generated concurrently.
 | Constraints | 31,880 | 29,024 |
 | Recurring proof, Apple M4 | 0.526–0.549 s | 0.425–0.429 s |
 
-The ordinary 234,166-constraint order proof remains the latency-dominant part
+The ordinary 241,198-constraint order proof remains the latency-dominant part
 of rollover at roughly 2.2 seconds. Replacement composes the smaller collateral
 release proof with that same order proof; cancellation needs only the release
 proof.
