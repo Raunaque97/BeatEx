@@ -92,8 +92,8 @@ impl PrivateWithdrawalWitness {
             client_order_nonce: 7,
             sequence: 3,
             allocation_rule_version: 2,
-            order_circuit_version: 2,
-            claim_circuit_version: 2,
+            order_circuit_version: 3,
+            claim_circuit_version: 3,
             buy,
             sell,
             base_reserve: 0,
@@ -400,8 +400,10 @@ impl ConstraintSynthesizer<Fq> for PrivateWithdrawalCircuit {
             16,
         )?;
         allocation_version.enforce_equal(&FpVar::constant(Fq::from(2u64)))?;
-        order_version.enforce_equal(&FpVar::constant(Fq::from(2u64)))?;
-        claim_version.enforce_equal(&FpVar::constant(Fq::from(2u64)))?;
+        let order_v2 = &order_version - FpVar::constant(Fq::from(2u64));
+        let order_v3 = &order_version - FpVar::constant(Fq::from(3u64));
+        (&order_v2 * &order_v3).enforce_equal(&FpVar::zero())?;
+        claim_version.enforce_equal(&FpVar::constant(Fq::from(3u64)))?;
 
         let mut buy = Vec::with_capacity(LEVELS);
         let mut sell = Vec::with_capacity(LEVELS);

@@ -11,14 +11,13 @@ import {
   compileTransaction,
   createKeyPairSignerFromBytes,
   createSolanaRpc,
-  createSolanaRpcSubscriptions,
   createTransactionMessage,
   getSignatureFromTransaction,
   getTransactionDecoder,
   getTransactionEncoder,
   partiallySignTransactionWithSigners,
   pipe,
-  sendAndConfirmTransactionFactory,
+  sendTransactionWithoutConfirmingFactory,
   setTransactionMessageConfig,
   setTransactionMessageFeePayer,
   setTransactionMessageFeePayerSigner,
@@ -28,6 +27,7 @@ import {
 
 const DEFAULT_RPC_URL = "https://api.devnet.solana.com";
 const MAX_V1_BYTES = 4096;
+const TX_COMMITMENT = process.env.BEATEX_TX_COMMITMENT ?? "confirmed";
 
 function usage() {
   console.error(`Usage: send.mjs [--check-only]
@@ -213,10 +213,139 @@ function validateBundle(bundle, checkOnly) {
   return instructions;
 }
 
-function subscriptionsUrl(rpcUrl) {
+function rpcCandidates(primaryRpcUrl) {
+  const candidates = [
+    primaryRpcUrl,
+    ...(process.env.BEATEX_RPC_FALLBACK_URLS ?? "")
+      .split(",")
+      .map((value) => value.trim())
+      .filter(Boolean),
+  ];
+  return candidates.filter((candidate, index) => candidates.indexOf(candidate) === index);
+}
+
+function rpcLabel(rpcUrl) {
   const url = new URL(rpcUrl);
-  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-  return url.toString();
+  let pathname = url.pathname;
+  for (const marker of ["/v1/", "/v2/"]) {
+    const index = pathname.indexOf(marker);
+    if (index >= 0) {
+      pathname = `${pathname.slice(0, index + marker.length)}<redacted>`;
+      break;
+    }
+  }
+  return `${url.protocol}//${url.host}${pathname}`;
+}
+
+function isRetryableRpcError(error) {
+  const detail = `${error instanceof Error ? error.message : String(error)} ${
+    error && typeof error === "object" && "cause" in error ? String(error.cause) : ""
+  }`.toLowerCase();
+  return /(?:http error \(429\)|too many requests|fetch failed|network|socket|econn|timed? ?out|timeout|websocket|connection closed)/.test(detail);
+}
+
+function isAuctionInitializationRace(error, label) {
+  if (!label?.startsWith("initialize auction")) return false;
+  const contexts = [error, error?.cause].filter(Boolean);
+  return contexts.some((value) => {
+    const logs = value?.context?.logs;
+    return Array.isArray(logs) && logs.some((line) => line.includes("already in use"));
+  });
+}
+
+function logRpcFailure(action, rpcUrl, error) {
+  console.error(`${action} via ${rpcLabel(rpcUrl)} failed:`);
+  console.error(error);
+}
+
+async function latestBlockhashWithFailover(rpcUrls) {
+  const failures = [];
+  for (const rpcUrl of rpcUrls) {
+    try {
+      const rpc = createSolanaRpc(rpcUrl);
+      return await rpc.getLatestBlockhash({ commitment: TX_COMMITMENT }).send();
+    } catch (error) {
+      failures.push(error);
+      logRpcFailure("latest blockhash request", rpcUrl, error);
+      if (!isRetryableRpcError(error)) throw error;
+    }
+  }
+  throw new AggregateError(failures, "latest blockhash request failed via all configured RPC URLs");
+}
+
+async function diagnoseTransaction(rpc, rpcUrl, signedTransactionBase64) {
+  try {
+    const simulation = await rpc
+      .simulateTransaction(signedTransactionBase64, {
+        commitment: "confirmed",
+        encoding: "base64",
+        sigVerify: false,
+      })
+      .send();
+    if (simulation.value.logs) console.error(simulation.value.logs.join("\n"));
+    if (simulation.value.unitsConsumed !== undefined) {
+      console.error(`simulation units consumed: ${simulation.value.unitsConsumed}`);
+    }
+  } catch (simulationError) {
+    console.error(`diagnostic simulation via ${rpcLabel(rpcUrl)} failed:`);
+    console.error(simulationError);
+  }
+}
+
+function commitmentRank(commitment) {
+  return { processed: 0, confirmed: 1, finalized: 2 }[commitment] ?? 1;
+}
+
+async function sendAndPoll(rpc, signedTransaction, waitForConfirmation = true) {
+  const signature = getSignatureFromTransaction(signedTransaction);
+  await sendTransactionWithoutConfirmingFactory({ rpc })(signedTransaction, {
+    commitment: TX_COMMITMENT,
+    skipPreflight: !waitForConfirmation,
+  });
+  if (!waitForConfirmation) return;
+  const deadline = Date.now() + (TX_COMMITMENT === "processed" ? 8_000 : 30_000);
+  while (Date.now() < deadline) {
+    const { value: statuses } = await rpc
+      .getSignatureStatuses([signature])
+      .send();
+    const status = statuses[0];
+    if (status?.err) throw new Error(`transaction failed on-chain: ${JSON.stringify(status.err)}`);
+    if (status?.confirmationStatus && commitmentRank(status.confirmationStatus) >= commitmentRank(TX_COMMITMENT)) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  throw new Error(`transaction confirmation timed out after ${TX_COMMITMENT} commitment`);
+}
+
+async function sendAndConfirmWithFailover(signedTransaction, rpcUrls, label) {
+  const failures = [];
+  const signedTransactionBase64 = Buffer.from(
+    getTransactionEncoder().encode(signedTransaction),
+  ).toString("base64");
+  for (const rpcUrl of rpcUrls) {
+    let rpc;
+    try {
+      rpc = createSolanaRpc(rpcUrl);
+      // Auction materialization sits on the critical path of the
+      // collection window. RPC acceptance plus the caller's account polling
+      // is sufficient; waiting here for a second status round-trip can consume
+      // the entire auction.
+      const waitForConfirmation = !(
+        TX_COMMITMENT === "processed" && label?.startsWith("initialize auction")
+      );
+      await sendAndPoll(rpc, signedTransaction, waitForConfirmation);
+      return;
+    } catch (error) {
+      if (isAuctionInitializationRace(error, label)) return;
+      failures.push(error);
+      logRpcFailure("transaction submission", rpcUrl, error);
+      if (isRetryableRpcError(error)) continue;
+      if (rpc) await diagnoseTransaction(rpc, rpcUrl, signedTransactionBase64);
+      throw error;
+    }
+  }
+  throw new AggregateError(failures, "transaction submission failed via all configured RPC URLs");
 }
 
 async function main() {
@@ -259,9 +388,8 @@ async function main() {
     signers.set(signer.address, signer);
   }
   const rpcUrl = bundle.rpcUrl ?? DEFAULT_RPC_URL;
-  const rpc = createSolanaRpc(rpcUrl);
-  const rpcSubscriptions = createSolanaRpcSubscriptions(subscriptionsUrl(rpcUrl));
-  const { value: latestBlockhash } = await rpc.getLatestBlockhash({ commitment: "confirmed" }).send();
+  const rpcUrls = rpcCandidates(rpcUrl);
+  const { value: latestBlockhash } = await latestBlockhashWithFailover(rpcUrls);
 
   const instructions = validatedInstructions.map((instruction) => {
     const accounts = instruction.accounts.map((accountMeta) => {
@@ -317,29 +445,7 @@ async function main() {
   const signedTransaction = wallet.kind === "browser"
     ? await signWithBrowser(wallet, transaction, bundle.label ?? "BeatEx transaction")
     : transaction;
-  try {
-    await sendAndConfirmTransactionFactory({ rpc, rpcSubscriptions })(signedTransaction, {
-      commitment: "confirmed",
-    });
-  } catch (error) {
-    try {
-      const simulation = await rpc
-        .simulateTransaction(
-          Buffer.from(getTransactionEncoder().encode(signedTransaction)).toString("base64"), {
-          commitment: "confirmed",
-          encoding: "base64",
-          sigVerify: false,
-          })
-        .send();
-      if (simulation.value.logs) console.error(simulation.value.logs.join("\n"));
-      if (simulation.value.unitsConsumed !== undefined) {
-        console.error(`simulation units consumed: ${simulation.value.unitsConsumed}`);
-      }
-    } catch (simulationError) {
-      console.error(`diagnostic simulation failed: ${simulationError}`);
-    }
-    throw error;
-  }
+  await sendAndConfirmWithFailover(signedTransaction, rpcUrls, bundle.label);
   console.log(
     JSON.stringify({
       signature: getSignatureFromTransaction(signedTransaction),

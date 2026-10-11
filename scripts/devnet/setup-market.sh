@@ -3,6 +3,7 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 project_root="$(cd "$script_dir/../.." && pwd)"
+source "$script_dir/load-rpc-env.sh"
 user_cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin"
 if [[ -d "$user_cargo_bin" ]]; then
   PATH="$user_cargo_bin:$PATH"
@@ -81,6 +82,10 @@ if [[ -z "$state_dir" ]]; then
 elif [[ "$state_dir" != /* ]]; then
   state_dir="$project_root/$state_dir"
 fi
+beatex_load_rpc_env "$state_dir"
+if [[ "$cluster" == devnet ]]; then
+  rpc_url="${BEATEX_RPC_SESSION_URL:-${BEATEX_RPC_URL:-$rpc_url}}"
+fi
 
 addresses_file="$state_dir/addresses.tsv"
 if [[ ! -f "$addresses_file" ]]; then
@@ -96,21 +101,6 @@ fi
 
 umask 077
 mkdir -p "$state_dir/market"
-vault_owner="$state_dir/market/vault-setup-owner.json"
-base_vault_keypair="$state_dir/market/base-vault-v3.json"
-quote_vault_keypair="$state_dir/market/quote-vault-v3.json"
-
-ensure_keypair() {
-  local path="$1"
-  if [[ ! -f "$path" ]]; then
-    solana-keygen new --no-bip39-passphrase --silent --outfile "$path" >&2
-  fi
-}
-
-ensure_keypair "$vault_owner"
-ensure_keypair "$base_vault_keypair"
-ensure_keypair "$quote_vault_keypair"
-
 (
   cd "$project_root"
   cargo run --release -q -p beatex-devnet-client -- addresses \
@@ -124,8 +114,28 @@ if [[ -z "$vault_authority" ]]; then
   printf 'Could not derive the vault authority.\n' >&2
   exit 1
 fi
+# Vault authorities are derived from the market PDA. Use that PDA in the
+# keypair filenames so a new market nonce gets fresh vault setup accounts
+# without overwriting the previous market's custody accounts.
+market_address="$(awk -F '\t' '$1 == "market" { print $2 }' "$market_addresses")"
+market_suffix="${market_address:0:8}"
+vault_owner="$state_dir/market/vault-setup-owner-$market_suffix.json"
+base_vault_keypair="$state_dir/market/base-vault-$market_suffix.json"
+quote_vault_keypair="$state_dir/market/quote-vault-$market_suffix.json"
+
+ensure_keypair() {
+  local path="$1"
+  if [[ ! -f "$path" ]]; then
+    solana-keygen new --no-bip39-passphrase --silent --outfile "$path" >&2
+  fi
+}
+
+ensure_keypair "$vault_owner"
+ensure_keypair "$base_vault_keypair"
+ensure_keypair "$quote_vault_keypair"
 
 config_file="$state_dir/solana-cli.yml"
+solana config set --config "$config_file" --url "$rpc_url" --keypair "$wallet" >/dev/null
 token_args=(
   --config "$config_file"
   --fee-payer "$wallet"
@@ -136,6 +146,17 @@ account_exists() {
   solana --url "$rpc_url" account "$1" --output json-compact >/dev/null 2>&1
 }
 
+wait_for_account() {
+  local address="$1"
+  local attempt
+  for attempt in {1..80}; do
+    if account_exists "$address"; then return 0; fi
+    sleep 0.25
+  done
+  printf 'Timed out waiting for account %s to become visible.\n' "$address" >&2
+  return 1
+}
+
 ensure_vault() {
   local mint="$1"
   local keypair="$2"
@@ -144,6 +165,7 @@ ensure_vault() {
   owner="$(solana-keygen pubkey "$vault_owner")"
   if ! account_exists "$address"; then
     spl-token "${token_args[@]}" create-account "$mint" "$keypair" --owner "$owner" >&2
+    wait_for_account "$address"
   fi
   display="$(spl-token "${token_args[@]}" display "$address")"
   current_owner="$(sed -n 's/^  Owner: //p' <<<"$display")"
@@ -192,4 +214,11 @@ market_start_slot="$((current_slot + 800))"
     --rpc-url "$rpc_url"
 )
 
-printf '\nMarket setup complete.\nManifest: %s\n' "$state_dir/market.tsv"
+artifact_args=(--cluster "$cluster" --state-dir "$state_dir")
+if [[ -f "$project_root/target/idl/beatex.json" ]]; then
+  artifact_args+=(--idl "$project_root/target/idl/beatex.json")
+fi
+node "$project_root/scripts/generate-protocol-artifacts.mjs" "${artifact_args[@]}"
+
+printf '\nMarket setup complete.\nSubmission interval: 40 slots (approximately 10 seconds on Devnet).\nManifest: %s\n' \
+  "$state_dir/market.tsv"

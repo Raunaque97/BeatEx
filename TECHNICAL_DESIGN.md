@@ -537,7 +537,7 @@ The exact BN254/Ristretto and native ZK ElGamal approaches remain documented as 
 
 Solana v1 permits a 4,096-byte transaction. The measured 17-level order, two updated encrypted balances, Groth16 proof, digest, commitment, accounts, and framing are estimated at about 3,032 bytes. The production queue path therefore uses one trader transaction rather than staged order writes.
 
-`submit_queued_order` verifies the order/balance proof, creates an immutable `QueuedOrder` PDA in `Accepted` state, applies the encrypted balance transition, and increments `accepted_order_count` atomically. It does not read the aggregate accumulator. The proof statement is consequently unaffected by folds or other traders' submissions; only Solana's normal writable lock on the small counter can delay execution.
+`submit_queued_order` verifies the order/balance proof, creates an immutable `QueuedOrder` PDA in `Accepted` state, applies the encrypted balance transition, and increments `accepted_order_count` atomically. The PDA is derived from the auction, owner, and client-generated order nonce, so traders do not read or predict the shared submission counter to construct an address. The program assigns the accepted sequence from that counter atomically during submission. The instruction does not read the aggregate accumulator. The proof statement is consequently unaffected by folds or other traders' submissions; Solana's normal writable lock on the small counter can serialize execution, but cannot cause counter-derived PDA collisions.
 
 Replacement events store a `previous_event` pointer instead of duplicating the
 prior 2,176-byte ciphertext curve. The prior event is immutable, so a fold bot
@@ -564,15 +564,16 @@ Apple M4 the measured rollover proof takes about 0.53 seconds after setup, so
 the combined latency is bounded by the roughly 2.2-second order proof rather
 than the 40.8-second exact Token-2022 withdrawal bridge.
 
-The transaction contains six BeatEx instructions in a fixed order:
+The rollover transaction contains six BeatEx instructions in a fixed order:
 
-1. `prepare_rollover` allocates the next queued-order and active-order accounts.
+1. `prepare_rollover` allocates the next queued-order and active-order accounts. Its first event PDA uses the `rollover-order` seed domain and is keyed by the next auction and owner; it does not depend on the submission counter.
 2. `verify_rollover_proof` verifies the settled-payout Groth16 proof.
 3. `bind_rollover_settlement` reconstructs and binds its settlement statement.
 4. `verify_rollover_proof` verifies the next-order Groth16 proof.
 5. `bind_rollover_order` reconstructs and binds its order statement.
 6. `rollover_order` performs the terminal old-order claim, private-balance
-   transition, and next-order queue mutation.
+   transition, and next-order queue mutation, and closes the old order's
+   latest event and active-order accounts, returning their rent to the owner.
 
 The preparation and binding handlers inspect the instructions sysvar and
 require the exact later or immediately preceding instruction discriminators,
@@ -603,7 +604,7 @@ aggregate_sell[i] = sum(order.sell[i])
 
 Curve arithmetic is not performed by the Solana program. A permissionless bot reads accepted orders and the current aggregate, computes the candidate aggregate offchain, and generates one Groth16 fold proof for a batch of one to four orders. The raw direct fold payload is 2,464 bytes and fits a v1 transaction. Public inputs contain one Poseidon digest rather than the full ciphertext list.
 
-`fold_queued_orders` verifies that the supplied order accounts are distinct, sorted, belong to the auction, and are still `Accepted`. It verifies the proof against a versioned verification-key PDA, writes the new aggregate, irreversibly changes every selected order to `Folded`, increments `folded_order_count` by the exact batch size, and increments the aggregate revision. Failure is atomic.
+`fold_queued_orders` verifies that the supplied order accounts are exactly the next entries of the submission counter's pending-event ring (which also makes them distinct), belong to the auction, and are still `Accepted`, and it clears those ring slots. It verifies the proof against a versioned verification-key PDA, writes the new aggregate, irreversibly changes every selected order to `Folded`, increments `folded_order_count` by the exact batch size, and increments the aggregate revision. Failure is atomic. The PDA seed change does not alter fold batching: one to four orders are still folded per proof and transaction.
 
 Folds may execute while the auction is `Pending`, up to the aggregation
 deadline. They write the aggregate PDA but do not write the submission counter.
@@ -1007,15 +1008,38 @@ salted private-order commitment
 order circuit version
 ```
 
+Trader submission, replacement, and cancellation event PDAs use the same
+client-nonce addressing scheme. Each event has a unique client-generated nonce
+for that owner and auction; its accepted sequence is assigned from
+`SubmissionCounter` on-chain and is stored in the account for ordering and fold
+accounting, never used as a PDA seed.
+
 Suggested seeds:
 
 ```text
-["queued-order", auction, accepted_sequence]
+["queued-order", auction, owner, client_order_nonce]
 ```
+
+The first event created by a rollover uses a separate seed domain because the
+rollover instruction is tied to the next auction and owner:
+
+```text
+["rollover-order", next_auction, owner]
+```
+
+Order accounts are rent-reclaimed once they can no longer be used. A terminal
+settlement, refund, or rollover closes the order's latest event and its
+active-order pointer in the same instruction; the closed accounts cannot be
+settled again, and they cannot be recreated because every initializing path
+requires a pending auction. Events superseded by a replacement, and the events
+of an order the owner cancelled, are closed by the permissionless
+`close_order_events` instruction once the auction is settled or cancelled and
+therefore no longer folds. It keeps an active order's latest event, and the
+rent always returns to the owner who funded the events.
 
 ### 14.5 Queue state
 
-`SubmissionCounter` contains the authoritative `accepted_order_count` and is the only queue account written by trader submissions.
+`SubmissionCounter` contains the authoritative `accepted_order_count` and is the only queue account written by trader submissions. It also indexes the queue for fold bots: the account is allocated with a raw ring of 64 event addresses after its serialized fields, and every accepted event (submission, replacement, cancellation, or rollover) is written to slot `sequence % 64`. Fold bots read the unfolded events from this one account instead of scanning program accounts, and each fold must consume exactly the next entries in acceptance order. A slot is reused only after a fold clears it, so a submission fails with `PendingQueueFull` while 64 events are unfolded. The ring is kept outside the Anchor struct so that deserializing the counter never copies 2 KiB onto the 4 KiB SBF stack. `initialize_auction` pays for the ring, and `close_empty_auction` refunds it with the counter.
 
 `AggregateAccumulator` contains `folded_order_count`, `fold_revision`, 34 aggregate ciphertexts, and their digest. It is written only by permissionless fold transactions.
 
@@ -1031,6 +1055,34 @@ Suggested seeds:
 ["private-balance", market, owner]
 ["queue-vk", market, circuit_kind, circuit_version]
 ```
+
+### 14.5a Finished auctions and price history
+
+An auction's working state is only needed until it finishes. `publish_and_clear`
+and `cancel_pending_auction` therefore close the submission counter and the
+aggregate accumulator, and rewrite the `Auction` in place, at the same PDA, as a
+compact `AuctionResult` (about 134 bytes instead of 2.6 KB): market, auction id,
+key epoch, final state, reference price and source, grid, versions, clearing
+index, price and volume, and the aggregate demand and supply at the clearing
+level. Settlement, refund, rollover, private withdrawal and
+`close_order_events` read only these fields and take the `AuctionResult` type;
+its distinct discriminator also stops every pending-phase instruction from
+accepting a finished auction. All released rent goes to the market authority,
+which funds `initialize_auction`. Both handlers read only the fixed-size header
+of the pending `Auction` rather than deserializing it, which keeps them within
+the 4 KiB SBF stack. Empty auctions are still closed outright.
+
+Historical prices are served off-chain. `publish_and_clear`,
+`cancel_pending_auction` and `close_empty_auction` emit `AuctionCleared`,
+`AuctionCancelled` and `EmptyAuctionClosed` through Anchor's event CPI.
+`AuctionCleared` carries the full decrypted demand and supply curves, which the
+compact result no longer stores. Only these instructions reference the
+`["__event_authority"]` PDA, so `crates/indexer` follows that one address with
+`getSignaturesForAddress`, decodes the self-CPI events, persists them, and
+serves `GET /v1/markets/{market}/auctions` for the web chart. For on-chain price
+logic, `Market.recent_clearings` keeps the eight most recent publications
+(auction id, clearing price and volume), sorted by auction id because
+publications can land out of order.
 
 ### 14.6 Token vaults
 

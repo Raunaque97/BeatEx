@@ -2,6 +2,7 @@ import type { TraderCircuit, TraderProofOperation } from "./types.js";
 
 interface WasmTraderProver {
   loadProvingKey(circuit: TraderCircuit, bytes: Uint8Array): void;
+  loadProvingKeyForVersion?(circuit: TraderCircuit, circuitVersion: number, bytes: Uint8Array): void;
   isProvingKeyLoaded(circuit: TraderCircuit): boolean;
   proveDeposit(request: unknown): unknown;
   proveWithdrawal(request: unknown): unknown;
@@ -24,7 +25,7 @@ export interface TraderWasmBindings {
 export type TraderWasmModuleLoader = () => Promise<TraderWasmBindings>;
 
 export interface TraderWasmRuntime {
-  loadProvingKey(circuit: TraderCircuit, provingKey: ArrayBuffer): void;
+  loadProvingKey(circuit: TraderCircuit, circuitVersion: number, provingKey: ArrayBuffer): void;
   prove(operation: TraderProofOperation, request: unknown): unknown;
   dispose(): void;
 }
@@ -37,7 +38,7 @@ export async function createTraderWasmRuntime(
   const bindings = await loader();
   await bindings.default({ module_or_path: bytes });
   const version = bindings.traderProverApiVersion();
-  if (version !== 1) throw new TypeError(`Unsupported trader prover WASM API version ${version}`);
+  if (version !== 2) throw new TypeError(`Unsupported trader prover WASM API version ${version}`);
   return new BindgenTraderWasmRuntime(new bindings.TraderProver());
 }
 
@@ -48,8 +49,15 @@ class BindgenTraderWasmRuntime implements TraderWasmRuntime {
     this.#prover = prover;
   }
 
-  loadProvingKey(circuit: TraderCircuit, provingKey: ArrayBuffer): void {
-    this.#prover.loadProvingKey(circuit, new Uint8Array(provingKey));
+  loadProvingKey(circuit: TraderCircuit, circuitVersion: number, provingKey: ArrayBuffer): void {
+    if (this.#prover.loadProvingKeyForVersion === undefined) {
+      if (circuitVersion !== 1 && circuitVersion !== 2) {
+        throw new Error(`${circuit} circuit version ${circuitVersion} requires a newer WASM runtime`);
+      }
+      this.#prover.loadProvingKey(circuit, new Uint8Array(provingKey));
+    } else {
+      this.#prover.loadProvingKeyForVersion(circuit, circuitVersion, new Uint8Array(provingKey));
+    }
     if (!this.#prover.isProvingKeyLoaded(circuit)) {
       throw new Error(`${circuit} proving key did not remain loaded`);
     }
@@ -80,6 +88,6 @@ class BindgenTraderWasmRuntime implements TraderWasmRuntime {
 }
 
 async function loadGeneratedBindings(): Promise<TraderWasmBindings> {
-  const url = new URL("./generated/beatex_trader_wasm_prover.js", import.meta.url).href;
-  return import(/* @vite-ignore */ url) as Promise<TraderWasmBindings>;
+  // A static specifier so bundlers include the glue in whichever chunk uses it.
+  return (await import("./generated/beatex_trader_wasm_prover.js")) as unknown as TraderWasmBindings;
 }

@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
+import { existsSync, readFileSync } from "node:fs";
 import test from "node:test";
 import {
+  ACCOUNT_DISCRIMINATORS,
   BEATEX_PROGRAM_ADDRESS,
+  INSTRUCTION_DISCRIMINATORS,
+  DEVNET_FAST_ORDER_CIRCUIT_VERSION,
+  GENERATED_DEPLOYMENT,
   InMemoryPrivateStateStorage,
   QueueCircuitKind,
   createKitTransactionCompiler,
@@ -11,6 +16,7 @@ import {
   deriveMarketPda,
   derivePrivateBalancePda,
   deriveQueuedOrderPda,
+  deriveRolloverOrderPda,
   deriveSubmissionCounterPda,
   deriveVerificationKeyPda,
   deriveVaultAuthorityPda,
@@ -18,6 +24,7 @@ import {
   encodeDepositCollateral,
   encodeInitializeAuction,
   encodeBindRolloverOrder,
+  encodeCancelActiveOrder,
   encodePrepareRollover,
   encodeRolloverOrder,
   encodeSubmitQueuedOrder,
@@ -43,6 +50,11 @@ const proof = {
   proofC: fixed(64, 3),
   publicInput: fixed(32, 4),
 };
+
+test("generated protocol metadata keeps production order submission at v2 and Devnet-fast at v3", () => {
+  assert.equal(GENERATED_DEPLOYMENT.protocol.circuitVersions.ORDER_SUBMISSION, 2);
+  assert.equal(GENERATED_DEPLOYMENT.protocol.circuitVersions.DEVNET_FAST_ORDER, 3);
+});
 
 test("human token quantities convert exactly to configured units", () => {
   assert.equal(baseTokensToUnits("0.000001"), 1n);
@@ -76,6 +88,11 @@ test("Devnet PDA derivation matches the deployed market", async () => {
   assert.equal(typeof balance, "string");
   const [auction] = await deriveAuctionPda(market, 1007n);
   assert.equal(typeof auction, "string");
+  const [queuedOrder] = await deriveQueuedOrderPda(auction, OWNER, 7n);
+  const [differentNonceOrder] = await deriveQueuedOrderPda(auction, OWNER, 8n);
+  const [differentOwnerOrder] = await deriveQueuedOrderPda(auction, MARKET, 7n);
+  assert.notEqual(queuedOrder, differentNonceOrder);
+  assert.notEqual(queuedOrder, differentOwnerOrder);
 });
 
 test("instruction encoders preserve frozen Anchor wire lengths", () => {
@@ -121,6 +138,16 @@ test("instruction encoders preserve frozen Anchor wire lengths", () => {
     200,
   );
   assert.equal(encodeRolloverOrder().length, 8);
+  assert.equal(
+    encodeCancelActiveOrder({
+      clientOrderNonce: 9n,
+      releasedEncryptedBase: fixed(64),
+      releasedEncryptedQuote: fixed(64),
+      proof,
+    }).length,
+    432,
+  );
+  assert.equal(encodePrepareRollover().length, 8);
 });
 
 test("private-state journal records broadcast before atomic confirmation", async () => {
@@ -191,9 +218,9 @@ test("the frozen six-instruction rollover remains exactly 4,093 bytes", async ()
   const [oldAuction] = await deriveAuctionPda(MARKET, 822n);
   const [nextAuction] = await deriveAuctionPda(MARKET, 823n);
   const [nextCounter] = await deriveSubmissionCounterPda(nextAuction);
-  const [oldOrder] = await deriveQueuedOrderPda(oldAuction, 0n);
+  const [oldOrder] = await deriveQueuedOrderPda(oldAuction, owner, 1n);
   const [oldActive] = await deriveActiveOrderPda(oldAuction, owner);
-  const [nextOrder] = await deriveQueuedOrderPda(nextAuction, 0n);
+  const [nextOrder] = await deriveRolloverOrderPda(nextAuction, owner);
   const [nextActive] = await deriveActiveOrderPda(nextAuction, owner);
   const [balance] = await derivePrivateBalancePda(MARKET, owner);
   const [rolloverKey] = await deriveVerificationKeyPda(
@@ -204,7 +231,7 @@ test("the frozen six-instruction rollover remains exactly 4,093 bytes", async ()
   const [orderKey] = await deriveVerificationKeyPda(
     MARKET,
     QueueCircuitKind.OrderSubmission,
-    1,
+    DEVNET_FAST_ORDER_CIRCUIT_VERSION,
   );
   const settlement = {
     terminalNullifier: fixed(32),
@@ -296,4 +323,24 @@ test("the frozen six-instruction rollover remains exactly 4,093 bytes", async ()
     },
   });
   assert.equal(bytes.length, 4093);
+});
+
+const IDL_PATH = new URL("../../../target/idl/beatex.json", import.meta.url);
+
+test("hand-written instruction discriminators match the program IDL", { skip: !existsSync(IDL_PATH) }, () => {
+  const idl = JSON.parse(readFileSync(IDL_PATH, "utf8"));
+  const byName = new Map(idl.instructions.map((instruction) => [instruction.name, instruction.discriminator]));
+  for (const [name, discriminator] of Object.entries(INSTRUCTION_DISCRIMINATORS)) {
+    const snake = name.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`);
+    assert.deepEqual([...discriminator], byName.get(snake), name);
+  }
+});
+
+test("hand-written account discriminators match the program IDL", { skip: !existsSync(IDL_PATH) }, () => {
+  const idl = JSON.parse(readFileSync(IDL_PATH, "utf8"));
+  const byName = new Map(idl.accounts.map((account) => [account.name, account.discriminator]));
+  for (const [name, discriminator] of Object.entries(ACCOUNT_DISCRIMINATORS)) {
+    const pascal = name[0].toUpperCase() + name.slice(1);
+    assert.deepEqual([...discriminator], byName.get(pascal), name);
+  }
 });

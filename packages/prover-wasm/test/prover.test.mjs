@@ -36,7 +36,7 @@ async function fixture() {
     assets,
     manifest: {
       schemaVersion: 1,
-      backend: "beatex-arkworks-groth16-wasm-v1",
+      backend: "beatex-arkworks-groth16-wasm-v2",
       provingKeyEncoding: "arkworks-canonical-uncompressed-v1",
       runtime: await descriptor("runtime.wasm", get("https://assets.example/runtime.wasm")),
       circuits: {
@@ -45,15 +45,15 @@ async function fixture() {
           provingKey: await descriptor("balance.pk", get("https://assets.example/balance.pk")),
         },
         order: {
-          circuitVersion: 1,
+          circuitVersion: 3,
           provingKey: await descriptor("order.pk", get("https://assets.example/order.pk")),
         },
         release: {
-          circuitVersion: 1,
+          circuitVersion: 2,
           provingKey: await descriptor("release.pk", get("https://assets.example/release.pk")),
         },
         settlement: {
-          circuitVersion: 1,
+          circuitVersion: 3,
           provingKey: await descriptor("settlement.pk", get("https://assets.example/settlement.pk")),
         },
       },
@@ -127,6 +127,11 @@ class FakeWorker {
 
   addEventListener(type, listener) {
     (type === "message" ? this.messageListeners : this.errorListeners).add(listener);
+    // A real worker announces readiness after evaluating its script.
+    if (type === "message" && !this.announced) {
+      this.announced = true;
+      queueMicrotask(() => this.emit({ type: "ready" }));
+    }
   }
 
   removeEventListener(type, listener) {
@@ -302,6 +307,10 @@ test("wasm-bindgen runtime dispatches without JSON or number conversion", async 
       calls.push(["load", circuit, [...value]]);
       this.loaded.add(circuit);
     }
+    loadProvingKeyForVersion(circuit, circuitVersion, value) {
+      calls.push(["load", circuit, circuitVersion, [...value]]);
+      this.loaded.add(circuit);
+    }
     isProvingKeyLoaded(circuit) { return this.loaded.has(circuit); }
     proveDeposit(request) { calls.push(["deposit", request]); return request; }
     proveWithdrawal(request) { return request; }
@@ -313,15 +322,45 @@ test("wasm-bindgen runtime dispatches without JSON or number conversion", async 
   }
   const runtime = await createTraderWasmRuntime(bytes(0), async () => ({
     default: async ({ module_or_path: wasm }) => calls.push(["initialize", wasm.byteLength]),
-    traderProverApiVersion: () => 1,
+    traderProverApiVersion: () => 2,
     TraderProver: FakeBindingsProver,
   }));
-  runtime.loadProvingKey("balance", bytes(1, 2));
+  runtime.loadProvingKey("balance", 1, bytes(1, 2));
   const request = { amount: 42n, salt: Uint8Array.of(1, 2, 3) };
   assert.equal(runtime.prove("deposit", request), request);
   assert.deepEqual(calls, [
     ["initialize", 1],
-    ["load", "balance", [1, 2]],
+    ["load", "balance", 1, [1, 2]],
     ["deposit", request],
   ]);
+});
+
+test("requests wait for the worker's ready signal before any message is posted", async () => {
+  class LateWorker extends FakeWorker {
+    addEventListener(type, listener) {
+      (type === "message" ? this.messageListeners : this.errorListeners).add(listener);
+    }
+  }
+  const worker = new LateWorker();
+  const { prover } = await setup({ worker });
+  const pending = prover.proveDeposit({ marker: "deposit" });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(worker.messages.length, 0, "nothing is sent before ready");
+  worker.emit({ type: "ready" });
+  assert.equal((await pending).operation, "deposit");
+  prover.dispose();
+});
+
+test("a worker that never starts fails requests instead of hanging", async () => {
+  class SilentWorker extends FakeWorker {
+    addEventListener(type, listener) {
+      (type === "message" ? this.messageListeners : this.errorListeners).add(listener);
+    }
+  }
+  const { prover } = await setup({
+    worker: new SilentWorker(),
+    options: { workerStartupTimeoutMs: 30 },
+  });
+  await assert.rejects(prover.proveDeposit({ marker: "deposit" }), /did not start/);
+  prover.dispose();
 });

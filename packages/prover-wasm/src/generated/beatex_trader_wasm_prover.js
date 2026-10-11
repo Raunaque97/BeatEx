@@ -211,7 +211,7 @@ const TraderProverFinalization = (typeof FinalizationRegistry === 'undefined')
  * One in-memory runtime for every proof needed by a trader frontend.
  *
  * Key bytes must be SHA-256-authenticated Arkworks canonical-uncompressed
- * `ProvingKey<Bn254>` artifacts for circuit version 1. Each artifact is
+ * `ProvingKey<Bn254>` artifacts for circuit version 2. Each artifact is
  * decoded exactly once. The official TypeScript loader performs the required
  * digest and byte-length checks before calling this lower-level API.
  */
@@ -248,6 +248,28 @@ export class TraderProver {
             const ptr1 = passArray8ToWasm0(bytes, wasm.__wbindgen_export_0);
             const len1 = WASM_VECTOR_LEN;
             wasm.traderprover_loadProvingKey(retptr, this.__wbg_ptr, ptr0, len0, ptr1, len1);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            if (r1) {
+                throw takeObject(r0);
+            }
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * @param {string} circuit
+     * @param {number} circuit_version
+     * @param {Uint8Array} bytes
+     */
+    loadProvingKeyForVersion(circuit, circuit_version, bytes) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(circuit, wasm.__wbindgen_export_0, wasm.__wbindgen_export_1);
+            const len0 = WASM_VECTOR_LEN;
+            const ptr1 = passArray8ToWasm0(bytes, wasm.__wbindgen_export_0);
+            const len1 = WASM_VECTOR_LEN;
+            wasm.traderprover_loadProvingKeyForVersion(retptr, this.__wbg_ptr, ptr0, len0, circuit_version, ptr1, len1);
             var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
             var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
             if (r1) {
@@ -777,9 +799,7 @@ async function __wbg_init(module_or_path) {
         }
     }
 
-    if (typeof module_or_path === 'undefined') {
-        module_or_path = new URL('beatex_trader_wasm_prover_bg.wasm', import.meta.url);
-    }
+
     const imports = __wbg_get_imports();
 
     if (typeof module_or_path === 'string' || (typeof Request === 'function' && module_or_path instanceof Request) || (typeof URL === 'function' && module_or_path instanceof URL)) {

@@ -4,6 +4,7 @@ members = [
     "crates/babyjubjub-groth16-spike",
     "crates/auction-sim",
     "crates/devnet-client",
+    "crates/indexer",
     "crates/groth16-spike",
     "crates/market-maker",
     "crates/threshold-crypto",

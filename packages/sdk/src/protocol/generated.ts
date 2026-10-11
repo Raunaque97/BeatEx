@@ -4,27 +4,27 @@
  */
 export const GENERATED_CLUSTER = "devnet";
 export const GENERATED_PROGRAM_ID = "2P37xv7CzDv7pSet6LaXJDq4m1auW3pZ8PzPLtErfsVd";
-export const GENERATED_MARKET_ID: string | null = "3haCd5iqRJuk9FGVFRdkW6jMnKQL4CH4vgwdpVc8XzxS";
+export const GENERATED_MARKET_ID: string | null = "3gnpAdrTnHxgQMiGgR7y6zPd2vP4uZLqyWt1TvVtCdGt";
 export const GENERATED_DEPLOYMENT = {
   "schemaVersion": 1,
   "cluster": "devnet",
   "programId": "2P37xv7CzDv7pSet6LaXJDq4m1auW3pZ8PzPLtErfsVd",
-  "market": "3haCd5iqRJuk9FGVFRdkW6jMnKQL4CH4vgwdpVc8XzxS",
-  "vaultAuthority": "2gbWNfRTH37Nvc3k3FCayaT1FvXysDTF8KKE3SpcWnWN",
-  "keyEpoch": "AoJ755HzDcFx8VZB3rpotAWRszxv7dCVZYX9WSRe3abe",
+  "market": "3gnpAdrTnHxgQMiGgR7y6zPd2vP4uZLqyWt1TvVtCdGt",
+  "vaultAuthority": "GX352jffG1zdZ3juFr2HVyoCc5vJ5LWQJWmtDcBM9np7",
+  "keyEpoch": "GUmGUhaqt7oAt1YkyrAT45CbApGHPxbJTdL73yL6mrED",
   "baseMint": "33D68TXfhVb8qiKXBF6yob5opkaeD4ayPsNPketQdgxm",
   "quoteMint": "7Fg3pJw2stGKi7WTQRYNsWYqYrFcuwziD8C5HpH9s9Ng",
-  "baseVault": "GGjBZSXRVm3yQ5yh1bBSzh9yuzJ7nWeEgfNGGv65LasK",
-  "quoteVault": "4GQapjjphiQiEBt85JuCrAZz1fQfCZJU41PLqS4snBZi",
+  "baseVault": "66hcLz9vzMcnb98yjiUa1aiJWZUnyDCg9jjbxAXerxTU",
+  "quoteVault": "BukhQVo4ebbCbdPaithQvAT8yqhYLHh2wmvxfVbr21j2",
   "verificationKeys": {
-    "vk-OrderSubmission-v1": "AghGudLf9ViZAxXZ3cP1cbML3LHN5HaPykocHY1ZfZNd",
-    "vk-AggregateFold-v2": "Aprm48rLwzjzChamEwryCUfbps7juQtAR7zTB9BzRExA",
-    "vk-BalanceDeposit-v1": "FSiCRBAfhDTSxTJmK9zJXMWiJASNP2vFiF4JMhiZYgEr",
-    "vk-AggregatePublication-v2": "HH6GiLwbW7LUwbA9BMZo9SUPTJ5BfLafLeiU4W5rfxSA",
-    "vk-PrivateClaim-v1": "3DQ22he42PwJwjpjugfdob1eGccHwspPgSMD6x8aehPt",
-    "vk-CancellationRefund-v1": "D6NjbWXim7E2pSy6jLT2mku5yFw7abWN3CjgfW21e1F4",
-    "vk-OrderModification-v1": "3tnPsgJHNg3dznkkYZJgLxVBWXawGUniuMtrSkFmb72Q",
-    "vk-RolloverSettlement-v1": "6r2btDmfXHgFpxQMfN26MPxfMmmYrnhkC3fY5VnVisvr"
+    "vk-OrderSubmission-v3": "6kVvod6mAs88yCuNPLfVRqZmdXdALT7t8BFYp6MJ1mYg",
+    "vk-AggregateFold-v3": "6FmeQAC6yvoQVQuCL1XTJo2VqXS3gdYRLVmsXvDcUpTt",
+    "vk-BalanceDeposit-v1": "6RYzpuCsjK9S8gjdvFvNu5nn1FUMzSe8K1f2Cbq2GqqH",
+    "vk-AggregatePublication-v3": "CCcUzpxmgrK8GueBuVkyFoXoYnziKradysDQ4WnFEjk1",
+    "vk-PrivateClaim-v3": "4EZctuoSGwNWwYHg2kAM3iSxM9nf1bixepXGJmFkQSZT",
+    "vk-CancellationRefund-v3": "DEK5QxS3Zs1pVKbMbKDkHArykBTdt3MkAnwTerdcwB5q",
+    "vk-OrderModification-v2": "2FrDMXwJthoft4r8mCMwv8ZiRw4LGdDtM4iQuWtJgwWP",
+    "vk-RolloverSettlement-v3": "Dsut4PFu8YRSmEz2Pg1j12FkArQLWm6Z2U39ZGJpCm5U"
   },
   "protocol": {
     "protocolVersion": 2,
@@ -35,13 +35,15 @@ export const GENERATED_DEPLOYMENT = {
     "quantityBits": 28,
     "circuitVersions": {
       "ORDER_SUBMISSION": 2,
+      "DEVNET_FAST_ORDER": 3,
       "BALANCE_DEPOSIT": 1,
-      "AGGREGATE_FOLD": 2,
-      "AGGREGATE_PUBLICATION": 2,
+      "AGGREGATE_FOLD": 3,
+      "AGGREGATE_PUBLICATION": 3,
       "ORDER_MODIFICATION": 2,
-      "ROLLOVER_SETTLEMENT": 2,
-      "PRIVATE_CLAIM": 2,
-      "CANCELLATION_REFUND": 2
+      "ROLLOVER_SETTLEMENT": 3,
+      "PRIVATE_CLAIM": 3,
+      "CANCELLATION_REFUND": 3
     }
-  }
+  },
+  "idlSha256": "0def851424c173f1421cf4e886902027d2587b31cb9ff8c873aaa8dfe4556600"
 } as const;

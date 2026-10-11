@@ -24,7 +24,7 @@ use {
         },
         deposit::{self, DepositProofRequest, DepositProver, PublicWithdrawalProofRequest},
         release::{CollateralReleaseProofRequest, CollateralReleaseProver, ReplacementProver},
-        rollover::{MarketMakerRolloverProver, RolloverProofRequest, RolloverProver},
+        rollover::{MarketMakerRolloverProofOutput, RolloverProofRequest, RolloverProver},
         transition::{
             self, FoldEventInput, FoldProofRequest, FoldProver, OrderProofRequest, OrderProver,
             PrivateBalanceOpening, SolanaVerificationKey,
@@ -40,9 +40,22 @@ use {
     },
     rand_chacha::{rand_core::SeedableRng, ChaCha20Rng},
     serde::{Deserialize, Serialize},
+    solana_compute_budget_interface::ComputeBudgetInstruction,
+    solana_hash::Hash,
+    solana_hash_v1::Hash as V1Hash,
     solana_instruction::{AccountMeta, Instruction},
+    solana_instruction_v1::{AccountMeta as V1AccountMeta, Instruction as V1Instruction},
     solana_keypair::{read_keypair_file, write_keypair_file, Keypair},
+    solana_keypair_v1::read_keypair_file as read_v1_keypair_file,
+    solana_message::Message,
+    solana_message_v1::{
+        v1::{Message as V1Message, TransactionConfig as V1TransactionConfig},
+        VersionedMessage as V1VersionedMessage,
+    },
     solana_signer::Signer,
+    solana_signer_v1::Signer as V1Signer,
+    solana_transaction::Transaction,
+    solana_transaction_v1::versioned::VersionedTransaction as V1Transaction,
     solana_zk_sdk::encryption::{derivation::derive_confidential_keys, elgamal::ElGamalCiphertext},
     spl_token_2022_interface::{
         extension::{
@@ -52,21 +65,44 @@ use {
         state::Account as TokenAccount,
     },
     std::{
+        cell::RefCell,
+        collections::{HashMap, HashSet},
         env,
         error::Error,
         fs::{self, OpenOptions},
-        io::{Read, Write},
+        io::{IsTerminal, Read, Write},
         path::{Path, PathBuf},
-        process::{Command, Stdio},
         str::FromStr,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            mpsc, Arc, OnceLock,
+        },
+        thread,
+        time::{Duration, Instant},
     },
 };
+
+#[cfg(feature = "browser-wallet")]
+use std::process::{Command, Stdio};
 
 const DEFAULT_RPC_URL: &str = "https://api.devnet.solana.com";
 const PYTH_BTC_USD_ACCOUNT: &str = "4cSM2e6rvbGQUFiJbqytoVMi5GgghSMr8LwVrT9VPSPo";
 const PYTH_BTC_USD_FEED: &str = "e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43";
-const MARKET_NONCE: u64 = 3;
+// Increment when immutable Devnet market configuration changes.
+const MARKET_NONCE: u64 = 11;
 const KEY_EPOCH: u64 = 1;
+const DEVNET_ORACLE_MAX_AGE_SECONDS: u64 = 24 * 60 * 60;
+const DEVNET_SUBMISSION_DURATION_SLOTS: u64 = 40;
+const DEVNET_AGGREGATION_DURATION_SLOTS: u64 = 200;
+const DEVNET_DECRYPTION_DURATION_SLOTS: u64 = 200;
+const MAX_COMMITTEE_AUCTION_WORKERS: usize = 4;
+// Market makers submit early in the window, so the last fold starts this many
+// slots before the close instead of waiting for it. Orders arriving later are
+// picked up by one extra fold before publication.
+const FINAL_FOLD_LEAD_SLOTS: u64 = 12;
+// Leave enough room for RPC submission and validator execution after proving.
+// Two slots was shorter than the observed native transaction path on Devnet.
+const MIN_ORDER_SEND_REMAINING_SLOTS: u64 = 8;
 const TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 
 #[derive(Clone, Debug)]
@@ -125,6 +161,12 @@ struct BundleInstruction {
     data_base64: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TransactionCompletion {
+    Confirmed,
+    ConfirmedNoPreflight,
+}
+
 #[derive(Deserialize)]
 struct RpcResponse {
     result: RpcResult,
@@ -141,23 +183,223 @@ struct RpcAccount {
 }
 
 #[derive(Deserialize)]
-struct ProgramAccountsResponse {
-    result: Vec<KeyedRpcAccount>,
+struct MultipleAccountsResponse {
+    result: MultipleAccountsResult,
 }
 
 #[derive(Deserialize)]
-struct KeyedRpcAccount {
-    pubkey: String,
-    account: RpcAccount,
+struct MultipleAccountsResult {
+    value: Vec<Option<RpcAccount>>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
-struct OrderIntent {
-    reference_price: u64,
-    grid_step_bps: u16,
-    client_order_nonce: u64,
-    buy: [u64; beatex_babyjubjub_groth16_spike::LEVELS],
-    sell: [u64; beatex_babyjubjub_groth16_spike::LEVELS],
+pub struct NativeOrderIntent {
+    #[serde(default)]
+    pub auction_id: Option<u64>,
+    pub reference_price: u64,
+    pub grid_step_bps: u16,
+    pub client_order_nonce: u64,
+    pub buy: [u64; beatex_babyjubjub_groth16_spike::LEVELS],
+    pub sell: [u64; beatex_babyjubjub_groth16_spike::LEVELS],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NativeOrderEvent {
+    Placed {
+        auction_id: u64,
+    },
+    Replaced {
+        auction_id: u64,
+    },
+    Rollover {
+        previous_auction_id: u64,
+        next_auction_id: u64,
+    },
+    Fill {
+        auction_id: u64,
+        side: String,
+        base_amount: u64,
+        quote_amount: u64,
+    },
+    Refund {
+        auction_id: u64,
+        base_amount: u64,
+        quote_amount: u64,
+    },
+}
+
+thread_local! {
+    static NATIVE_ORDER_EVENTS: RefCell<Option<Vec<NativeOrderEvent>>> = const { RefCell::new(None) };
+    // Groth16 circuit setup is intentionally deterministic for Devnet, but it
+    // is still very expensive. Keep one proving key per worker thread so a
+    // long-lived native client pays setup cost only on its first use of each
+    // circuit. Thread-local storage avoids sharing Arkworks proving keys
+    // across workers while keeping the hot proving path lock-free.
+    static DEVNET_DEPOSIT_PROVER: RefCell<Option<DepositProver>> = const { RefCell::new(None) };
+    static DEVNET_ORDER_PROVER: RefCell<Option<OrderProver>> = const { RefCell::new(None) };
+    static DEVNET_FAST_ORDER_PROVER: RefCell<Option<OrderProver>> = const { RefCell::new(None) };
+    static DEVNET_REPLACEMENT_PROVER: RefCell<Option<ReplacementProver>> = const { RefCell::new(None) };
+    static DEVNET_FAST_REPLACEMENT_PROVER: RefCell<Option<ReplacementProver>> = const { RefCell::new(None) };
+    static DEVNET_ROLLOVER_PROVER: RefCell<Option<RolloverProver>> = const { RefCell::new(None) };
+    static DEVNET_COLLATERAL_RELEASE_PROVER: RefCell<Option<CollateralReleaseProver>> =
+        const { RefCell::new(None) };
+}
+
+static DEVNET_FAST_FOLD_PROVER: OnceLock<FoldProver> = OnceLock::new();
+static DEVNET_FAST_PUBLICATION_PROVER: OnceLock<AggregatePublicationProver> = OnceLock::new();
+
+fn devnet_fast_fold_prover() -> Result<&'static FoldProver, Box<dyn Error>> {
+    if let Some(prover) = DEVNET_FAST_FOLD_PROVER.get() {
+        return Ok(prover);
+    }
+    let prover = FoldProver::deterministic_devnet_fast()?;
+    let _ = DEVNET_FAST_FOLD_PROVER.set(prover);
+    DEVNET_FAST_FOLD_PROVER
+        .get()
+        .ok_or_else(|| "fold prover cache initialization failed".into())
+}
+
+fn devnet_fast_publication_prover() -> Result<&'static AggregatePublicationProver, Box<dyn Error>> {
+    if let Some(prover) = DEVNET_FAST_PUBLICATION_PROVER.get() {
+        return Ok(prover);
+    }
+    let prover = AggregatePublicationProver::deterministic_devnet_fast()?;
+    let _ = DEVNET_FAST_PUBLICATION_PROVER.set(prover);
+    DEVNET_FAST_PUBLICATION_PROVER
+        .get()
+        .ok_or_else(|| "publication prover cache initialization failed".into())
+}
+
+fn with_deposit_prover<T>(
+    f: impl FnOnce(&DepositProver) -> Result<T, Box<dyn Error>>,
+) -> Result<T, Box<dyn Error>> {
+    DEVNET_DEPOSIT_PROVER.with(|cached| {
+        let mut cached = cached.borrow_mut();
+        if cached.is_none() {
+            *cached = Some(DepositProver::deterministic_devnet()?);
+        }
+        f(cached.as_ref().expect("deposit prover cache initialized"))
+    })
+}
+
+fn with_order_prover<T>(
+    version: u16,
+    f: impl FnOnce(&OrderProver) -> Result<T, Box<dyn Error>>,
+) -> Result<T, Box<dyn Error>> {
+    let cache = if version == queue::DEVNET_FAST_ORDER_CIRCUIT_VERSION {
+        &DEVNET_FAST_ORDER_PROVER
+    } else {
+        &DEVNET_ORDER_PROVER
+    };
+    cache.with(|cached| {
+        let mut cached = cached.borrow_mut();
+        if cached.is_none() {
+            *cached = Some(if version == queue::DEVNET_FAST_ORDER_CIRCUIT_VERSION {
+                OrderProver::deterministic_devnet_fast()?
+            } else {
+                OrderProver::deterministic_devnet()?
+            });
+        }
+        f(cached.as_ref().expect("order prover cache initialized"))
+    })
+}
+
+fn with_replacement_prover<T>(
+    version: u16,
+    f: impl FnOnce(&ReplacementProver) -> Result<T, Box<dyn Error>>,
+) -> Result<T, Box<dyn Error>> {
+    let cache = if version == queue::DEVNET_FAST_ORDER_CIRCUIT_VERSION {
+        &DEVNET_FAST_REPLACEMENT_PROVER
+    } else {
+        &DEVNET_REPLACEMENT_PROVER
+    };
+    cache.with(|cached| {
+        let mut cached = cached.borrow_mut();
+        if cached.is_none() {
+            *cached = Some(if version == queue::DEVNET_FAST_ORDER_CIRCUIT_VERSION {
+                ReplacementProver::deterministic_devnet_fast()?
+            } else {
+                ReplacementProver::deterministic_devnet()?
+            });
+        }
+        f(cached
+            .as_ref()
+            .expect("replacement prover cache initialized"))
+    })
+}
+
+fn with_rollover_prover<T>(
+    f: impl FnOnce(&RolloverProver) -> Result<T, Box<dyn Error>>,
+) -> Result<T, Box<dyn Error>> {
+    DEVNET_ROLLOVER_PROVER.with(|cached| {
+        let mut cached = cached.borrow_mut();
+        if cached.is_none() {
+            *cached = Some(RolloverProver::deterministic_devnet_fast()?);
+        }
+        f(cached.as_ref().expect("rollover prover cache initialized"))
+    })
+}
+
+fn with_collateral_release_prover<T>(
+    f: impl FnOnce(&CollateralReleaseProver) -> Result<T, Box<dyn Error>>,
+) -> Result<T, Box<dyn Error>> {
+    DEVNET_COLLATERAL_RELEASE_PROVER.with(|cached| {
+        let mut cached = cached.borrow_mut();
+        if cached.is_none() {
+            *cached = Some(CollateralReleaseProver::deterministic_devnet()?);
+        }
+        f(cached
+            .as_ref()
+            .expect("collateral release prover cache initialized"))
+    })
+}
+
+/// Initialize the proving keys used by the native market-maker hot path on
+/// the calling thread. The caches are thread-local, so long-lived workers
+/// should call this once before accepting their first order.
+pub fn warm_native_market_maker_provers() -> Result<(), String> {
+    with_deposit_prover(|_| Ok(())).map_err(|error| error.to_string())?;
+    with_order_prover(queue::DEVNET_FAST_ORDER_CIRCUIT_VERSION, |_| Ok(()))
+        .map_err(|error| error.to_string())?;
+    with_rollover_prover(|_| Ok(())).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn emit_order_event(event: NativeOrderEvent) {
+    NATIVE_ORDER_EVENTS.with(|capture| {
+        let mut capture = capture.borrow_mut();
+        if let Some(events) = capture.as_mut() {
+            events.push(event);
+            return;
+        }
+        match event {
+            NativeOrderEvent::Placed { auction_id } => {
+                println!("BEATEX_ORDER_EVENT\tplaced\t{auction_id}")
+            }
+            NativeOrderEvent::Replaced { auction_id } => {
+                println!("BEATEX_ORDER_EVENT\treplaced\t{auction_id}")
+            }
+            NativeOrderEvent::Rollover {
+                previous_auction_id,
+                next_auction_id,
+            } => println!("BEATEX_ORDER_EVENT\trollover\t{previous_auction_id}\t{next_auction_id}"),
+            NativeOrderEvent::Fill {
+                auction_id,
+                side,
+                base_amount,
+                quote_amount,
+            } => println!(
+                "BEATEX_ORDER_EVENT\tfill\t{auction_id}\t{side}\t{base_amount}\t{quote_amount}"
+            ),
+            NativeOrderEvent::Refund {
+                auction_id,
+                base_amount,
+                quote_amount,
+            } => {
+                println!("BEATEX_ORDER_EVENT\trefund\t{auction_id}\t{base_amount}\t{quote_amount}")
+            }
+        }
+    });
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -208,10 +450,102 @@ struct StoredOrder {
 struct TraderPrivateState {
     revision: u64,
     balance: StoredBalance,
+    #[serde(default)]
+    active_orders: Vec<StoredOrder>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     active_order: Option<StoredOrder>,
 }
 
-#[derive(Debug)]
+impl TraderPrivateState {
+    fn normalize(mut self) -> Self {
+        if let Some(legacy) = self.active_order.take() {
+            if !self
+                .active_orders
+                .iter()
+                .any(|order| order.auction_id == legacy.auction_id)
+            {
+                self.active_orders.push(legacy);
+            }
+        }
+        self.active_orders.sort_by_key(|order| order.auction_id);
+        self
+    }
+
+    fn order(&self, auction_id: u64) -> Option<&StoredOrder> {
+        self.active_orders
+            .iter()
+            .find(|order| order.auction_id == auction_id)
+    }
+
+    fn upsert_order(&mut self, order: StoredOrder) {
+        self.active_orders
+            .retain(|existing| existing.auction_id != order.auction_id);
+        self.active_orders.push(order);
+        self.active_orders.sort_by_key(|order| order.auction_id);
+    }
+
+    fn remove_order(&mut self, auction_id: u64) {
+        self.active_orders
+            .retain(|order| order.auction_id != auction_id);
+    }
+
+    fn has_active_orders(&self) -> bool {
+        !self.active_orders.is_empty()
+    }
+}
+
+struct FillEvent {
+    side: &'static str,
+    base_amount: u64,
+    quote_amount: u64,
+}
+
+fn fill_event(
+    auction: &beatex::AuctionResult,
+    order: &StoredOrder,
+) -> Result<Option<FillEvent>, Box<dyn Error>> {
+    let index = usize::from(auction.clearing_index);
+    let allocation = allocation::allocate(allocation::AllocationInput {
+        buy: order.buy[index],
+        sell: order.sell[index],
+        demand: auction.demand_at_clearing,
+        supply: auction.supply_at_clearing,
+        clearing_price: auction.clearing_price,
+        base_reserve: order.base_reserve,
+        quote_reserve: order.quote_reserve,
+    })
+    .map_err(|error| format!("private allocation failed: {error:?}"))?;
+    if order.buy[index] != 0 {
+        Ok(Some(FillEvent {
+            side: "buy",
+            base_amount: allocation.base_credit,
+            quote_amount: allocation.quote_debit,
+        }))
+    } else if order.sell[index] != 0 {
+        Ok(Some(FillEvent {
+            side: "sell",
+            base_amount: allocation.base_debit,
+            quote_amount: allocation.quote_credit,
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct NativeOrderConfig {
+    pub base_mint: Pubkey,
+    pub quote_mint: Pubkey,
+    pub wallet: PathBuf,
+    pub state_dir: PathBuf,
+    pub rpc_url: String,
+    pub base_source: Pubkey,
+    pub quote_source: Pubkey,
+    pub deposit_base: u64,
+    pub deposit_quote: u64,
+}
+
+#[derive(Clone, Debug)]
 struct OrderConfig {
     common: CommonConfig,
     wallet: PathBuf,
@@ -228,6 +562,61 @@ struct FoldConfig {
     wallet: PathBuf,
     rpc_url: String,
     auction_id: u64,
+    max_batches: usize,
+    coordinator_logs: bool,
+}
+
+#[derive(Debug)]
+struct AuctionStatusConfig {
+    common: CommonConfig,
+    rpc_url: String,
+    auction_id: u64,
+}
+
+#[derive(Debug)]
+struct MarketStatusConfig {
+    common: CommonConfig,
+    rpc_url: String,
+}
+
+#[derive(Clone, Debug)]
+struct PipelineAuction {
+    auction_id: u64,
+    state: beatex::AuctionState,
+    submission_end_slot: u64,
+    aggregation_deadline_slot: u64,
+    decryption_deadline_slot: u64,
+    accepted_orders: u64,
+    folded_orders: u64,
+}
+
+fn fetch_committee_auction_accounts(
+    rpc_url: &str,
+    addresses: &AuctionAddresses,
+) -> Result<Option<(beatex::Auction, SubmissionCounter, AggregateAccumulator)>, Box<dyn Error>> {
+    let mut accounts = fetch_multiple_account_bytes(
+        rpc_url,
+        &[
+            addresses.auction,
+            addresses.submission_counter,
+            addresses.accumulator,
+        ],
+    )?
+    .into_iter();
+    let Some(auction_bytes) = accounts.next().flatten() else {
+        return Ok(None);
+    };
+    let Some(counter_bytes) = accounts.next().flatten() else {
+        return Ok(None);
+    };
+    let Some(accumulator_bytes) = accounts.next().flatten() else {
+        return Ok(None);
+    };
+    Ok(Some((
+        beatex::Auction::try_deserialize(&mut auction_bytes.as_slice())?,
+        SubmissionCounter::try_deserialize(&mut counter_bytes.as_slice())?,
+        AggregateAccumulator::try_deserialize(&mut accumulator_bytes.as_slice())?,
+    )))
 }
 
 #[derive(Debug)]
@@ -236,6 +625,7 @@ struct PublishConfig {
     wallet: PathBuf,
     rpc_url: String,
     auction_id: u64,
+    coordinator_logs: bool,
 }
 
 #[derive(Debug)]
@@ -289,7 +679,7 @@ struct AuctionAddresses {
 
 fn usage() {
     eprintln!(
-        "Usage:\n  beatex-devnet-client addresses --base-mint PUBKEY --quote-mint PUBKEY --state-dir DIR\n\n  beatex-devnet-client initialize --base-mint PUBKEY --quote-mint PUBKEY --base-vault PUBKEY --quote-vault PUBKEY --wallet KEYPAIR --vault-owner KEYPAIR --state-dir DIR --market-start-slot SLOT [--rpc-url URL]\n\n  beatex-devnet-client order --base-mint PUBKEY --quote-mint PUBKEY --base-source PUBKEY --quote-source PUBKEY --wallet KEYPAIR --state-dir DIR [--rpc-url URL]\n\n  beatex-devnet-client fold --base-mint PUBKEY --quote-mint PUBKEY --auction-id N --wallet KEYPAIR --state-dir DIR [--rpc-url URL]\n\n  beatex-devnet-client publish --base-mint PUBKEY --quote-mint PUBKEY --auction-id N --wallet KEYPAIR --state-dir DIR [--rpc-url URL]\n\n  beatex-devnet-client cancel --base-mint PUBKEY --quote-mint PUBKEY --auction-id N --wallet KEYPAIR --state-dir DIR [--rpc-url URL]\n\n  beatex-devnet-client settle-balance|refund-balance --base-mint PUBKEY --quote-mint PUBKEY --auction-id N --wallet TRADER_KEYPAIR --state-dir DIR [--rpc-url URL]\n\n  beatex-devnet-client withdraw --base-mint PUBKEY --quote-mint PUBKEY --wallet TRADER_KEYPAIR --base-destination PUBKEY --quote-destination PUBKEY --base-amount N --quote-amount N --state-dir DIR [--rpc-url URL]\n\n  beatex-devnet-client claim|refund --base-mint PUBKEY --quote-mint PUBKEY --auction-id N --wallet FEE_PAYER_KEYPAIR --owner TRADER_KEYPAIR --vault-owner KEYPAIR --base-destination PUBKEY --quote-destination PUBKEY --state-dir DIR [--rpc-url URL]\n\nThe default fast path keeps custody in the vault's public Token-2022 balance while all trading balances remain encrypted. settle-balance and refund-balance credit the internal ledger; withdraw debits it and performs one public token withdrawal. Legacy claim and refund retain the slower confidential Token-2022 exit. The client refuses mainnet URLs."
+        "Usage:\n  beatex-devnet-client addresses --base-mint PUBKEY --quote-mint PUBKEY --state-dir DIR\n\n  beatex-devnet-client initialize --base-mint PUBKEY --quote-mint PUBKEY --base-vault PUBKEY --quote-vault PUBKEY --wallet KEYPAIR --vault-owner KEYPAIR --state-dir DIR --market-start-slot SLOT [--rpc-url URL]\n\n  beatex-devnet-client committee --base-mint PUBKEY --quote-mint PUBKEY --wallet KEYPAIR --state-dir DIR [--rpc-url URL]\n\n  beatex-devnet-client watch-auctions --base-mint PUBKEY --quote-mint PUBKEY --wallet KEYPAIR --state-dir DIR [--rpc-url URL]\n\n  beatex-devnet-client auction --base-mint PUBKEY --quote-mint PUBKEY --auction-id N --wallet KEYPAIR --state-dir DIR [--rpc-url URL]\n\n  beatex-devnet-client market-status|pipeline-status --base-mint PUBKEY --quote-mint PUBKEY --state-dir DIR [--rpc-url URL]\n\n  beatex-devnet-client auction-status --base-mint PUBKEY --quote-mint PUBKEY --auction-id N --state-dir DIR [--rpc-url URL]\n\n  beatex-devnet-client order --base-mint PUBKEY --quote-mint PUBKEY --base-source PUBKEY --quote-source PUBKEY --wallet KEYPAIR --state-dir DIR [--rpc-url URL]\n\n  beatex-devnet-client fold --base-mint PUBKEY --quote-mint PUBKEY --auction-id N --wallet KEYPAIR --state-dir DIR [--rpc-url URL] [--max-batches N]\n\n  beatex-devnet-client publish --base-mint PUBKEY --quote-mint PUBKEY --auction-id N --wallet KEYPAIR --state-dir DIR [--rpc-url URL]\n\n  beatex-devnet-client cancel --base-mint PUBKEY --quote-mint PUBKEY --auction-id N --wallet KEYPAIR --state-dir DIR [--rpc-url URL]\n\n  beatex-devnet-client settle-balance|refund-balance --base-mint PUBKEY --quote-mint PUBKEY --auction-id N --wallet TRADER_KEYPAIR --state-dir DIR [--rpc-url URL]\n\n  beatex-devnet-client withdraw --base-mint PUBKEY --quote-mint PUBKEY --wallet TRADER_KEYPAIR --base-destination PUBKEY --quote-destination PUBKEY --base-amount N --quote-amount N --state-dir DIR [--rpc-url URL]\n\n  beatex-devnet-client claim|refund --base-mint PUBKEY --quote-mint PUBKEY --auction-id N --wallet FEE_PAYER_KEYPAIR --owner TRADER_KEYPAIR --vault-owner KEYPAIR --base-destination PUBKEY --quote-destination PUBKEY --state-dir DIR [--rpc-url URL]\n\nThe default fast path keeps custody in the vault's public Token-2022 balance while all trading balances remain encrypted. settle-balance and refund-balance credit the internal ledger; withdraw debits it and performs one public token withdrawal. Legacy claim and refund retain the slower confidential Token-2022 exit. The client refuses mainnet URLs."
     );
 }
 
@@ -356,25 +746,18 @@ fn print_addresses(config: &CommonConfig) -> Result<(), Box<dyn Error>> {
 }
 
 fn account_exists(rpc_url: &str, address: &Pubkey) -> bool {
-    Command::new("solana")
-        .args([
-            "--url",
-            rpc_url,
-            "account",
-            &address.to_string(),
-            "--output",
-            "json-compact",
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+    account_exists_result(rpc_url, address).unwrap_or(false)
 }
 
-fn fetch_anchor_account<T: AccountDeserialize>(
+fn account_exists_result(rpc_url: &str, address: &Pubkey) -> Result<bool, Box<dyn Error>> {
+    account_exists_result_with_timeout(rpc_url, address, "20")
+}
+
+fn account_exists_result_with_timeout(
     rpc_url: &str,
     address: &Pubkey,
-) -> Result<Option<T>, Box<dyn Error>> {
+    timeout_seconds: &str,
+) -> Result<bool, Box<dyn Error>> {
     let request = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -382,24 +765,230 @@ fn fetch_anchor_account<T: AccountDeserialize>(
         "params": [address.to_string(), {"encoding": "base64", "commitment": "confirmed"}],
     })
     .to_string();
-    let output = Command::new("curl")
-        .args([
-            "--fail",
-            "--silent",
-            "--show-error",
-            "--max-time",
-            "20",
-            "--header",
-            "Content-Type: application/json",
-            "--data",
-            &request,
-            rpc_url,
-        ])
-        .output()?;
-    if !output.status.success() {
-        return Err(format!("RPC request failed with {}", output.status).into());
+    let response =
+        serde_json::from_slice::<RpcResponse>(&rpc_request(rpc_url, &request, timeout_seconds)?)?;
+    Ok(response.result.value.is_some())
+}
+
+// `InitializeAuction` creates three PDAs in one instruction.  A second
+// initializer that reaches the same slot while the first transaction is
+// still being processed fails in the system program with this message.  Keep
+// this check deliberately narrow: all other simulation errors still need to
+// be surfaced with their complete RPC payload.
+fn is_already_initialized_race(error: impl std::fmt::Display) -> bool {
+    let error = error.to_string();
+    error.contains("Allocate: account Address") && error.contains("already in use")
+}
+
+fn wait_for_account_exists(
+    rpc_url: &str,
+    address: &Pubkey,
+    timeout: Duration,
+) -> Result<(), Box<dyn Error>> {
+    let deadline = Instant::now() + timeout;
+    let mut last_error = None;
+    loop {
+        match account_exists_result_with_timeout(rpc_url, address, "1") {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(error) => last_error = Some(error.to_string()),
+        }
+        if Instant::now() >= deadline {
+            return Err(last_error
+                .map(|error| format!("timed out confirming auction account {address}: {error}"))
+                .unwrap_or_else(|| format!("timed out confirming auction account {address}"))
+                .into());
+        }
+        thread::sleep(Duration::from_millis(200));
     }
-    let response: RpcResponse = serde_json::from_slice(&output.stdout)?;
+}
+
+fn rpc_candidates(primary: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+    let mut push_unique = |candidate: &str| {
+        let candidate = candidate.trim();
+        if !candidate.is_empty() && !candidates.iter().any(|existing| existing == candidate) {
+            candidates.push(candidate.to_owned());
+        }
+    };
+    push_unique(primary);
+    if let Ok(configured) = env::var("BEATEX_RPC_FALLBACK_URLS") {
+        for candidate in configured.split(',') {
+            push_unique(candidate);
+        }
+    }
+    candidates
+}
+
+fn rpc_label(rpc_url: &str) -> String {
+    // Helius keys are query parameters and Alchemy keys are path segments.
+    // Keep endpoint diagnostics useful without ever putting either credential
+    // in a bot log or an error returned to the operator.
+    let mut label = rpc_url.split('?').next().unwrap_or(rpc_url).to_owned();
+    for marker in ["/v1/", "/v2/"] {
+        if let Some(index) = label.find(marker) {
+            label.truncate(index + marker.len());
+            label.push_str("<redacted>");
+            break;
+        }
+    }
+    label
+}
+
+fn rpc_method(request: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(request)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("method")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+}
+
+fn is_transaction_submission(method: Option<&str>) -> bool {
+    matches!(method, Some("sendTransaction" | "sendVersionedTransaction"))
+}
+
+fn is_rate_limited_json_rpc(error: &serde_json::Value) -> bool {
+    let code = error.get("code").and_then(serde_json::Value::as_i64);
+    if matches!(code, Some(-32429 | -32005)) {
+        return true;
+    }
+    error
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .map(|message| {
+            let message = message.to_ascii_lowercase();
+            message.contains("rate limit")
+                || message.contains("too many requests")
+                || message.contains("throttl")
+        })
+        .unwrap_or(false)
+}
+
+fn rpc_request(
+    rpc_url: &str,
+    request: &str,
+    timeout_seconds: &str,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+    let client = CLIENT.get_or_init(reqwest::blocking::Client::new);
+    let timeout = Duration::from_secs(timeout_seconds.parse()?);
+    let submission = is_transaction_submission(rpc_method(request).as_deref());
+    let mut failures = Vec::new();
+    // Stateful bot reads must remain on the same provider that accepted the
+    // preceding transaction. Round-robin reads at `processed` commitment can
+    // otherwise move backwards in time when providers observe the same slot
+    // at different moments. Fallbacks are still tried when the primary is
+    // unavailable or rate-limited.
+    for candidate in rpc_candidates(rpc_url) {
+        let response = match client
+            .post(&candidate)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .timeout(timeout)
+            .body(request.to_owned())
+            .send()
+        {
+            Ok(response) => response,
+            Err(error) => {
+                failures.push(format!("{} request failed: {error}", rpc_label(&candidate)));
+                continue;
+            }
+        };
+        let status = response.status();
+        let body = match response.bytes() {
+            Ok(body) => body,
+            Err(error) => {
+                failures.push(format!(
+                    "{} response body failed: {error}",
+                    rpc_label(&candidate)
+                ));
+                continue;
+            }
+        };
+        if !status.is_success() {
+            if submission && status != reqwest::StatusCode::TOO_MANY_REQUESTS {
+                return Err(format!(
+                    "{} returned HTTP {}: {}",
+                    rpc_label(&candidate),
+                    status,
+                    String::from_utf8_lossy(&body).trim()
+                )
+                .into());
+            }
+            failures.push(format!(
+                "{} returned HTTP {}: {}",
+                rpc_label(&candidate),
+                status,
+                String::from_utf8_lossy(&body).trim()
+            ));
+            continue;
+        }
+        match serde_json::from_slice::<serde_json::Value>(&body) {
+            Ok(response) if response.get("error").is_none() => return Ok(body.to_vec()),
+            Ok(response) => {
+                let error = &response["error"];
+                let code = error.get("code").and_then(serde_json::Value::as_i64);
+                // A failed transaction simulation or invalid request is
+                // deterministic. Replaying it against fallback providers
+                // only duplicates the same program logs and incorrectly
+                // presents an application failure as an RPC outage.
+                if matches!(code, Some(-32002 | -32600 | -32601 | -32602)) {
+                    return Err(format!(
+                        "{} returned deterministic JSON-RPC error {error}",
+                        rpc_label(&candidate)
+                    )
+                    .into());
+                }
+                if submission && !is_rate_limited_json_rpc(error) {
+                    return Err(format!(
+                        "{} returned JSON-RPC error {error}",
+                        rpc_label(&candidate)
+                    )
+                    .into());
+                }
+                failures.push(format!(
+                    "{} returned JSON-RPC error {error}",
+                    rpc_label(&candidate)
+                ));
+            }
+            Err(error) if submission => {
+                return Err(
+                    format!("{} returned invalid JSON: {error}", rpc_label(&candidate)).into(),
+                );
+            }
+            Err(error) => failures.push(format!(
+                "{} returned invalid JSON: {error}",
+                rpc_label(&candidate)
+            )),
+        }
+    }
+    Err(format!("all RPC endpoints failed: {}", failures.join("; ")).into())
+}
+
+fn fetch_anchor_account<T: AccountDeserialize>(
+    rpc_url: &str,
+    address: &Pubkey,
+) -> Result<Option<T>, Box<dyn Error>> {
+    fetch_anchor_account_at(rpc_url, address, "confirmed", "20")
+}
+
+fn fetch_anchor_account_at<T: AccountDeserialize>(
+    rpc_url: &str,
+    address: &Pubkey,
+    commitment: &str,
+    timeout_seconds: &str,
+) -> Result<Option<T>, Box<dyn Error>> {
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getAccountInfo",
+        "params": [address.to_string(), {"encoding": "base64", "commitment": commitment}],
+    })
+    .to_string();
+    let response: RpcResponse =
+        serde_json::from_slice(&rpc_request(rpc_url, &request, timeout_seconds)?)?;
     let Some(account) = response.result.value else {
         return Ok(None);
     };
@@ -418,29 +1007,59 @@ fn fetch_account_bytes(rpc_url: &str, address: &Pubkey) -> Result<Vec<u8>, Box<d
         "params": [address.to_string(), {"encoding": "base64", "commitment": "confirmed"}],
     })
     .to_string();
-    let output = Command::new("curl")
-        .args([
-            "--fail",
-            "--silent",
-            "--show-error",
-            "--max-time",
-            "20",
-            "--header",
-            "Content-Type: application/json",
-            "--data",
-            &request,
-            rpc_url,
-        ])
-        .output()?;
-    if !output.status.success() {
-        return Err(format!("RPC request failed with {}", output.status).into());
-    }
-    let response: RpcResponse = serde_json::from_slice(&output.stdout)?;
+    let response: RpcResponse = serde_json::from_slice(&rpc_request(rpc_url, &request, "20")?)?;
     let account = response.result.value.ok_or("account does not exist")?;
     if account.data.1 != "base64" {
         return Err(format!("unexpected account encoding {}", account.data.1).into());
     }
     Ok(BASE64.decode(account.data.0)?)
+}
+
+fn fetch_multiple_account_bytes(
+    rpc_url: &str,
+    addresses: &[Pubkey],
+) -> Result<Vec<Option<Vec<u8>>>, Box<dyn Error>> {
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getMultipleAccounts",
+        "params": [
+            addresses.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            {"encoding": "base64", "commitment": "confirmed"}
+        ],
+    })
+    .to_string();
+    let response: MultipleAccountsResponse =
+        serde_json::from_slice(&rpc_request(rpc_url, &request, "20")?)?;
+    if response.result.value.len() != addresses.len() {
+        return Err("getMultipleAccounts returned the wrong number of entries".into());
+    }
+    response
+        .result
+        .value
+        .into_iter()
+        .map(|account| {
+            account
+                .map(|account| {
+                    if account.data.1 != "base64" {
+                        return Err(format!("unexpected account encoding {}", account.data.1));
+                    }
+                    BASE64
+                        .decode(account.data.0)
+                        .map_err(|error| error.to_string())
+                })
+                .transpose()
+                .map_err(Into::into)
+        })
+        .collect()
+}
+
+fn deserialize_anchor_account<T: AccountDeserialize>(
+    bytes: Option<Vec<u8>>,
+    missing: &'static str,
+) -> Result<T, Box<dyn Error>> {
+    let bytes = bytes.ok_or(missing)?;
+    Ok(T::try_deserialize(&mut bytes.as_slice())?)
 }
 
 fn minimum_balance_for_rent_exemption(rpc_url: &str, space: usize) -> Result<u64, Box<dyn Error>> {
@@ -452,83 +1071,108 @@ fn minimum_balance_for_rent_exemption(rpc_url: &str, space: usize) -> Result<u64
         "jsonrpc": "2.0",
         "id": 1,
         "method": "getMinimumBalanceForRentExemption",
-        "params": [space, {"commitment": "confirmed"}],
+        "params": [space, {"commitment": "processed"}],
     })
     .to_string();
-    let output = Command::new("curl")
-        .args([
-            "--fail",
-            "--silent",
-            "--show-error",
-            "--max-time",
-            "20",
-            "--header",
-            "Content-Type: application/json",
-            "--data",
-            &request,
-            rpc_url,
-        ])
-        .output()?;
-    if !output.status.success() {
-        return Err(format!("RPC rent request failed with {}", output.status).into());
-    }
-    Ok(serde_json::from_slice::<RentResponse>(&output.stdout)?.result)
+    Ok(serde_json::from_slice::<RentResponse>(&rpc_request(rpc_url, &request, "20")?)?.result)
 }
 
-fn fetch_accepted_orders(
-    rpc_url: &str,
-    auction: &Pubkey,
-) -> Result<Vec<(Pubkey, QueuedOrder)>, Box<dyn Error>> {
-    // QueuedOrder layout: discriminator (8), version (1), market (32), auction.
-    const AUCTION_OFFSET: usize = 8 + 1 + 32;
+fn lamport_balance(rpc_url: &str, owner: &Pubkey) -> Result<u64, Box<dyn Error>> {
+    #[derive(Deserialize)]
+    struct BalanceResponse {
+        result: BalanceResult,
+    }
+    #[derive(Deserialize)]
+    struct BalanceResult {
+        value: u64,
+    }
     let request = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
-        "method": "getProgramAccounts",
-        "params": [
-            beatex::ID.to_string(),
-            {
-                "encoding": "base64",
-                "commitment": "confirmed",
-                "filters": [
-                    {"dataSize": 8 + QueuedOrder::INIT_SPACE},
-                    {"memcmp": {"offset": AUCTION_OFFSET, "bytes": auction.to_string()}}
-                ]
-            }
-        ]
+        "method": "getBalance",
+        "params": [owner.to_string(), {"commitment": "processed"}],
     })
     .to_string();
-    let output = Command::new("curl")
-        .args([
-            "--fail",
-            "--silent",
-            "--show-error",
-            "--max-time",
-            "30",
-            "--header",
-            "Content-Type: application/json",
-            "--data",
-            &request,
-            rpc_url,
-        ])
-        .output()?;
-    if !output.status.success() {
-        return Err(format!("RPC request failed with {}", output.status).into());
+    Ok(
+        serde_json::from_slice::<BalanceResponse>(&rpc_request(rpc_url, &request, "10")?)?
+            .result
+            .value,
+    )
+}
+
+fn ensure_committee_payer_can_initialize(
+    rpc_url: &str,
+    payer: &Pubkey,
+) -> Result<(), Box<dyn Error>> {
+    const FEE_BUFFER_LAMPORTS: u64 = 100_000;
+    let auction_rent =
+        minimum_balance_for_rent_exemption(rpc_url, 8 + beatex::Auction::INIT_SPACE)?;
+    let counter_rent =
+        minimum_balance_for_rent_exemption(rpc_url, queue::SUBMISSION_COUNTER_SPACE)?;
+    let accumulator_rent =
+        minimum_balance_for_rent_exemption(rpc_url, 8 + AggregateAccumulator::INIT_SPACE)?;
+    let account_rent = auction_rent
+        .checked_add(counter_rent)
+        .and_then(|value| value.checked_add(accumulator_rent))
+        .ok_or("auction rent requirement overflow")?;
+    let required = account_rent
+        .checked_add(FEE_BUFFER_LAMPORTS)
+        .ok_or("committee payer requirement overflow")?;
+    let available = lamport_balance(rpc_url, payer)?;
+    if available < required {
+        return Err(format!(
+            "committee payer {payer} has {available} lamports ({:.9} SOL); initializing one auction requires at least {required} lamports ({:.9} SOL: {account_rent} rent plus fee buffer). Fund the wallet and restart the committee bot",
+            available as f64 / 1_000_000_000.0,
+            required as f64 / 1_000_000_000.0,
+        )
+        .into());
     }
-    let response: ProgramAccountsResponse = serde_json::from_slice(&output.stdout)?;
-    let mut orders = Vec::new();
-    for keyed in response.result {
-        if keyed.account.data.1 != "base64" {
-            return Err(format!("unexpected account encoding {}", keyed.account.data.1).into());
-        }
-        let bytes = BASE64.decode(keyed.account.data.0)?;
-        let order = QueuedOrder::try_deserialize(&mut bytes.as_slice())?;
-        if order.state == QueuedOrderState::Accepted {
-            orders.push((Pubkey::from_str(&keyed.pubkey)?, order));
-        }
+    Ok(())
+}
+
+/// The next accepted events to fold, in acceptance order, read from the
+/// submission counter's pending-event ring rather than a program-account scan.
+fn fetch_pending_orders(
+    rpc_url: &str,
+    counter: &Pubkey,
+    folded_order_count: u64,
+    limit: usize,
+) -> Result<Vec<(Pubkey, QueuedOrder)>, Box<dyn Error>> {
+    let counter_bytes = fetch_account_bytes(rpc_url, counter)?;
+    let accepted =
+        SubmissionCounter::try_deserialize(&mut counter_bytes.as_slice())?.accepted_order_count;
+    let end = accepted.min(folded_order_count.saturating_add(limit as u64));
+    let addresses = (folded_order_count..end)
+        .map(|sequence| {
+            queue::pending_event(&counter_bytes, sequence)
+                .map_err(|error| format!("pending event {sequence} is unreadable: {error:?}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if addresses.is_empty() {
+        return Ok(Vec::new());
     }
-    orders.sort_by_key(|(address, _)| *address);
-    Ok(orders)
+    let accounts = fetch_multiple_account_bytes(rpc_url, &addresses)?;
+    addresses
+        .into_iter()
+        .zip(accounts)
+        .map(|(address, bytes)| {
+            let bytes = bytes.ok_or_else(|| format!("pending event {address} is missing"))?;
+            Ok((
+                address,
+                QueuedOrder::try_deserialize(&mut bytes.as_slice())?,
+            ))
+        })
+        .collect()
+}
+
+/// The two accounts Anchor's `#[event_cpi]` appends to instructions that emit
+/// indexable events: the event-authority PDA and the program itself.
+fn event_cpi_metas() -> [BundleAccount; 2] {
+    let (event_authority, _) = Pubkey::find_program_address(&[b"__event_authority"], &beatex::ID);
+    [
+        meta(event_authority, false, false),
+        meta(beatex::ID, false, false),
+    ]
 }
 
 fn meta(address: Pubkey, writable: bool, signer: bool) -> BundleAccount {
@@ -547,7 +1191,7 @@ fn send(
     data: Vec<u8>,
     additional_signers: Vec<PathBuf>,
 ) -> Result<(), Box<dyn Error>> {
-    send_bundle(
+    send_with_completion(
         wallet,
         rpc_url,
         label,
@@ -557,6 +1201,28 @@ fn send(
             data_base64: BASE64.encode(data),
         }],
         additional_signers,
+        TransactionCompletion::Confirmed,
+    )
+}
+
+fn send_committee(
+    wallet: &Path,
+    rpc_url: &str,
+    label: &str,
+    accounts: Vec<BundleAccount>,
+    data: Vec<u8>,
+) -> Result<(), Box<dyn Error>> {
+    send_with_completion(
+        wallet,
+        rpc_url,
+        label,
+        vec![BundleInstruction {
+            program_id: beatex::ID.to_string(),
+            accounts,
+            data_base64: BASE64.encode(data),
+        }],
+        vec![],
+        TransactionCompletion::ConfirmedNoPreflight,
     )
 }
 
@@ -595,9 +1261,295 @@ fn send_bundle(
     instructions: Vec<BundleInstruction>,
     additional_signers: Vec<PathBuf>,
 ) -> Result<(), Box<dyn Error>> {
-    let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let sender = project_root.join("clients/v1-transaction/send.mjs");
-    let bundle = InstructionBundle {
+    send_with_completion(
+        wallet,
+        rpc_url,
+        label,
+        instructions,
+        additional_signers,
+        TransactionCompletion::Confirmed,
+    )
+}
+
+fn send_with_completion(
+    wallet: &Path,
+    rpc_url: &str,
+    label: &str,
+    instructions: Vec<BundleInstruction>,
+    additional_signers: Vec<PathBuf>,
+    completion: TransactionCompletion,
+) -> Result<(), Box<dyn Error>> {
+    let mut bundle =
+        make_instruction_bundle(wallet, rpc_url, label, instructions, additional_signers)?;
+    if completion == TransactionCompletion::ConfirmedNoPreflight {
+        bundle.priority_fee_lamports = 10_000;
+    }
+    if !wallet_file_is_browser_session(wallet)? {
+        return send_bundle_rust_v1(&bundle, completion);
+    }
+    #[cfg(not(feature = "browser-wallet"))]
+    {
+        return Err(
+            "this native-only build does not support interactive browser-wallet sessions".into(),
+        );
+    }
+    #[cfg(feature = "browser-wallet")]
+    {
+        let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let sender = project_root.join("clients/v1-transaction/send.mjs");
+        if !label.starts_with("initialize auction ") {
+            eprintln!("sending {label}");
+        }
+        let mut child = Command::new("node")
+            .arg(sender)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()?;
+        serde_json::to_writer(
+            child
+                .stdin
+                .take()
+                .ok_or("transaction sender has no stdin")?,
+            &bundle,
+        )?;
+        let status = child.wait()?;
+        if !status.success() {
+            return Err(format!("{label} transaction failed with {status}").into());
+        }
+        Ok(())
+    }
+}
+
+fn wallet_file_is_browser_session(path: &Path) -> Result<bool, Box<dyn Error>> {
+    let value: serde_json::Value = serde_json::from_slice(&fs::read(path)?)?;
+    Ok(value
+        .as_object()
+        .and_then(|object| object.get("type"))
+        .and_then(serde_json::Value::as_str)
+        == Some("browser-wallet"))
+}
+
+fn send_bundle_rust_v1(
+    bundle: &InstructionBundle,
+    completion: TransactionCompletion,
+) -> Result<(), Box<dyn Error>> {
+    let blockhash_request = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "getLatestBlockhash",
+        "params": [{"commitment": "processed"}],
+    })
+    .to_string();
+    let blockhash_response: serde_json::Value =
+        serde_json::from_slice(&rpc_request(&bundle.rpc_url, &blockhash_request, "5")?)?;
+    let blockhash = blockhash_response
+        .pointer("/result/value/blockhash")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("latest blockhash response is missing its blockhash")?
+        .parse::<V1Hash>()?;
+
+    let payer = read_v1_keypair_file(&bundle.keypair)?;
+    let additional = bundle
+        .signer_keypairs
+        .iter()
+        .map(read_v1_keypair_file)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut signer_refs = Vec::with_capacity(additional.len() + 1);
+    signer_refs.push(&payer);
+    signer_refs.extend(additional.iter());
+    let instructions = bundle
+        .instructions
+        .iter()
+        .map(|instruction| {
+            Ok(V1Instruction {
+                program_id: instruction.program_id.parse()?,
+                accounts: instruction
+                    .accounts
+                    .iter()
+                    .map(|account| {
+                        let address = account.address.parse()?;
+                        Ok(if account.writable {
+                            V1AccountMeta::new(address, account.signer)
+                        } else {
+                            V1AccountMeta::new_readonly(address, account.signer)
+                        })
+                    })
+                    .collect::<Result<Vec<_>, Box<dyn Error>>>()?,
+                data: BASE64.decode(&instruction.data_base64)?,
+            })
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    let config = V1TransactionConfig::empty()
+        .with_priority_fee(bundle.priority_fee_lamports)
+        .with_compute_unit_limit(bundle.compute_unit_limit)
+        .with_loaded_accounts_data_size_limit(bundle.loaded_accounts_data_size_limit)
+        .with_heap_size(bundle.heap_size);
+    let message =
+        V1Message::try_compile_with_config(&payer.pubkey(), &instructions, blockhash, config)?;
+    let transaction = V1Transaction::try_new(V1VersionedMessage::V1(message), &signer_refs)?;
+    let encoded_bytes = wincode::serialize(&transaction)?;
+    if encoded_bytes.len() > 4096 {
+        return Err(format!(
+            "v1 transaction is {} bytes; maximum is 4096",
+            encoded_bytes.len()
+        )
+        .into());
+    }
+    let latency_sensitive_transaction = completion == TransactionCompletion::ConfirmedNoPreflight
+        || matches!(
+            bundle.label.as_str(),
+            "submit encrypted order"
+                | "replace encrypted order"
+                | "claim previous auction and place next order"
+        );
+    let send_request = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "sendTransaction",
+        "params": [BASE64.encode(encoded_bytes), {
+            // These transactions already contain locally generated Groth16
+            // proofs and are constrained by the collection deadline.
+            // Re-running the complete program in RPC preflight can consume
+            // most of that window. The program still performs every check
+            // when the transaction executes on-chain.
+            "encoding": "base64", "skipPreflight": latency_sensitive_transaction,
+            "preflightCommitment": "processed",
+        }],
+    })
+    .to_string();
+    let send_bytes = rpc_request(&bundle.rpc_url, &send_request, "15").map_err(|error| {
+        if error.to_string().starts_with("all RPC endpoints failed") {
+            format!("transaction submission outcome unknown: {error}").into()
+        } else {
+            error
+        }
+    })?;
+    let send_response: serde_json::Value = serde_json::from_slice(&send_bytes)?;
+    let signature = send_response
+        .get("result")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("sendTransaction response is missing its signature")?;
+
+    let status_endpoints = rpc_candidates(&bundle.rpc_url);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut status_poll = 0usize;
+    let mut last_rebroadcast = Instant::now();
+    let mut last_status_error = None;
+    while Instant::now() < deadline {
+        // A provider can acknowledge a transaction without forwarding it to
+        // a leader. Rebroadcasting the identical signed bytes is idempotent;
+        // it cannot place a second order or charge a second transaction fee.
+        if last_rebroadcast.elapsed() >= Duration::from_secs(2) {
+            let endpoint = &status_endpoints[(status_poll + 1) % status_endpoints.len()];
+            if let Err(error) = rpc_request(endpoint, &send_request, "5") {
+                last_status_error = Some(format!("rebroadcast failed: {error}"));
+            }
+            last_rebroadcast = Instant::now();
+        }
+        let status_request = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "getSignatureStatuses",
+            "params": [[signature]],
+        })
+        .to_string();
+        let status_endpoint = &status_endpoints[status_poll % status_endpoints.len()];
+        status_poll += 1;
+        let status_response: serde_json::Value =
+            match rpc_request(status_endpoint, &status_request, "5")
+                .and_then(|bytes| serde_json::from_slice(&bytes).map_err(Into::into))
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    last_status_error = Some(error.to_string());
+                    thread::sleep(Duration::from_millis(400));
+                    continue;
+                }
+            };
+        if let Some(status) = status_response.pointer("/result/value/0") {
+            if !status.is_null() {
+                if !status.get("err").is_none_or(serde_json::Value::is_null) {
+                    return Err(format!(
+                        "transaction {signature} failed on-chain: {}",
+                        status["err"]
+                    )
+                    .into());
+                }
+                let confirmation_status = status
+                    .get("confirmationStatus")
+                    .and_then(serde_json::Value::as_str);
+                let complete = matches!(confirmation_status, Some("confirmed" | "finalized"));
+                if complete {
+                    return Ok(());
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(400));
+    }
+    let history_request = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "getSignatureStatuses",
+        "params": [[signature], {"searchTransactionHistory": true}],
+    })
+    .to_string();
+    for endpoint in &status_endpoints {
+        if let Ok(bytes) = rpc_request(endpoint, &history_request, "5") {
+            if let Ok(response) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                if let Some(status) = response.pointer("/result/value/0") {
+                    if !status.is_null() {
+                        if !status.get("err").is_none_or(serde_json::Value::is_null) {
+                            return Err(format!(
+                                "transaction {signature} failed on-chain: {}",
+                                status["err"]
+                            )
+                            .into());
+                        }
+                        if matches!(
+                            status
+                                .get("confirmationStatus")
+                                .and_then(serde_json::Value::as_str),
+                            Some("confirmed" | "finalized")
+                        ) {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let last_status_error = last_status_error
+        .map(|error| format!("; last status RPC error: {error}"))
+        .unwrap_or_default();
+    Err(format!(
+        "transaction confirmation outcome unknown for {signature} after 30 seconds{last_status_error}"
+    )
+    .into())
+}
+
+fn ensure_order_submission_time(
+    rpc_url: &str,
+    auction: &beatex::Auction,
+) -> Result<(), Box<dyn Error>> {
+    let slot = current_slot(rpc_url)?;
+    let remaining = auction.submission_end_slot.saturating_sub(slot);
+    if remaining <= MIN_ORDER_SEND_REMAINING_SLOTS {
+        return Err(format!(
+            "auction {} submission window expired before transaction submission",
+            auction.auction_id
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn make_instruction_bundle(
+    wallet: &Path,
+    rpc_url: &str,
+    label: &str,
+    instructions: Vec<BundleInstruction>,
+    additional_signers: Vec<PathBuf>,
+) -> Result<InstructionBundle, Box<dyn Error>> {
+    let latency_sensitive_order = matches!(
+        label,
+        "submit encrypted order"
+            | "replace encrypted order"
+            | "claim previous auction and place next order"
+    );
+    Ok(InstructionBundle {
         keypair: absolute(wallet)?.display().to_string(),
         label: label.to_owned(),
         signer_keypairs: additional_signers
@@ -609,27 +1561,8 @@ fn send_bundle(
         compute_unit_limit: 1_400_000,
         loaded_accounts_data_size_limit: 2 * 1024 * 1024,
         heap_size: 256 * 1024,
-        priority_fee_lamports: 0,
-    };
-    eprintln!("sending {label}");
-    let mut child = Command::new("node")
-        .arg(sender)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()?;
-    serde_json::to_writer(
-        child
-            .stdin
-            .take()
-            .ok_or("transaction sender has no stdin")?,
-        &bundle,
-    )?;
-    let status = child.wait()?;
-    if !status.success() {
-        return Err(format!("{label} transaction failed with {status}").into());
-    }
-    Ok(())
+        priority_fee_lamports: if latency_sensitive_order { 10_000 } else { 0 },
+    })
 }
 
 fn absolute(path: &Path) -> Result<PathBuf, Box<dyn Error>> {
@@ -735,16 +1668,16 @@ fn initialize_market(
         market_start_slot: config.market_start_slot,
         minimum_reference_volume: 1,
         oracle_feed_id: decode_hex_32(PYTH_BTC_USD_FEED)?,
-        oracle_max_age_seconds: 600,
+        oracle_max_age_seconds: DEVNET_ORACLE_MAX_AGE_SECONDS,
         oracle_max_confidence_bps: 200,
         oracle_exponent_adjustment: 0,
         min_reference_price: 1_000,
         max_reference_price: 1_000_000,
-        submission_duration_slots: 400,
-        aggregation_duration_slots: 200,
-        decryption_duration_slots: 200,
+        submission_duration_slots: DEVNET_SUBMISSION_DURATION_SLOTS,
+        aggregation_duration_slots: DEVNET_AGGREGATION_DURATION_SLOTS,
+        decryption_duration_slots: DEVNET_DECRYPTION_DURATION_SLOTS,
         allocation_rule_version: allocation::ALLOCATION_RULE_VERSION,
-        order_circuit_version: queue::ORDER_SUBMISSION_CIRCUIT_VERSION,
+        order_circuit_version: queue::DEVNET_FAST_ORDER_CIRCUIT_VERSION,
         claim_circuit_version: queue::PRIVATE_CLAIM_CIRCUIT_VERSION,
     };
     send(
@@ -918,16 +1851,17 @@ fn verification_key_address(market: &Pubkey, kind: QueueCircuitKind, version: u1
 
 fn generate_verification_key(
     kind: QueueCircuitKind,
+    version: u16,
 ) -> Result<SolanaVerificationKey, Box<dyn Error>> {
     eprintln!("generating {:?} verification key", kind);
     match kind {
         QueueCircuitKind::OrderSubmission => {
-            OrderProver::deterministic_devnet()?.verification_key()
+            with_order_prover(version, |prover| prover.verification_key())
         }
         QueueCircuitKind::AggregateFold => transition::deterministic_fold_verification_key(),
         QueueCircuitKind::BalanceDeposit => deposit::deterministic_verification_key(),
         QueueCircuitKind::AggregatePublication => {
-            AggregatePublicationProver::deterministic_devnet()?.verification_key()
+            AggregatePublicationProver::deterministic_devnet_fast()?.verification_key()
         }
         QueueCircuitKind::PrivateClaim => {
             deterministic_private_withdrawal_verification_key(PrivateWithdrawalKind::Claim)
@@ -936,10 +1870,10 @@ fn generate_verification_key(
             deterministic_private_withdrawal_verification_key(PrivateWithdrawalKind::Refund)
         }
         QueueCircuitKind::OrderModification => {
-            CollateralReleaseProver::deterministic_devnet()?.verification_key()
+            with_collateral_release_prover(|prover| prover.verification_key())
         }
         QueueCircuitKind::RolloverSettlement => {
-            RolloverProver::deterministic_devnet()?.verification_key()
+            with_rollover_prover(|prover| prover.verification_key())
         }
     }
 }
@@ -960,13 +1894,17 @@ fn initialize_verification_keys(
         QueueCircuitKind::RolloverSettlement,
     ];
     for kind in kinds {
-        let version = queue::circuit_version(kind);
+        let version = if kind == QueueCircuitKind::OrderSubmission {
+            queue::DEVNET_FAST_ORDER_CIRCUIT_VERSION
+        } else {
+            queue::circuit_version(kind)
+        };
         let address = verification_key_address(&addresses.market, kind, version);
         if account_exists(&config.rpc_url, &address) {
             eprintln!("{:?} key {} already exists", kind, address);
             continue;
         }
-        let key = generate_verification_key(kind)?;
+        let key = generate_verification_key(kind, version)?;
         let args = InitializeQueueVerificationKeyArgs {
             circuit_kind: kind,
             circuit_version: version,
@@ -994,6 +1932,10 @@ fn initialize_verification_keys(
 }
 
 fn current_slot(rpc_url: &str) -> Result<u64, Box<dyn Error>> {
+    current_slot_with_timeout(rpc_url, "20")
+}
+
+fn current_slot_with_timeout(rpc_url: &str, timeout_seconds: &str) -> Result<u64, Box<dyn Error>> {
     #[derive(Deserialize)]
     struct SlotResponse {
         result: u64,
@@ -1002,27 +1944,13 @@ fn current_slot(rpc_url: &str) -> Result<u64, Box<dyn Error>> {
         "jsonrpc": "2.0",
         "id": 1,
         "method": "getSlot",
-        "params": [{"commitment": "confirmed"}],
+        "params": [{"commitment": "processed"}],
     })
     .to_string();
-    let output = Command::new("curl")
-        .args([
-            "--fail",
-            "--silent",
-            "--show-error",
-            "--max-time",
-            "20",
-            "--header",
-            "Content-Type: application/json",
-            "--data",
-            &request,
-            rpc_url,
-        ])
-        .output()?;
-    if !output.status.success() {
-        return Err(format!("RPC request failed with {}", output.status).into());
-    }
-    Ok(serde_json::from_slice::<SlotResponse>(&output.stdout)?.result)
+    Ok(
+        serde_json::from_slice::<SlotResponse>(&rpc_request(rpc_url, &request, timeout_seconds)?)?
+            .result,
+    )
 }
 
 fn current_auction_addresses(
@@ -1059,7 +1987,182 @@ fn auction_addresses(addresses: &Addresses, auction_id: u64) -> AuctionAddresses
     }
 }
 
-fn initialize_current_auction(
+fn send_initialization_direct(
+    wallet: &Path,
+    rpc_url: &str,
+    instruction: Instruction,
+    freshness: Option<(u64, u64, u64)>,
+) -> Result<(), Box<dyn Error>> {
+    let blockhash_request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getLatestBlockhash",
+        "params": [{"commitment": "processed"}],
+    })
+    .to_string();
+    let blockhash_response: serde_json::Value =
+        serde_json::from_slice(&rpc_request(rpc_url, &blockhash_request, "2")?)?;
+    let blockhash = blockhash_response
+        .pointer("/result/value/blockhash")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("latest blockhash response is missing its blockhash")?
+        .parse::<Hash>()?;
+    if let Some((market_start_slot, submission_duration_slots, auction_id)) = freshness {
+        let slot = current_slot_with_timeout(rpc_url, "2")?;
+        if !auction_target_is_fresh(
+            market_start_slot,
+            submission_duration_slots,
+            slot,
+            auction_id,
+        ) {
+            return Err("auction initialization target became stale before submission".into());
+        }
+    }
+    let payer = read_keypair_file(wallet)?;
+    let transaction = Transaction::new(
+        &[&payer],
+        Message::new(
+            &[
+                ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
+                instruction,
+            ],
+            Some(&payer.pubkey()),
+        ),
+        blockhash,
+    );
+    let encoded = BASE64.encode(bincode::serialize(&transaction)?);
+    let send_request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "sendTransaction",
+        "params": [
+            encoded,
+            {
+                "encoding": "base64",
+                // Initialization is latency-sensitive, but it must not be
+                // fire-and-forget: without preflight an on-chain failure is
+                // indistinguishable from a successful RPC submission and the
+                // coordinator silently leaves the auction uninitialized.
+                "skipPreflight": false,
+                "preflightCommitment": "processed",
+            }
+        ],
+    })
+    .to_string();
+    let response: serde_json::Value =
+        serde_json::from_slice(&rpc_request(rpc_url, &send_request, "5")?)?;
+    response
+        .get("result")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("initialize-auction sendTransaction response is missing its signature")?;
+    Ok(())
+}
+
+fn submit_auction_initialization(
+    wallet: &Path,
+    rpc_url: &str,
+    addresses: &Addresses,
+    key_epoch: Pubkey,
+    oracle_price: Pubkey,
+    payer: Pubkey,
+    auction_id: u64,
+    quiet: bool,
+    freshness: Option<(u64, u64)>,
+) -> Result<(), Box<dyn Error>> {
+    let current = auction_addresses(addresses, auction_id);
+    let instruction = Instruction {
+        program_id: beatex::ID,
+        accounts: vec![
+            AccountMeta::new(payer, true),
+            AccountMeta::new_readonly(addresses.market, false),
+            AccountMeta::new_readonly(key_epoch, false),
+            AccountMeta::new_readonly(oracle_price, false),
+            AccountMeta::new(current.auction, false),
+            AccountMeta::new(current.submission_counter, false),
+            AccountMeta::new(current.accumulator, false),
+            AccountMeta::new_readonly(anchor_lang::system_program::ID, false),
+        ],
+        data: beatex::instruction::InitializeAuction { auction_id }.data(),
+    };
+    let label = format!("initialize auction {auction_id}");
+    if quiet {
+        send_initialization_direct(
+            wallet,
+            rpc_url,
+            instruction,
+            freshness.map(|(start, duration)| (start, duration, auction_id)),
+        )
+    } else {
+        send_instructions(wallet, rpc_url, &label, &[instruction], vec![])
+    }
+}
+
+fn coordinator_timestamp() -> String {
+    let utc = time::OffsetDateTime::now_utc();
+    let now = time::UtcOffset::current_local_offset()
+        .map(|offset| utc.to_offset(offset))
+        .unwrap_or(utc);
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
+        now.year(),
+        u8::from(now.month()),
+        now.day(),
+        now.hour(),
+        now.minute(),
+        now.second(),
+        now.millisecond()
+    )
+}
+
+fn coordinator_auction_log(auction_id: u64, action: &str) {
+    let color = std::io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none();
+    if color {
+        let (foreground, background) = match auction_id % 6 {
+            0 => (37, 44),
+            1 => (37, 45),
+            2 => (30, 46),
+            3 => (30, 42),
+            4 => (30, 43),
+            _ => (37, 100),
+        };
+        println!(
+            "[{}] \x1b[1;{foreground};{background}m auction {auction_id} \x1b[0m {action}",
+            coordinator_timestamp()
+        );
+    } else {
+        println!(
+            "[{}] auction {auction_id} {action}",
+            coordinator_timestamp()
+        );
+    }
+}
+
+fn coordinator_error(error: &dyn std::fmt::Display) {
+    for line in error.to_string().lines() {
+        eprintln!("[{}] {line}", coordinator_timestamp());
+    }
+}
+
+fn auction_target_is_fresh(
+    market_start_slot: u64,
+    submission_duration_slots: u64,
+    slot: u64,
+    auction_id: u64,
+) -> bool {
+    if submission_duration_slots == 0 || slot < market_start_slot {
+        return false;
+    }
+    let elapsed = slot - market_start_slot;
+    let current_auction_id = elapsed / submission_duration_slots;
+    if auction_id == current_auction_id {
+        return true;
+    }
+    let remaining_slots = submission_duration_slots - elapsed % submission_duration_slots;
+    auction_id == current_auction_id.saturating_add(1)
+        && remaining_slots <= beatex::AUCTION_PREINITIALIZATION_SLOTS
+}
+
+fn watch_and_initialize_auctions(
     common: CommonConfig,
     wallet: PathBuf,
     rpc_url: String,
@@ -1070,46 +2173,245 @@ fn initialize_current_auction(
     let addresses = addresses(&common);
     let market = fetch_anchor_account::<beatex::Market>(&rpc_url, &addresses.market)?
         .ok_or("market has not been initialized")?;
-    let Some(current) = current_auction_addresses(&rpc_url, &addresses, &market)? else {
-        let slot = current_slot(&rpc_url)?;
+    if market.submission_duration_slots == 0 {
+        return Err("market submission duration is zero".into());
+    }
+    let payer = wallet_pubkey(&wallet)?;
+    let market_start_slot = market.market_start_slot;
+    let submission_duration_slots = market.submission_duration_slots;
+    let key_epoch = market.current_key_epoch;
+    let oracle_price = market.oracle_price_account;
+    let mut targets = HashMap::<u64, InitializationTarget>::new();
+
+    loop {
+        let slot = match current_slot_with_timeout(&rpc_url, "2") {
+            Ok(slot) => slot,
+            Err(error) => {
+                coordinator_error(error.as_ref());
+                thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+        };
+        if slot < market_start_slot {
+            thread::sleep(Duration::from_millis(100));
+            continue;
+        }
+        let elapsed = slot - market_start_slot;
+        let current_auction_id = elapsed / submission_duration_slots;
+        let remaining_slots = submission_duration_slots - elapsed % submission_duration_slots;
+        let next_auction_id = current_auction_id
+            .checked_add(1)
+            .ok_or("auction id overflow")?;
+        // Each auction keeps retrying until its own window closes, independently
+        // of the next auction becoming a target.
+        targets.retain(|auction_id, target| {
+            if *auction_id >= current_auction_id {
+                return true;
+            }
+            if !target.confirmed.load(Ordering::Acquire)
+                && !target.in_flight.load(Ordering::Acquire)
+            {
+                coordinator_auction_log(
+                    *auction_id,
+                    "missed: not initialized before its window closed",
+                );
+            }
+            false
+        });
+        let mut candidates = vec![current_auction_id];
+        if remaining_slots <= beatex::AUCTION_PREINITIALIZATION_SLOTS {
+            candidates.push(next_auction_id);
+        }
+        let mut last_cleared_sequence = None;
+        for auction_id in candidates {
+            let target = targets.entry(auction_id).or_insert_with(|| {
+                coordinator_auction_log(auction_id, "scheduled");
+                InitializationTarget::default()
+            });
+            if target.confirmed.load(Ordering::Acquire)
+                || target.in_flight.load(Ordering::Acquire)
+                || target
+                    .attempt_started
+                    .is_some_and(|started| started.elapsed() < Duration::from_millis(750))
+            {
+                continue;
+            }
+            // Before the fallback slots, the program only accepts the next
+            // auction once auction N-1 has cleared and its price can be used.
+            if auction_id == next_auction_id
+                && remaining_slots > beatex::AUCTION_FALLBACK_INITIALIZATION_SLOTS
+            {
+                let sequence = match last_cleared_sequence {
+                    Some(sequence) => sequence,
+                    None => match fetch_anchor_account_at::<beatex::Market>(
+                        &rpc_url,
+                        &addresses.market,
+                        "processed",
+                        "2",
+                    ) {
+                        Ok(Some(market)) => {
+                            last_cleared_sequence = Some(market.last_cleared_auction_sequence);
+                            market.last_cleared_auction_sequence
+                        }
+                        Ok(None) => continue,
+                        Err(error) => {
+                            coordinator_error(error.as_ref());
+                            continue;
+                        }
+                    },
+                };
+                if !beatex::previous_clearing_is_recent(sequence, auction_id) {
+                    continue;
+                }
+            }
+            target.in_flight.store(true, Ordering::Release);
+            target.attempt_started = Some(Instant::now());
+            let open_offset = if auction_id == next_auction_id {
+                format!("open-{remaining_slots}")
+            } else {
+                format!("open+{}", submission_duration_slots - remaining_slots)
+            };
+            let worker_wallet = wallet.clone();
+            let worker_rpc = rpc_url.clone();
+            let worker_addresses = addresses.clone();
+            let worker_in_flight = Arc::clone(&target.in_flight);
+            let worker_confirmed = Arc::clone(&target.confirmed);
+            thread::spawn(move || {
+                let current = auction_addresses(&worker_addresses, auction_id);
+                // The target is already eligible. Submit without an account
+                // lookup; the final slot check in send_initialization_direct
+                // still prevents stale transactions at a phase boundary.
+                let result = submit_auction_initialization(
+                    &worker_wallet,
+                    &worker_rpc,
+                    &worker_addresses,
+                    key_epoch,
+                    oracle_price,
+                    payer,
+                    auction_id,
+                    true,
+                    Some((market_start_slot, submission_duration_slots)),
+                );
+                let confirmed = match result {
+                    Ok(()) => match wait_for_account_exists(
+                        &worker_rpc,
+                        &current.auction,
+                        Duration::from_secs(3),
+                    ) {
+                        Ok(()) => true,
+                        Err(error) => {
+                            coordinator_error(&error);
+                            false
+                        }
+                    },
+                    Err(error) => {
+                        match account_exists_result_with_timeout(&worker_rpc, &current.auction, "1")
+                        {
+                            Ok(true) => {
+                                if !is_already_initialized_race(error.as_ref()) {
+                                    coordinator_error(error.as_ref());
+                                }
+                                true
+                            }
+                            Ok(false) => {
+                                coordinator_error(error.as_ref());
+                                false
+                            }
+                            Err(lookup_error) => {
+                                coordinator_error(error.as_ref());
+                                coordinator_error(lookup_error.as_ref());
+                                false
+                            }
+                        }
+                    }
+                };
+                if confirmed {
+                    worker_confirmed.store(true, Ordering::Release);
+                    let reference = match fetch_anchor_account_at::<beatex::Auction>(
+                        &worker_rpc,
+                        &current.auction,
+                        "processed",
+                        "2",
+                    ) {
+                        Ok(Some(auction)) if auction.reference_from_oracle => {
+                            format!("reference {} from Pyth", auction.reference_price)
+                        }
+                        Ok(Some(auction)) => {
+                            format!(
+                                "reference {} from previous clearing",
+                                auction.reference_price
+                            )
+                        }
+                        _ => "reference unknown".to_owned(),
+                    };
+                    coordinator_auction_log(
+                        auction_id,
+                        &format!("initialized (sent at {open_offset}, {reference})"),
+                    );
+                }
+                worker_in_flight.store(false, Ordering::Release);
+            });
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
+#[derive(Default)]
+struct InitializationTarget {
+    attempt_started: Option<Instant>,
+    in_flight: Arc<AtomicBool>,
+    confirmed: Arc<AtomicBool>,
+}
+
+fn initialize_current_auction(
+    common: CommonConfig,
+    wallet: PathBuf,
+    rpc_url: String,
+    requested_auction_id: Option<u64>,
+) -> Result<(), Box<dyn Error>> {
+    if rpc_url.contains("mainnet") {
+        return Err("mainnet is not supported by the Devnet client".into());
+    }
+    let addresses = addresses(&common);
+    let market = fetch_anchor_account::<beatex::Market>(&rpc_url, &addresses.market)?
+        .ok_or("market has not been initialized")?;
+    let payer = wallet_pubkey(&wallet)?;
+    let slot = current_slot(&rpc_url)?;
+    if slot < market.market_start_slot {
         println!(
             "market {} starts at slot {}; current slot is {}",
             addresses.market, market.market_start_slot, slot
         );
         return Ok(());
-    };
-    if !account_exists(&rpc_url, &current.auction) {
-        let payer = wallet_pubkey(&wallet)?;
-        send(
-            &wallet,
-            &rpc_url,
-            &format!("initialize auction {}", current.auction_id),
-            vec![
-                meta(payer, true, true),
-                meta(addresses.market, false, false),
-                meta(addresses.key_epoch, false, false),
-                meta(market.oracle_price_account, false, false),
-                meta(current.auction, true, false),
-                meta(current.submission_counter, true, false),
-                meta(current.accumulator, true, false),
-                meta(anchor_lang::system_program::ID, false, false),
-            ],
-            beatex::instruction::InitializeAuction {
-                auction_id: current.auction_id,
-            }
-            .data(),
-            vec![],
-        )?;
     }
-    let path = common.state_dir.join("current-auction.tsv");
-    fs::write(
-        path,
-        format!(
-            "name\tvalue\nauction-id\t{}\nauction\t{}\nsubmission-counter\t{}\naccumulator\t{}\n",
-            current.auction_id, current.auction, current.submission_counter, current.accumulator,
-        ),
+    let auction_id = (slot - market.market_start_slot) / market.submission_duration_slots;
+    if requested_auction_id.is_some_and(|requested| requested != auction_id) {
+        return Err(format!(
+            "auction window changed before initialization (requested {}, current {auction_id})",
+            requested_auction_id.unwrap()
+        )
+        .into());
+    }
+    let current = auction_addresses(&addresses, auction_id);
+    if account_exists(&rpc_url, &current.auction) {
+        println!(
+            "auction {auction_id} already initialized: {}",
+            current.auction
+        );
+        return Ok(());
+    }
+    submit_auction_initialization(
+        &wallet,
+        &rpc_url,
+        &addresses,
+        market.current_key_epoch,
+        market.oracle_price_account,
+        payer,
+        auction_id,
+        false,
+        None,
     )?;
-    println!("auction {}: {}", current.auction_id, current.auction);
+    println!("auction {auction_id} initialization submitted");
     Ok(())
 }
 
@@ -1153,7 +2455,23 @@ fn ciphertext_array(
 }
 
 fn trader_state_path(state_dir: &Path, owner: &Pubkey) -> PathBuf {
-    state_dir.join("traders").join(format!("{owner}.json"))
+    let market = fs::read_to_string(state_dir.join("market.tsv"))
+        .ok()
+        .and_then(|contents| {
+            contents.lines().skip(1).find_map(|line| {
+                let mut fields = line.split('\t');
+                if fields.next() == Some("market") {
+                    fields.next().map(str::to_owned)
+                } else {
+                    None
+                }
+            })
+        })
+        .unwrap_or_else(|| "legacy".to_owned());
+    state_dir
+        .join("traders")
+        .join(market)
+        .join(format!("{owner}.json"))
 }
 
 fn read_trader_state(
@@ -1164,7 +2482,9 @@ fn read_trader_state(
     if !path.exists() {
         return Ok(None);
     }
-    Ok(Some(serde_json::from_slice(&fs::read(path)?)?))
+    Ok(Some(
+        serde_json::from_slice::<TraderPrivateState>(&fs::read(path)?)?.normalize(),
+    ))
 }
 
 fn write_trader_state(
@@ -1172,9 +2492,9 @@ fn write_trader_state(
     owner: &Pubkey,
     state: &TraderPrivateState,
 ) -> Result<(), Box<dyn Error>> {
-    let directory = state_dir.join("traders");
-    fs::create_dir_all(&directory)?;
     let path = trader_state_path(state_dir, owner);
+    let directory = path.parent().ok_or("trader state path has no parent")?;
+    fs::create_dir_all(&directory)?;
     let temporary = path.with_extension("json.pending");
     fs::write(&temporary, serde_json::to_vec_pretty(state)?)?;
     restrict_permissions(&temporary)?;
@@ -1222,7 +2542,7 @@ fn initialize_private_balance(
     )
 }
 
-fn deposit_initial_balance(
+fn deposit_balance(
     config: &OrderConfig,
     addresses: &Addresses,
     market: &beatex::Market,
@@ -1230,25 +2550,28 @@ fn deposit_initial_balance(
     owner: Pubkey,
     private_balance: Pubkey,
     state: &mut TraderPrivateState,
+    base_amount: u64,
+    quote_amount: u64,
 ) -> Result<(), Box<dyn Error>> {
-    if state.revision != 0 {
+    if base_amount == 0 && quote_amount == 0 {
         return Ok(());
     }
-    let prover = DepositProver::deterministic_devnet()?;
     let mut rng = ChaCha20Rng::from_entropy();
-    let output = prover.prove(
-        DepositProofRequest {
-            market: addresses.market.to_bytes(),
-            owner: owner.to_bytes(),
-            key_epoch: addresses.key_epoch.to_bytes(),
-            committee_key: key_epoch.babyjub_encryption_pubkey,
-            old_revision: state.revision,
-            base_amount: config.deposit_base,
-            quote_amount: config.deposit_quote,
-            old_balance: state.balance.opening(),
-        },
-        &mut rng,
-    )?;
+    let output = with_deposit_prover(|prover| {
+        prover.prove(
+            DepositProofRequest {
+                market: addresses.market.to_bytes(),
+                owner: owner.to_bytes(),
+                key_epoch: addresses.key_epoch.to_bytes(),
+                committee_key: key_epoch.babyjub_encryption_pubkey,
+                old_revision: state.revision,
+                base_amount,
+                quote_amount,
+                old_balance: state.balance.opening(),
+            },
+            &mut rng,
+        )
+    })?;
     let deposit_key = verification_key_address(
         &addresses.market,
         QueueCircuitKind::BalanceDeposit,
@@ -1257,7 +2580,7 @@ fn deposit_initial_balance(
     send(
         &config.wallet,
         &config.rpc_url,
-        "deposit market-maker collateral",
+        "deposit private collateral",
         vec![
             meta(owner, true, true),
             meta(addresses.market, false, false),
@@ -1275,8 +2598,8 @@ fn deposit_initial_balance(
         ],
         beatex::instruction::DepositCollateral {
             args: DepositCollateralArgs {
-                base_amount: config.deposit_base,
-                quote_amount: config.deposit_quote,
+                base_amount,
+                quote_amount,
                 new_encrypted_base: output.new_encrypted_base,
                 new_encrypted_quote: output.new_encrypted_quote,
                 proof: proof_input(
@@ -1310,31 +2633,32 @@ fn submit_order(
     key_epoch: &beatex::KeyEpoch,
     owner: Pubkey,
     private_balance: Pubkey,
-    counter: &beatex::SubmissionCounter,
-    intent: &OrderIntent,
+    intent: &NativeOrderIntent,
     state: &mut TraderPrivateState,
 ) -> Result<(), Box<dyn Error>> {
-    let prover = OrderProver::deterministic_devnet()?;
     let mut rng = ChaCha20Rng::from_entropy();
-    let output = prover.prove(
-        OrderProofRequest {
-            auction: auction_addresses.auction.to_bytes(),
-            owner: owner.to_bytes(),
-            client_order_nonce: intent.client_order_nonce,
-            reference_price: auction.reference_price,
-            grid_step_bps: auction.grid_step_bps,
-            committee_key: key_epoch.babyjub_encryption_pubkey,
-            buy: intent.buy,
-            sell: intent.sell,
-            old_balance: state.balance.opening(),
-        },
-        &mut rng,
-    )?;
+    let output = with_order_prover(auction.order_circuit_version, |prover| {
+        prover.prove(
+            OrderProofRequest {
+                auction: auction_addresses.auction.to_bytes(),
+                owner: owner.to_bytes(),
+                client_order_nonce: intent.client_order_nonce,
+                reference_price: auction.reference_price,
+                grid_step_bps: auction.grid_step_bps,
+                committee_key: key_epoch.babyjub_encryption_pubkey,
+                buy: intent.buy,
+                sell: intent.sell,
+                old_balance: state.balance.opening(),
+            },
+            &mut rng,
+        )
+    })?;
     let (event, _) = Pubkey::find_program_address(
         &[
             b"queued-order",
             auction_addresses.auction.as_ref(),
-            &counter.accepted_order_count.to_le_bytes(),
+            owner.as_ref(),
+            &intent.client_order_nonce.to_le_bytes(),
         ],
         &beatex::ID,
     );
@@ -1349,8 +2673,9 @@ fn submit_order(
     let order_key = verification_key_address(
         &addresses.market,
         QueueCircuitKind::OrderSubmission,
-        queue::ORDER_SUBMISSION_CIRCUIT_VERSION,
+        auction.order_circuit_version,
     );
+    ensure_order_submission_time(&config.rpc_url, auction)?;
     send(
         &config.wallet,
         &config.rpc_url,
@@ -1387,7 +2712,7 @@ fn submit_order(
     )?;
     state.balance = output.new_balance.into();
     state.revision += 1;
-    state.active_order = Some(StoredOrder {
+    state.upsert_order(StoredOrder {
         auction_id: auction_addresses.auction_id,
         auction: auction_addresses.auction.to_string(),
         event: event.to_string(),
@@ -1399,7 +2724,11 @@ fn submit_order(
         base_reserve: output.base_reserve,
         quote_reserve: output.quote_reserve,
     });
-    write_trader_state(&config.common.state_dir, &owner, state)
+    write_trader_state(&config.common.state_dir, &owner, state)?;
+    emit_order_event(NativeOrderEvent::Placed {
+        auction_id: auction_addresses.auction_id,
+    });
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1411,19 +2740,13 @@ fn replace_order(
     key_epoch: &beatex::KeyEpoch,
     owner: Pubkey,
     private_balance: Pubkey,
-    counter: &beatex::SubmissionCounter,
-    intent: &OrderIntent,
+    intent: &NativeOrderIntent,
     state: &mut TraderPrivateState,
 ) -> Result<(), Box<dyn Error>> {
     let previous = state
-        .active_order
-        .clone()
+        .order(auction_addresses.auction_id)
+        .cloned()
         .ok_or("missing private active-order state")?;
-    if previous.auction_id != auction_addresses.auction_id {
-        return Err(
-            "the previous auction order must be settled or refunded before a new order".into(),
-        );
-    }
     let previous_event = Pubkey::from_str(&previous.event)?;
     let (active_order, _) = Pubkey::find_program_address(
         &[
@@ -1442,42 +2765,44 @@ fn replace_order(
         &[
             b"queued-order",
             auction_addresses.auction.as_ref(),
-            &counter.accepted_order_count.to_le_bytes(),
+            owner.as_ref(),
+            &intent.client_order_nonce.to_le_bytes(),
         ],
         &beatex::ID,
     );
-    let prover = ReplacementProver::deterministic_devnet()?;
     let mut rng = ChaCha20Rng::from_entropy();
-    let output = prover.prove(
-        CollateralReleaseProofRequest {
-            market: addresses.market.to_bytes(),
-            auction: auction_addresses.auction.to_bytes(),
-            active_order: active_order.to_bytes(),
-            owner: owner.to_bytes(),
-            balance_revision: state.revision,
-            client_order_nonce: previous.client_order_nonce,
-            buy: previous.buy,
-            sell: previous.sell,
-            base_reserve: previous.base_reserve,
-            quote_reserve: previous.quote_reserve,
-            order_salt: previous.order_salt,
-            expected_order_commitment: previous.order_commitment,
-            committee_key: key_epoch.babyjub_encryption_pubkey,
-            old_balance: state.balance.opening(),
-        },
-        OrderProofRequest {
-            auction: auction_addresses.auction.to_bytes(),
-            owner: owner.to_bytes(),
-            client_order_nonce: intent.client_order_nonce,
-            reference_price: auction.reference_price,
-            grid_step_bps: auction.grid_step_bps,
-            committee_key: key_epoch.babyjub_encryption_pubkey,
-            buy: intent.buy,
-            sell: intent.sell,
-            old_balance: state.balance.opening(),
-        },
-        &mut rng,
-    )?;
+    let output = with_replacement_prover(auction.order_circuit_version, |prover| {
+        prover.prove(
+            CollateralReleaseProofRequest {
+                market: addresses.market.to_bytes(),
+                auction: auction_addresses.auction.to_bytes(),
+                active_order: active_order.to_bytes(),
+                owner: owner.to_bytes(),
+                balance_revision: state.revision,
+                client_order_nonce: previous.client_order_nonce,
+                buy: previous.buy,
+                sell: previous.sell,
+                base_reserve: previous.base_reserve,
+                quote_reserve: previous.quote_reserve,
+                order_salt: previous.order_salt,
+                expected_order_commitment: previous.order_commitment,
+                committee_key: key_epoch.babyjub_encryption_pubkey,
+                old_balance: state.balance.opening(),
+            },
+            OrderProofRequest {
+                auction: auction_addresses.auction.to_bytes(),
+                owner: owner.to_bytes(),
+                client_order_nonce: intent.client_order_nonce,
+                reference_price: auction.reference_price,
+                grid_step_bps: auction.grid_step_bps,
+                committee_key: key_epoch.babyjub_encryption_pubkey,
+                buy: intent.buy,
+                sell: intent.sell,
+                old_balance: state.balance.opening(),
+            },
+            &mut rng,
+        )
+    })?;
     let release_key = verification_key_address(
         &addresses.market,
         QueueCircuitKind::OrderModification,
@@ -1486,8 +2811,9 @@ fn replace_order(
     let order_key = verification_key_address(
         &addresses.market,
         QueueCircuitKind::OrderSubmission,
-        queue::ORDER_SUBMISSION_CIRCUIT_VERSION,
+        auction.order_circuit_version,
     );
+    ensure_order_submission_time(&config.rpc_url, auction)?;
     send(
         &config.wallet,
         &config.rpc_url,
@@ -1538,7 +2864,7 @@ fn replace_order(
     )?;
     state.balance = output.replacement.new_balance.into();
     state.revision += 1;
-    state.active_order = Some(StoredOrder {
+    state.upsert_order(StoredOrder {
         auction_id: auction_addresses.auction_id,
         auction: auction_addresses.auction.to_string(),
         event: event.to_string(),
@@ -1550,7 +2876,11 @@ fn replace_order(
         base_reserve: output.replacement.base_reserve,
         quote_reserve: output.replacement.quote_reserve,
     });
-    write_trader_state(&config.common.state_dir, &owner, state)
+    write_trader_state(&config.common.state_dir, &owner, state)?;
+    emit_order_event(NativeOrderEvent::Replaced {
+        auction_id: auction_addresses.auction_id,
+    });
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1562,21 +2892,15 @@ fn rollover_order(
     key_epoch: &beatex::KeyEpoch,
     owner: Pubkey,
     private_balance: Pubkey,
-    next_counter: &beatex::SubmissionCounter,
-    intent: &OrderIntent,
+    intent: &NativeOrderIntent,
+    previous: StoredOrder,
+    old_auction: beatex::AuctionResult,
     state: &mut TraderPrivateState,
 ) -> Result<(), Box<dyn Error>> {
-    let previous = state
-        .active_order
-        .clone()
-        .ok_or("missing private active-order state")?;
     let old_addresses = auction_addresses(addresses, previous.auction_id);
     if previous.auction != old_addresses.auction.to_string() {
         return Err("the local previous-auction address is inconsistent".into());
     }
-    let old_auction =
-        fetch_anchor_account::<beatex::Auction>(&config.rpc_url, &old_addresses.auction)?
-            .ok_or("previous auction account is missing")?;
     if old_auction.state != beatex::AuctionState::Settled {
         return Err(match old_auction.state {
             beatex::AuctionState::Cancelled => {
@@ -1591,13 +2915,6 @@ fn rollover_order(
         return Err("rollover requires both auctions to use the same key epoch".into());
     }
     let old_order_address = Pubkey::from_str(&previous.event)?;
-    let old_order = fetch_anchor_account::<QueuedOrder>(&config.rpc_url, &old_order_address)?
-        .ok_or("previous queued order is missing")?;
-    if old_order.state != QueuedOrderState::Folded
-        || old_order.withdrawal_state != WithdrawalState::Pending
-    {
-        return Err("previous queued order is not rollover-eligible".into());
-    }
     let old_active_order = Pubkey::find_program_address(
         &[
             b"active-order",
@@ -1607,17 +2924,30 @@ fn rollover_order(
         &beatex::ID,
     )
     .0;
-    let old_active =
-        fetch_anchor_account::<beatex::ActiveOrder>(&config.rpc_url, &old_active_order)?
-            .ok_or("previous active-order account is missing")?;
+    let mut previous_accounts =
+        fetch_multiple_account_bytes(&config.rpc_url, &[old_order_address, old_active_order])?
+            .into_iter();
+    let old_order = deserialize_anchor_account::<QueuedOrder>(
+        previous_accounts.next().flatten(),
+        "previous queued order is missing",
+    )?;
+    let old_active = deserialize_anchor_account::<beatex::ActiveOrder>(
+        previous_accounts.next().flatten(),
+        "previous active-order account is missing",
+    )?;
+    if old_order.state != QueuedOrderState::Folded
+        || old_order.withdrawal_state != WithdrawalState::Pending
+    {
+        return Err("previous queued order is not rollover-eligible".into());
+    }
     if !old_active.active || old_active.latest_event != old_order_address {
         return Err("previous queued order is not the active revision".into());
     }
     let next_order_address = Pubkey::find_program_address(
         &[
-            b"queued-order",
+            b"rollover-order",
             next_addresses.auction.as_ref(),
-            &next_counter.accepted_order_count.to_le_bytes(),
+            owner.as_ref(),
         ],
         &beatex::ID,
     )
@@ -1631,50 +2961,54 @@ fn rollover_order(
         &beatex::ID,
     )
     .0;
-    let clearing_index = usize::from(old_auction.clearing_index);
-    let prover = MarketMakerRolloverProver::deterministic_devnet()?;
     let mut rng = ChaCha20Rng::from_entropy();
-    let output = prover.prove(
-        RolloverProofRequest {
-            market: addresses.market.to_bytes(),
-            auction: old_addresses.auction.to_bytes(),
-            order: old_order_address.to_bytes(),
-            active_order: old_active_order.to_bytes(),
-            owner: owner.to_bytes(),
-            key_epoch: addresses.key_epoch.to_bytes(),
-            client_order_nonce: old_order.client_order_nonce,
-            sequence: old_order.sequence,
-            allocation_rule_version: old_auction.allocation_rule_version,
-            order_circuit_version: old_auction.order_circuit_version,
-            claim_circuit_version: old_auction.claim_circuit_version,
-            buy: previous.buy,
-            sell: previous.sell,
-            base_reserve: previous.base_reserve,
-            quote_reserve: previous.quote_reserve,
-            order_salt: previous.order_salt,
-            expected_order_commitment: old_order.order_commitment,
-            clearing_index: old_auction.clearing_index,
-            clearing_price: old_auction.clearing_price,
-            demand: old_auction.decrypted_demand[clearing_index],
-            supply: old_auction.decrypted_supply[clearing_index],
-            clearing_volume: old_auction.clearing_volume,
-            balance_revision: state.revision,
-            committee_key: key_epoch.babyjub_encryption_pubkey,
-            old_balance: state.balance.opening(),
-        },
-        OrderProofRequest {
-            auction: next_addresses.auction.to_bytes(),
-            owner: owner.to_bytes(),
-            client_order_nonce: intent.client_order_nonce,
-            reference_price: next_auction.reference_price,
-            grid_step_bps: next_auction.grid_step_bps,
-            committee_key: key_epoch.babyjub_encryption_pubkey,
-            buy: intent.buy,
-            sell: intent.sell,
-            old_balance: state.balance.opening(),
-        },
-        &mut rng,
-    )?;
+    let settlement_request = RolloverProofRequest {
+        market: addresses.market.to_bytes(),
+        auction: old_addresses.auction.to_bytes(),
+        order: old_order_address.to_bytes(),
+        active_order: old_active_order.to_bytes(),
+        owner: owner.to_bytes(),
+        key_epoch: addresses.key_epoch.to_bytes(),
+        client_order_nonce: old_order.client_order_nonce,
+        sequence: old_order.sequence,
+        allocation_rule_version: old_auction.allocation_rule_version,
+        order_circuit_version: old_auction.order_circuit_version,
+        claim_circuit_version: old_auction.claim_circuit_version,
+        buy: previous.buy,
+        sell: previous.sell,
+        base_reserve: previous.base_reserve,
+        quote_reserve: previous.quote_reserve,
+        order_salt: previous.order_salt,
+        expected_order_commitment: old_order.order_commitment,
+        clearing_index: old_auction.clearing_index,
+        clearing_price: old_auction.clearing_price,
+        demand: old_auction.demand_at_clearing,
+        supply: old_auction.supply_at_clearing,
+        clearing_volume: old_auction.clearing_volume,
+        balance_revision: state.revision,
+        committee_key: key_epoch.babyjub_encryption_pubkey,
+        old_balance: state.balance.opening(),
+    };
+    let mut next_order_request = OrderProofRequest {
+        auction: next_addresses.auction.to_bytes(),
+        owner: owner.to_bytes(),
+        client_order_nonce: intent.client_order_nonce,
+        reference_price: next_auction.reference_price,
+        grid_step_bps: next_auction.grid_step_bps,
+        committee_key: key_epoch.babyjub_encryption_pubkey,
+        buy: intent.buy,
+        sell: intent.sell,
+        old_balance: state.balance.opening(),
+    };
+    let settlement = with_rollover_prover(|prover| prover.prove(settlement_request, &mut rng))?;
+    next_order_request.old_balance = settlement.credited_balance.clone();
+    let next_order = with_order_prover(next_auction.order_circuit_version, |prover| {
+        prover.prove(next_order_request, &mut rng)
+    })?;
+    let output = MarketMakerRolloverProofOutput {
+        settlement,
+        next_order,
+    };
     let rollover_key = verification_key_address(
         &addresses.market,
         QueueCircuitKind::RolloverSettlement,
@@ -1683,12 +3017,13 @@ fn rollover_order(
     let order_key = verification_key_address(
         &addresses.market,
         QueueCircuitKind::OrderSubmission,
-        queue::ORDER_SUBMISSION_CIRCUIT_VERSION,
+        next_auction.order_circuit_version,
     );
     let mut settlement_expected_input = output.settlement.public_input;
     settlement_expected_input.reverse();
     let mut order_expected_input = output.next_order.public_input;
     order_expected_input.reverse();
+    ensure_order_submission_time(&config.rpc_url, next_auction)?;
     send_bundle(
         &config.wallet,
         &config.rpc_url,
@@ -1834,7 +3169,8 @@ fn rollover_order(
     )?;
     state.balance = output.next_order.new_balance.into();
     state.revision += 1;
-    state.active_order = Some(StoredOrder {
+    state.remove_order(previous.auction_id);
+    state.upsert_order(StoredOrder {
         auction_id: next_addresses.auction_id,
         auction: next_addresses.auction.to_string(),
         event: next_order_address.to_string(),
@@ -1847,30 +3183,195 @@ fn rollover_order(
         quote_reserve: output.next_order.quote_reserve,
     });
     write_trader_state(&config.common.state_dir, &owner, state)?;
-    println!(
-        "rolled auction {} into {} with payouts {} base and {} quote units",
-        previous.auction_id,
-        next_addresses.auction_id,
-        output.settlement.base_payout,
-        output.settlement.quote_payout
-    );
+    emit_order_event(NativeOrderEvent::Rollover {
+        previous_auction_id: previous.auction_id,
+        next_auction_id: next_addresses.auction_id,
+    });
+    if let Some(fill) = fill_event(&old_auction, &previous)? {
+        emit_order_event(NativeOrderEvent::Fill {
+            auction_id: previous.auction_id,
+            side: fill.side.to_owned(),
+            base_amount: fill.base_amount,
+            quote_amount: fill.quote_amount,
+        });
+    }
     Ok(())
 }
 
+fn order_reserves(
+    market: &beatex::Market,
+    auction: &beatex::Auction,
+    intent: &NativeOrderIntent,
+) -> Result<(u64, u64), Box<dyn Error>> {
+    let center = i64::from(auction.grid_size / 2);
+    let mut max_quote = 0u128;
+    for index in 0..usize::from(auction.grid_size) {
+        let offset = i64::try_from(index)? - center;
+        let multiplier = 10_000i64
+            .checked_add(offset * i64::from(auction.grid_step_bps))
+            .ok_or("grid multiplier overflow")?;
+        if multiplier <= 0 {
+            return Err("grid contains a non-positive multiplier".into());
+        }
+        let price = u128::from(auction.reference_price)
+            .checked_mul(multiplier as u128)
+            .and_then(|value| value.checked_add(5_000))
+            .ok_or("grid price overflow")?
+            / 10_000;
+        max_quote = max_quote.max(u128::from(intent.buy[index]) * price);
+    }
+    let max_sell = intent.sell[..usize::from(auction.grid_size)]
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or_default();
+    let base = u128::from(max_sell)
+        .checked_mul(u128::from(market.base_unit_size))
+        .ok_or("base reserve overflow")?;
+    Ok((u64::try_from(base)?, u64::try_from(max_quote)?))
+}
+
+fn top_up_private_balance_if_needed(
+    config: &OrderConfig,
+    addresses: &Addresses,
+    market: &beatex::Market,
+    key_epoch: &beatex::KeyEpoch,
+    owner: Pubkey,
+    private_balance: Pubkey,
+    auction: &beatex::Auction,
+    intent: &NativeOrderIntent,
+    state: &mut TraderPrivateState,
+) -> Result<(), Box<dyn Error>> {
+    // A live order already has collateral reserved. Its replacement/rollover
+    // proof accounts for that order and must not receive an unrelated deposit.
+    if state.has_active_orders() {
+        return Ok(());
+    }
+    let (required_base, required_quote) = order_reserves(market, auction, intent)?;
+    let missing_base = required_base.saturating_sub(state.balance.base_value);
+    let missing_quote = required_quote.saturating_sub(state.balance.quote_value);
+    if missing_base == 0 && missing_quote == 0 {
+        return Ok(());
+    }
+    // Keep the first-order defaults generous enough for the configured maker
+    // curve, while also recovering cleanly if an earlier attempt deposited the
+    // old, too-small defaults and failed before submitting an order.
+    let deposit_base = missing_base.max(config.deposit_base);
+    let deposit_quote = missing_quote.max(config.deposit_quote);
+    println!(
+        "private balance top-up: {} base units and {} quote units",
+        deposit_base, deposit_quote
+    );
+    deposit_balance(
+        config,
+        addresses,
+        market,
+        key_epoch,
+        owner,
+        private_balance,
+        state,
+        deposit_base,
+        deposit_quote,
+    )
+}
+
 fn execute_order(config: OrderConfig) -> Result<(), Box<dyn Error>> {
+    let mut input = Vec::new();
+    std::io::stdin().read_to_end(&mut input)?;
+    let intent: NativeOrderIntent = serde_json::from_slice(&input)?;
+    execute_order_intent(config, intent)
+}
+
+fn execute_order_intent(
+    config: OrderConfig,
+    intent: NativeOrderIntent,
+) -> Result<(), Box<dyn Error>> {
+    execute_order_intent_once(config, intent)
+}
+
+fn execute_order_intent_once(
+    config: OrderConfig,
+    intent: NativeOrderIntent,
+) -> Result<(), Box<dyn Error>> {
     if config.rpc_url.contains("mainnet") {
         return Err("mainnet is not supported by the Devnet client".into());
     }
-    let mut input = Vec::new();
-    std::io::stdin().read_to_end(&mut input)?;
-    let intent: OrderIntent = serde_json::from_slice(&input)?;
     let owner = wallet_pubkey(&config.wallet)?;
     let addresses = addresses(&config.common);
-    let market = fetch_anchor_account::<beatex::Market>(&config.rpc_url, &addresses.market)?
-        .ok_or("market has not been initialized")?;
-    let key_epoch =
-        fetch_anchor_account::<beatex::KeyEpoch>(&config.rpc_url, &addresses.key_epoch)?
-            .ok_or("key epoch has not been initialized")?;
+    let private_balance = private_balance_address(&addresses.market, &owner);
+    let (market, key_epoch, auction_addresses, auction, onchain_before) = if let Some(auction_id) =
+        intent.auction_id
+    {
+        let auction_addresses = auction_addresses(&addresses, auction_id);
+        let mut accounts = fetch_multiple_account_bytes(
+            &config.rpc_url,
+            &[
+                addresses.market,
+                addresses.key_epoch,
+                auction_addresses.auction,
+                private_balance,
+            ],
+        )?
+        .into_iter();
+        let market = deserialize_anchor_account::<beatex::Market>(
+            accounts.next().flatten(),
+            "market has not been initialized",
+        )?;
+        let key_epoch = deserialize_anchor_account::<beatex::KeyEpoch>(
+            accounts.next().flatten(),
+            "key epoch has not been initialized",
+        )?;
+        let auction = deserialize_anchor_account::<beatex::Auction>(
+            accounts.next().flatten(),
+            "requested auction has not been initialized",
+        )?;
+        let onchain_before = accounts
+            .next()
+            .flatten()
+            .map(|bytes| beatex::EncryptedPrivateBalance::try_deserialize(&mut bytes.as_slice()))
+            .transpose()?;
+        (
+            market,
+            key_epoch,
+            auction_addresses,
+            auction,
+            onchain_before,
+        )
+    } else {
+        let market = fetch_anchor_account::<beatex::Market>(&config.rpc_url, &addresses.market)?
+            .ok_or("market has not been initialized")?;
+        let auction_addresses = current_auction_addresses(&config.rpc_url, &addresses, &market)?
+            .ok_or("market has not reached its start slot")?;
+        let mut accounts = fetch_multiple_account_bytes(
+            &config.rpc_url,
+            &[
+                addresses.key_epoch,
+                auction_addresses.auction,
+                private_balance,
+            ],
+        )?
+        .into_iter();
+        let key_epoch = deserialize_anchor_account::<beatex::KeyEpoch>(
+            accounts.next().flatten(),
+            "key epoch has not been initialized",
+        )?;
+        let auction = deserialize_anchor_account::<beatex::Auction>(
+            accounts.next().flatten(),
+            "current auction has not been initialized",
+        )?;
+        let onchain_before = accounts
+            .next()
+            .flatten()
+            .map(|bytes| beatex::EncryptedPrivateBalance::try_deserialize(&mut bytes.as_slice()))
+            .transpose()?;
+        (
+            market,
+            key_epoch,
+            auction_addresses,
+            auction,
+            onchain_before,
+        )
+    };
     if intent.grid_step_bps != market.grid_step_bps {
         return Err(format!(
             "intent grid step {} bps does not match market grid step {} bps",
@@ -1878,16 +3379,9 @@ fn execute_order(config: OrderConfig) -> Result<(), Box<dyn Error>> {
         )
         .into());
     }
-    initialize_current_auction(
-        config.common.clone(),
-        config.wallet.clone(),
-        config.rpc_url.clone(),
-    )?;
-    let auction_addresses = current_auction_addresses(&config.rpc_url, &addresses, &market)?
-        .ok_or("market has not reached its start slot")?;
-    let auction =
-        fetch_anchor_account::<beatex::Auction>(&config.rpc_url, &auction_addresses.auction)?
-            .ok_or("current auction has not been initialized")?;
+    if auction.market != addresses.market || auction.auction_id != auction_addresses.auction_id {
+        return Err("auction account does not match the requested market and auction".into());
+    }
     if intent.reference_price != auction.reference_price {
         return Err(format!(
             "intent reference {} does not match auction reference {}",
@@ -1895,9 +3389,6 @@ fn execute_order(config: OrderConfig) -> Result<(), Box<dyn Error>> {
         )
         .into());
     }
-    let private_balance = private_balance_address(&addresses.market, &owner);
-    let onchain_before =
-        fetch_anchor_account::<beatex::EncryptedPrivateBalance>(&config.rpc_url, &private_balance)?;
     let mut state =
         read_trader_state(&config.common.state_dir, &owner)?.unwrap_or(TraderPrivateState {
             revision: 0,
@@ -1907,6 +3398,7 @@ fn execute_order(config: OrderConfig) -> Result<(), Box<dyn Error>> {
                 base_randomness: [0; 32],
                 quote_randomness: [0; 32],
             },
+            active_orders: Vec::new(),
             active_order: None,
         });
     if let Some(onchain) = &onchain_before {
@@ -1920,41 +3412,87 @@ fn execute_order(config: OrderConfig) -> Result<(), Box<dyn Error>> {
     } else if state.revision != 0 {
         return Err("local private balance exists but its on-chain account is missing".into());
     }
-    initialize_private_balance(&config, &addresses, owner, private_balance)?;
-    deposit_initial_balance(
+    if onchain_before.is_none() {
+        initialize_private_balance(&config, &addresses, owner, private_balance)?;
+    }
+    if state.revision == 0 {
+        deposit_balance(
+            &config,
+            &addresses,
+            &market,
+            &key_epoch,
+            owner,
+            private_balance,
+            &mut state,
+            config.deposit_base,
+            config.deposit_quote,
+        )?;
+    }
+    top_up_private_balance_if_needed(
         &config,
         &addresses,
         &market,
         &key_epoch,
         owner,
         private_balance,
+        &auction,
+        &intent,
         &mut state,
     )?;
-    let counter = fetch_anchor_account::<beatex::SubmissionCounter>(
-        &config.rpc_url,
-        &auction_addresses.submission_counter,
-    )?
-    .ok_or("submission counter is missing")?;
-    if let Some(previous) = &state.active_order {
-        if previous.auction_id == auction_addresses.auction_id {
-            replace_order(
-                &config,
-                &addresses,
-                &auction_addresses,
-                &auction,
-                &key_epoch,
-                owner,
-                private_balance,
-                &counter,
-                &intent,
-                &mut state,
-            )
-        } else {
-            let old_addresses = crate::auction_addresses(&addresses, previous.auction_id);
-            let old_auction =
-                fetch_anchor_account::<beatex::Auction>(&config.rpc_url, &old_addresses.auction)?
-                    .ok_or("previous auction account is missing")?;
-            if old_auction.state == beatex::AuctionState::Cancelled {
+    if state.order(auction_addresses.auction_id).is_some() {
+        replace_order(
+            &config,
+            &addresses,
+            &auction_addresses,
+            &auction,
+            &key_epoch,
+            owner,
+            private_balance,
+            &intent,
+            &mut state,
+        )
+    } else {
+        let previous_orders = state
+            .active_orders
+            .iter()
+            .filter(|order| order.auction_id < auction_addresses.auction_id)
+            .collect::<Vec<_>>();
+        let mut terminal_order = None;
+        for chunk in previous_orders.chunks(100) {
+            let previous_addresses = chunk
+                .iter()
+                .map(|order| crate::auction_addresses(&addresses, order.auction_id).auction)
+                .collect::<Vec<_>>();
+            let previous_accounts =
+                fetch_multiple_account_bytes(&config.rpc_url, &previous_addresses)?;
+            for (previous, account_bytes) in chunk.iter().zip(previous_accounts) {
+                // Finished auctions are compacted to an `AuctionResult`; any
+                // other form is still pending.
+                let Some(account_bytes) = account_bytes.filter(|bytes| {
+                    bytes.starts_with(
+                        <beatex::AuctionResult as anchor_lang::Discriminator>::DISCRIMINATOR,
+                    )
+                }) else {
+                    continue;
+                };
+                let previous_auction =
+                    beatex::AuctionResult::try_deserialize(&mut account_bytes.as_slice())?;
+                if matches!(
+                    previous_auction.state,
+                    beatex::AuctionState::Settled | beatex::AuctionState::Cancelled
+                ) {
+                    terminal_order = Some(((*previous).clone(), previous_auction));
+                    break;
+                }
+            }
+            if terminal_order.is_some() {
+                break;
+            }
+        }
+        match terminal_order {
+            Some((previous, previous_auction))
+                if previous_auction.state == beatex::AuctionState::Cancelled =>
+            {
                 execute_balance_settlement(BalanceSettlementConfig {
                     common: config.common.clone(),
                     wallet: config.wallet.clone(),
@@ -1972,11 +3510,13 @@ fn execute_order(config: OrderConfig) -> Result<(), Box<dyn Error>> {
                     &key_epoch,
                     owner,
                     private_balance,
-                    &counter,
                     &intent,
                     &mut state,
                 )
-            } else {
+            }
+            Some((previous, previous_auction))
+                if previous_auction.state == beatex::AuctionState::Settled =>
+            {
                 rollover_order(
                     &config,
                     &addresses,
@@ -1985,38 +3525,598 @@ fn execute_order(config: OrderConfig) -> Result<(), Box<dyn Error>> {
                     &key_epoch,
                     owner,
                     private_balance,
-                    &counter,
                     &intent,
+                    previous,
+                    previous_auction,
                     &mut state,
                 )
             }
+            _ => submit_order(
+                &config,
+                &addresses,
+                &auction_addresses,
+                &auction,
+                &key_epoch,
+                owner,
+                private_balance,
+                &intent,
+                &mut state,
+            ),
         }
-    } else {
-        submit_order(
-            &config,
-            &addresses,
-            &auction_addresses,
-            &auction,
-            &key_epoch,
-            owner,
-            private_balance,
-            &counter,
-            &intent,
-            &mut state,
-        )
     }
 }
 
-fn execute_fold(config: FoldConfig) -> Result<(), Box<dyn Error>> {
+/// Execute one order directly in this process and return the order lifecycle
+/// events emitted by the transaction/prover path. This is the native API used
+/// by long-lived Rust clients such as the market maker.
+pub fn execute_native_order(
+    config: NativeOrderConfig,
+    intent: NativeOrderIntent,
+) -> Result<Vec<NativeOrderEvent>, String> {
+    if wallet_file_is_browser_session(&config.wallet).map_err(|error| error.to_string())? {
+        return Err(
+            "native order execution requires a Solana JSON keypair, not a browser-wallet session"
+                .to_owned(),
+        );
+    }
+    read_v1_keypair_file(&config.wallet)
+        .map_err(|error| format!("native order wallet is not a valid Solana keypair: {error}"))?;
+    let order_config = OrderConfig {
+        common: CommonConfig {
+            base_mint: config.base_mint,
+            quote_mint: config.quote_mint,
+            state_dir: config.state_dir,
+        },
+        wallet: config.wallet,
+        base_source: config.base_source,
+        quote_source: config.quote_source,
+        rpc_url: config.rpc_url,
+        deposit_base: config.deposit_base,
+        deposit_quote: config.deposit_quote,
+    };
+    let previous_capture = NATIVE_ORDER_EVENTS
+        .with(|capture| std::mem::replace(&mut *capture.borrow_mut(), Some(Vec::new())));
+    let result = execute_order_intent(order_config, intent).map_err(|error| error.to_string());
+    let events = NATIVE_ORDER_EVENTS.with(|capture| {
+        let mut capture = capture.borrow_mut();
+        let events = capture.take().unwrap_or_default();
+        *capture = previous_capture;
+        events
+    });
+    result.map(|()| events)
+}
+
+fn execute_market_status(config: MarketStatusConfig) -> Result<(), Box<dyn Error>> {
     if config.rpc_url.contains("mainnet") {
         return Err("mainnet is not supported by the Devnet client".into());
+    }
+    let addresses = addresses(&config.common);
+    let market = fetch_anchor_account::<beatex::Market>(&config.rpc_url, &addresses.market)?
+        .ok_or("market has not been initialized")?;
+    let slot = current_slot(&config.rpc_url)?;
+    println!("current-slot\t{slot}");
+    println!("market-start-slot\t{}", market.market_start_slot);
+    println!(
+        "submission-duration-slots\t{}",
+        market.submission_duration_slots
+    );
+    println!(
+        "aggregation-duration-slots\t{}",
+        market.aggregation_duration_slots
+    );
+    println!(
+        "decryption-duration-slots\t{}",
+        market.decryption_duration_slots
+    );
+    println!("order-circuit-version\t{}", market.order_circuit_version);
+    if slot < market.market_start_slot {
+        println!("started\tfalse");
+    } else {
+        println!("started\ttrue");
+        println!(
+            "current-auction-id\t{}",
+            (slot - market.market_start_slot) / market.submission_duration_slots
+        );
+    }
+    Ok(())
+}
+
+fn execute_pipeline_status(config: MarketStatusConfig) -> Result<(), Box<dyn Error>> {
+    if config.rpc_url.contains("mainnet") {
+        return Err("mainnet is not supported by the Devnet client".into());
+    }
+    let addresses = addresses(&config.common);
+    let market = fetch_anchor_account::<beatex::Market>(&config.rpc_url, &addresses.market)?
+        .ok_or("market has not been initialized")?;
+    let slot = current_slot(&config.rpc_url)?;
+    println!("current-slot\t{slot}");
+    println!("market-start-slot\t{}", market.market_start_slot);
+    println!(
+        "submission-duration-slots\t{}",
+        market.submission_duration_slots
+    );
+    println!(
+        "aggregation-duration-slots\t{}",
+        market.aggregation_duration_slots
+    );
+    println!(
+        "decryption-duration-slots\t{}",
+        market.decryption_duration_slots
+    );
+    println!("order-circuit-version\t{}", market.order_circuit_version);
+    if slot < market.market_start_slot {
+        println!("started\tfalse");
+        return Ok(());
+    }
+    let current_id = (slot - market.market_start_slot) / market.submission_duration_slots;
+    println!("started\ttrue");
+    println!("current-auction-id\t{current_id}");
+
+    let lifecycle_span = market
+        .submission_duration_slots
+        .checked_add(market.aggregation_duration_slots)
+        .and_then(|value| value.checked_add(market.decryption_duration_slots))
+        .ok_or("pipeline duration overflow")?;
+    let pipeline_depth = lifecycle_span
+        .checked_add(market.submission_duration_slots - 1)
+        .ok_or("pipeline depth overflow")?
+        / market.submission_duration_slots;
+    let first_id = current_id.saturating_sub(pipeline_depth);
+    let auction_ids = (first_id..=current_id).collect::<Vec<_>>();
+    let mut account_addresses = Vec::with_capacity(auction_ids.len() * 3);
+    for auction_id in &auction_ids {
+        let derived = auction_addresses(&addresses, *auction_id);
+        account_addresses.extend([
+            derived.auction,
+            derived.submission_counter,
+            derived.accumulator,
+        ]);
+    }
+    let account_bytes =
+        fetch_multiple_account_bytes(&config.rpc_url, account_addresses.as_slice())?;
+    for (auction_id, accounts) in auction_ids.iter().zip(account_bytes.chunks_exact(3)) {
+        let Some(auction_bytes) = accounts[0].as_deref() else {
+            continue;
+        };
+        // Empty-auction reclamation closes all three accounts in one
+        // transaction. Different RPC nodes can briefly expose a mixed view
+        // while that transaction propagates; skip that snapshot and let the
+        // next poll observe the consistent state.
+        let Some(counter_bytes) = accounts[1].as_deref() else {
+            continue;
+        };
+        let Some(accumulator_bytes) = accounts[2].as_deref() else {
+            continue;
+        };
+        let auction = beatex::Auction::try_deserialize(&mut auction_bytes.as_ref())?;
+        let counter = SubmissionCounter::try_deserialize(&mut counter_bytes.as_ref())?;
+        let accumulator = AggregateAccumulator::try_deserialize(&mut accumulator_bytes.as_ref())?;
+        let state = match auction.state {
+            beatex::AuctionState::Pending => "pending",
+            beatex::AuctionState::Settled => "settled",
+            beatex::AuctionState::Cancelled => "cancelled",
+        };
+        println!(
+            "auction\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            auction_id,
+            state,
+            auction.open_slot,
+            auction.submission_end_slot,
+            auction.aggregation_deadline_slot,
+            auction.decryption_deadline_slot,
+            counter.accepted_order_count,
+            accumulator.folded_order_count,
+            counter
+                .accepted_order_count
+                .saturating_sub(accumulator.folded_order_count),
+        );
+    }
+    Ok(())
+}
+
+fn fetch_pipeline_auctions(
+    rpc_url: &str,
+    addresses: &Addresses,
+    market: &beatex::Market,
+    current_id: u64,
+) -> Result<Vec<PipelineAuction>, Box<dyn Error>> {
+    let lifecycle_span = market
+        .submission_duration_slots
+        .checked_add(market.aggregation_duration_slots)
+        .and_then(|value| value.checked_add(market.decryption_duration_slots))
+        .ok_or("pipeline duration overflow")?;
+    let pipeline_depth = lifecycle_span
+        .checked_add(market.submission_duration_slots - 1)
+        .ok_or("pipeline depth overflow")?
+        / market.submission_duration_slots;
+    let first_id = current_id.saturating_sub(pipeline_depth);
+    let auction_ids = (first_id..=current_id).collect::<Vec<_>>();
+    let mut account_addresses = Vec::with_capacity(auction_ids.len() * 3);
+    for auction_id in &auction_ids {
+        let derived = auction_addresses(addresses, *auction_id);
+        account_addresses.extend([
+            derived.auction,
+            derived.submission_counter,
+            derived.accumulator,
+        ]);
+    }
+    let account_bytes = fetch_multiple_account_bytes(rpc_url, &account_addresses)?;
+    let mut snapshots = Vec::new();
+    for (auction_id, accounts) in auction_ids.iter().zip(account_bytes.chunks_exact(3)) {
+        let Some(auction_bytes) = accounts[0].as_deref() else {
+            continue;
+        };
+        let (Some(counter_bytes), Some(accumulator_bytes)) =
+            (accounts[1].as_deref(), accounts[2].as_deref())
+        else {
+            continue;
+        };
+        let auction = beatex::Auction::try_deserialize(&mut auction_bytes.as_ref())?;
+        let counter = SubmissionCounter::try_deserialize(&mut counter_bytes.as_ref())?;
+        let accumulator = AggregateAccumulator::try_deserialize(&mut accumulator_bytes.as_ref())?;
+        snapshots.push(PipelineAuction {
+            auction_id: *auction_id,
+            state: auction.state,
+            submission_end_slot: auction.submission_end_slot,
+            aggregation_deadline_slot: auction.aggregation_deadline_slot,
+            decryption_deadline_slot: auction.decryption_deadline_slot,
+            accepted_orders: counter.accepted_order_count,
+            folded_orders: accumulator.folded_order_count,
+        });
+    }
+    Ok(snapshots)
+}
+
+fn committee_action_needed(snapshot: &PipelineAuction, current_slot: u64) -> bool {
+    if snapshot.state != beatex::AuctionState::Pending {
+        return false;
+    }
+    let queued = snapshot
+        .accepted_orders
+        .saturating_sub(snapshot.folded_orders);
+    (queued > 0
+        && current_slot < snapshot.aggregation_deadline_slot
+        && (queued >= queue_hash::FOLD_BATCH_SIZE as u64
+            || current_slot.saturating_add(FINAL_FOLD_LEAD_SLOTS) >= snapshot.submission_end_slot))
+        || (snapshot.accepted_orders > 0 && current_slot >= snapshot.decryption_deadline_slot)
+        || (snapshot.accepted_orders > 0
+            && current_slot >= snapshot.aggregation_deadline_slot
+            && snapshot.accepted_orders != snapshot.folded_orders)
+        || (current_slot >= snapshot.submission_end_slot
+            && snapshot.accepted_orders > 0
+            && snapshot.accepted_orders == snapshot.folded_orders)
+        || (current_slot >= snapshot.submission_end_slot
+            && snapshot.accepted_orders == 0
+            && snapshot.folded_orders == 0)
+}
+
+fn process_committee_auction(
+    common: CommonConfig,
+    wallet: PathBuf,
+    rpc_url: String,
+    auction_id: u64,
+) -> Result<(), Box<dyn Error>> {
+    let job_started = Instant::now();
+    let addresses = addresses(&common);
+    let auction_addresses = auction_addresses(&addresses, auction_id);
+    // One worker carries an auction from its final fold straight into
+    // publication, so settlement never waits for the dispatcher's next pass.
+    loop {
+        let Some((auction, counter, accumulator)) =
+            fetch_committee_auction_accounts(&rpc_url, &auction_addresses)?
+        else {
+            // The pipeline may have queued this worker immediately before another
+            // worker reclaimed an empty auction.
+            return Ok(());
+        };
+        if auction.state != beatex::AuctionState::Pending {
+            return Ok(());
+        }
+        let slot = current_slot(&rpc_url)?;
+        let queued = counter
+            .accepted_order_count
+            .saturating_sub(accumulator.folded_order_count);
+        if queued > 0
+            && slot < auction.aggregation_deadline_slot
+            && (queued >= queue_hash::FOLD_BATCH_SIZE as u64
+                || slot.saturating_add(FINAL_FOLD_LEAD_SLOTS) >= auction.submission_end_slot)
+        {
+            execute_fold_with_snapshot(
+                FoldConfig {
+                    common: common.clone(),
+                    wallet: wallet.clone(),
+                    rpc_url: rpc_url.clone(),
+                    auction_id,
+                    max_batches: 1,
+                    coordinator_logs: true,
+                },
+                Some((auction, accumulator)),
+                Some(job_started),
+            )?;
+            continue;
+        }
+        if counter.accepted_order_count > 0
+            && counter.accepted_order_count == accumulator.folded_order_count
+            && slot < auction.submission_end_slot
+            && slot.saturating_add(FINAL_FOLD_LEAD_SLOTS) >= auction.submission_end_slot
+        {
+            // Fully folded just before the close: wait for it, then publish.
+            thread::sleep(Duration::from_millis(100));
+            continue;
+        }
+
+        if slot >= auction.submission_end_slot
+            && counter.accepted_order_count == 0
+            && accumulator.folded_order_count == 0
+        {
+            let market = fetch_anchor_account::<beatex::Market>(&rpc_url, &addresses.market)?
+                .ok_or("market has not been initialized")?;
+            send(
+                &wallet,
+                &rpc_url,
+                &format!("close empty auction {auction_id}"),
+                vec![
+                    meta(addresses.market, false, false),
+                    meta(auction_addresses.auction, true, false),
+                    meta(auction_addresses.submission_counter, true, false),
+                    meta(auction_addresses.accumulator, true, false),
+                    meta(market.authority, true, false),
+                ]
+                .into_iter()
+                .chain(event_cpi_metas())
+                .collect(),
+                beatex::instruction::CloseEmptyAuction {}.data(),
+                vec![],
+            )?;
+            coordinator_auction_log(
+                auction_id,
+                &format!(
+                    "empty auction storage reclaimed, took {:.1}s",
+                    job_started.elapsed().as_secs_f64()
+                ),
+            );
+            return Ok(());
+        }
+        if counter.accepted_order_count > 0
+            && (slot >= auction.decryption_deadline_slot
+                || (slot >= auction.aggregation_deadline_slot
+                    && counter.accepted_order_count != accumulator.folded_order_count))
+        {
+            execute_cancel(FoldConfig {
+                common: common.clone(),
+                wallet: wallet.clone(),
+                rpc_url: rpc_url.clone(),
+                auction_id,
+                max_batches: 1,
+                coordinator_logs: true,
+            })?;
+        } else if slot >= auction.submission_end_slot
+            && counter.accepted_order_count > 0
+            && counter.accepted_order_count == accumulator.folded_order_count
+        {
+            execute_publish_with_started(
+                PublishConfig {
+                    common: common.clone(),
+                    wallet: wallet.clone(),
+                    rpc_url: rpc_url.clone(),
+                    auction_id,
+                    coordinator_logs: true,
+                },
+                job_started,
+            )?;
+        }
+        return Ok(());
+    }
+}
+
+fn run_committee_pipeline(common: CommonConfig, wallet: PathBuf, rpc_url: String) {
+    let addresses = addresses(&common);
+    let market = loop {
+        match fetch_anchor_account::<beatex::Market>(&rpc_url, &addresses.market) {
+            Ok(Some(market)) => break market,
+            Ok(None) => coordinator_error(&"market has not been initialized"),
+            Err(error) => coordinator_error(error.as_ref()),
+        }
+        thread::sleep(Duration::from_millis(500));
+    };
+    if let Err(error) = devnet_fast_fold_prover().and_then(|_| {
+        devnet_fast_publication_prover()
+            .and_then(|prover| prover.prepare_decryption_bound(market.max_aggregate_quantity))
+    }) {
+        coordinator_error(&format!("committee prover initialization failed: {error}"));
+        return;
+    }
+    let (completion_sender, completion_receiver) = mpsc::channel::<u64>();
+    let mut in_flight = HashSet::new();
+    let mut retry_after = HashMap::<u64, Instant>::new();
+    let mut last_snapshot_slot = None;
+    loop {
+        let mut snapshot_dirty = false;
+        while let Ok(auction_id) = completion_receiver.try_recv() {
+            in_flight.remove(&auction_id);
+            retry_after.insert(auction_id, Instant::now() + Duration::from_secs(3));
+            snapshot_dirty = true;
+        }
+        let now = Instant::now();
+        retry_after.retain(|_, deadline| *deadline > now);
+        let slot = match current_slot(&rpc_url) {
+            Ok(slot) => slot,
+            Err(error) => {
+                coordinator_error(error.as_ref());
+                thread::sleep(Duration::from_millis(250));
+                continue;
+            }
+        };
+        if slot < market.market_start_slot {
+            thread::sleep(Duration::from_millis(250));
+            continue;
+        }
+        if last_snapshot_slot == Some(slot) && !snapshot_dirty {
+            thread::sleep(Duration::from_millis(250));
+            continue;
+        }
+        let current_id = (slot - market.market_start_slot) / market.submission_duration_slots;
+        match fetch_pipeline_auctions(&rpc_url, &addresses, &market, current_id) {
+            Ok(snapshots) => {
+                last_snapshot_slot = Some(slot);
+                for snapshot in snapshots {
+                    if in_flight.len() >= MAX_COMMITTEE_AUCTION_WORKERS {
+                        break;
+                    }
+                    if committee_action_needed(&snapshot, slot)
+                        && !retry_after.contains_key(&snapshot.auction_id)
+                        && in_flight.insert(snapshot.auction_id)
+                    {
+                        let worker_common = common.clone();
+                        let worker_wallet = wallet.clone();
+                        let worker_rpc = rpc_url.clone();
+                        let worker_sender = completion_sender.clone();
+                        thread::spawn(move || {
+                            if let Err(error) = process_committee_auction(
+                                worker_common,
+                                worker_wallet,
+                                worker_rpc,
+                                snapshot.auction_id,
+                            ) {
+                                coordinator_error(&format!(
+                                    "auction {} processing failed: {error}",
+                                    snapshot.auction_id
+                                ));
+                            }
+                            let _ = worker_sender.send(snapshot.auction_id);
+                        });
+                    }
+                }
+            }
+            Err(error) => coordinator_error(error.as_ref()),
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn run_committee_bot(
+    common: CommonConfig,
+    wallet: PathBuf,
+    rpc_url: String,
+) -> Result<(), Box<dyn Error>> {
+    // Bot execution is deliberately keypair-only. Browser-wallet sessions use
+    // the interactive Node bridge elsewhere in the CLI and must never enter a
+    // long-running committee process.
+    read_v1_keypair_file(&wallet)?;
+    let payer = wallet_pubkey(&wallet)?;
+    ensure_committee_payer_can_initialize(&rpc_url, &payer)?;
+    let pipeline_common = common.clone();
+    let pipeline_wallet = wallet.clone();
+    let pipeline_rpc = rpc_url.clone();
+    thread::spawn(move || run_committee_pipeline(pipeline_common, pipeline_wallet, pipeline_rpc));
+    watch_and_initialize_auctions(common, wallet, rpc_url)
+}
+
+fn execute_auction_status(config: AuctionStatusConfig) -> Result<(), Box<dyn Error>> {
+    if config.rpc_url.contains("mainnet") {
+        return Err("mainnet is not supported by the Devnet client".into());
+    }
+    let addresses = addresses(&config.common);
+    let auction_addresses = auction_addresses(&addresses, config.auction_id);
+    let Some(auction_bytes) =
+        fetch_multiple_account_bytes(&config.rpc_url, &[auction_addresses.auction])?
+            .into_iter()
+            .next()
+            .flatten()
+    else {
+        println!("exists\tfalse");
+        println!("auction-id\t{}", config.auction_id);
+        return Ok(());
+    };
+    if auction_bytes
+        .starts_with(<beatex::AuctionResult as anchor_lang::Discriminator>::DISCRIMINATOR)
+    {
+        // Finished auctions are compacted; their queue accounts are closed.
+        let result = beatex::AuctionResult::try_deserialize(&mut auction_bytes.as_slice())?;
+        println!("exists\ttrue");
+        println!("auction-id\t{}", config.auction_id);
+        println!(
+            "state\t{}",
+            if result.state == beatex::AuctionState::Settled {
+                "settled"
+            } else {
+                "cancelled"
+            }
+        );
+        println!("reference-price\t{}", result.reference_price);
+        println!("clearing-price\t{}", result.clearing_price);
+        println!("clearing-volume\t{}", result.clearing_volume);
+        return Ok(());
+    }
+    let auction = beatex::Auction::try_deserialize(&mut auction_bytes.as_slice())?;
+    let current_slot = current_slot(&config.rpc_url)?;
+    let counter = fetch_anchor_account::<SubmissionCounter>(
+        &config.rpc_url,
+        &auction_addresses.submission_counter,
+    )?
+    .ok_or("submission counter is missing")?;
+    let accumulator = fetch_anchor_account::<AggregateAccumulator>(
+        &config.rpc_url,
+        &auction_addresses.accumulator,
+    )?
+    .ok_or("aggregate accumulator is missing")?;
+    let state = match auction.state {
+        beatex::AuctionState::Pending => "pending",
+        beatex::AuctionState::Settled => "settled",
+        beatex::AuctionState::Cancelled => "cancelled",
+    };
+    println!("exists\ttrue");
+    println!("auction-id\t{}", config.auction_id);
+    println!("state\t{state}");
+    println!("current-slot\t{current_slot}");
+    println!("open-slot\t{}", auction.open_slot);
+    println!("submission-end-slot\t{}", auction.submission_end_slot);
+    println!(
+        "aggregation-deadline-slot\t{}",
+        auction.aggregation_deadline_slot
+    );
+    println!(
+        "decryption-deadline-slot\t{}",
+        auction.decryption_deadline_slot
+    );
+    println!("accepted-orders\t{}", counter.accepted_order_count);
+    println!("folded-orders\t{}", accumulator.folded_order_count);
+    println!(
+        "queued-orders\t{}",
+        counter
+            .accepted_order_count
+            .saturating_sub(accumulator.folded_order_count)
+    );
+    Ok(())
+}
+
+fn execute_fold(config: FoldConfig) -> Result<(), Box<dyn Error>> {
+    execute_fold_with_snapshot(config, None, None)
+}
+
+fn execute_fold_with_snapshot(
+    config: FoldConfig,
+    initial_snapshot: Option<(beatex::Auction, AggregateAccumulator)>,
+    job_started: Option<Instant>,
+) -> Result<(), Box<dyn Error>> {
+    let started = job_started.unwrap_or_else(Instant::now);
+    if config.rpc_url.contains("mainnet") {
+        return Err("mainnet is not supported by the Devnet client".into());
+    }
+    if config.max_batches == 0 {
+        return Err("max-batches must be positive".into());
     }
     let aggregator = wallet_pubkey(&config.wallet)?;
     let addresses = addresses(&config.common);
     let auction_addresses = auction_addresses(&addresses, config.auction_id);
-    let auction =
-        fetch_anchor_account::<beatex::Auction>(&config.rpc_url, &auction_addresses.auction)?
-            .ok_or("auction has not been initialized")?;
+    let (auction, initial_accumulator) = if let Some(snapshot) = initial_snapshot {
+        snapshot
+    } else {
+        let (auction, _, accumulator) =
+            fetch_committee_auction_accounts(&config.rpc_url, &auction_addresses)?
+                .ok_or("auction has not been initialized")?;
+        (auction, accumulator)
+    };
     if auction.market != addresses.market {
         return Err("auction belongs to a different market".into());
     }
@@ -2025,37 +4125,54 @@ fn execute_fold(config: FoldConfig) -> Result<(), Box<dyn Error>> {
         QueueCircuitKind::AggregateFold,
         queue::AGGREGATE_FOLD_CIRCUIT_VERSION,
     );
-    let prover = FoldProver::deterministic_devnet()?;
     let mut rng = ChaCha20Rng::from_entropy();
     let mut total_folded = 0usize;
+    let mut completed_batches = 0usize;
+    let mut cached_accumulator = Some(initial_accumulator);
 
     loop {
-        let accepted = fetch_accepted_orders(&config.rpc_url, &auction_addresses.auction)?;
-        if accepted.is_empty() {
-            println!(
-                "auction {} queue is drained; folded {} event(s)",
-                config.auction_id, total_folded
-            );
-            return Ok(());
+        if completed_batches >= config.max_batches {
+            break;
         }
-        let batch = accepted
-            .into_iter()
-            .take(queue_hash::FOLD_BATCH_SIZE)
-            .collect::<Vec<_>>();
-        let accumulator = fetch_anchor_account::<AggregateAccumulator>(
+        let accumulator = if let Some(accumulator) = cached_accumulator.take() {
+            accumulator
+        } else {
+            fetch_committee_auction_accounts(&config.rpc_url, &auction_addresses)?
+                .ok_or("aggregate accumulator is missing")?
+                .2
+        };
+        let batch = fetch_pending_orders(
             &config.rpc_url,
-            &auction_addresses.accumulator,
-        )?
-        .ok_or("aggregate accumulator is missing")?;
+            &auction_addresses.submission_counter,
+            accumulator.folded_order_count,
+            queue_hash::FOLD_BATCH_SIZE,
+        )?;
+        if batch.is_empty() {
+            break;
+        }
         let old_aggregate = ciphertext_array(&accumulator.ciphertexts)?;
+        let previous_addresses = batch
+            .iter()
+            .filter_map(|(_, event)| {
+                (event.previous_event != Pubkey::default()).then_some(event.previous_event)
+            })
+            .collect::<Vec<_>>();
+        let previous_accounts = if previous_addresses.is_empty() {
+            Vec::new()
+        } else {
+            fetch_multiple_account_bytes(&config.rpc_url, &previous_addresses)?
+        };
+        let mut previous_accounts = previous_accounts.into_iter();
         let mut events = Vec::with_capacity(batch.len());
         for (event_address, event) in &batch {
             let previous_ciphertexts = if event.previous_event == Pubkey::default() {
                 [identity_ciphertext(); queue::QUEUED_CIPHERTEXT_COUNT]
             } else {
-                let previous =
-                    fetch_anchor_account::<QueuedOrder>(&config.rpc_url, &event.previous_event)?
-                        .ok_or("replacement event references a missing previous event")?;
+                let bytes = previous_accounts
+                    .next()
+                    .flatten()
+                    .ok_or("replacement event references a missing previous event")?;
+                let previous = QueuedOrder::try_deserialize(&mut bytes.as_slice())?;
                 ciphertext_array(&previous.ciphertexts)?
             };
             events.push(FoldEventInput {
@@ -2064,7 +4181,7 @@ fn execute_fold(config: FoldConfig) -> Result<(), Box<dyn Error>> {
                 ciphertexts: ciphertext_array(&event.ciphertexts)?,
             });
         }
-        let output = prover.prove(
+        let output = devnet_fast_fold_prover()?.prove(
             FoldProofRequest {
                 auction: auction_addresses.auction.to_bytes(),
                 old_folded_count: accumulator.folded_order_count,
@@ -2077,7 +4194,7 @@ fn execute_fold(config: FoldConfig) -> Result<(), Box<dyn Error>> {
             meta(aggregator, false, true),
             meta(addresses.market, false, false),
             meta(auction_addresses.auction, false, false),
-            meta(auction_addresses.submission_counter, false, false),
+            meta(auction_addresses.submission_counter, true, false),
             meta(auction_addresses.accumulator, true, false),
             meta(fold_key, false, false),
         ];
@@ -2086,40 +4203,99 @@ fn execute_fold(config: FoldConfig) -> Result<(), Box<dyn Error>> {
                 .iter()
                 .map(|(event_address, _)| meta(*event_address, true, false)),
         );
-        send(
-            &config.wallet,
-            &config.rpc_url,
-            &format!("fold {} encrypted queue event(s)", batch.len()),
-            accounts,
-            beatex::instruction::FoldQueuedOrders {
-                args: FoldQueuedOrdersArgs {
-                    new_aggregate: flatten_ciphertexts(output.new_aggregate),
-                    proof: proof_input(
-                        output.proof_a,
-                        output.proof_b,
-                        output.proof_c,
-                        output.public_input,
-                    ),
-                },
-            }
-            .data(),
-            vec![],
-        )?;
+        let label = format!("fold {} encrypted queue event(s)", batch.len());
+        let data = beatex::instruction::FoldQueuedOrders {
+            args: FoldQueuedOrdersArgs {
+                new_aggregate: flatten_ciphertexts(output.new_aggregate),
+                proof: proof_input(
+                    output.proof_a,
+                    output.proof_b,
+                    output.proof_c,
+                    output.public_input,
+                ),
+            },
+        }
+        .data();
+        if config.coordinator_logs {
+            send_committee(&config.wallet, &config.rpc_url, &label, accounts, data)?;
+        } else {
+            send(
+                &config.wallet,
+                &config.rpc_url,
+                &label,
+                accounts,
+                data,
+                vec![],
+            )?;
+        }
         total_folded += batch.len();
+        completed_batches += 1;
     }
+    if total_folded > 0 {
+        if config.coordinator_logs {
+            coordinator_auction_log(
+                config.auction_id,
+                &format!(
+                    "folding [{total_folded}] orders... folded, took {:.1}s",
+                    started.elapsed().as_secs_f64()
+                ),
+            );
+        } else {
+            println!(
+                "BEATEX_EVENT\tauction\t{}\tfolded\t{}\t{:.1}",
+                config.auction_id,
+                total_folded,
+                started.elapsed().as_secs_f64()
+            );
+        }
+    }
+    Ok(())
 }
 
 fn execute_publish(config: PublishConfig) -> Result<(), Box<dyn Error>> {
+    execute_publish_with_started(config, Instant::now())
+}
+
+fn execute_publish_with_started(
+    config: PublishConfig,
+    started: Instant,
+) -> Result<(), Box<dyn Error>> {
     if config.rpc_url.contains("mainnet") {
         return Err("mainnet is not supported by the Devnet client".into());
     }
     let addresses = addresses(&config.common);
     let auction_addresses = auction_addresses(&addresses, config.auction_id);
-    let market = fetch_anchor_account::<beatex::Market>(&config.rpc_url, &addresses.market)?
-        .ok_or("market has not been initialized")?;
-    let auction =
-        fetch_anchor_account::<beatex::Auction>(&config.rpc_url, &auction_addresses.auction)?
-            .ok_or("auction has not been initialized")?;
+    let mut account_bytes = fetch_multiple_account_bytes(
+        &config.rpc_url,
+        &[
+            addresses.market,
+            auction_addresses.auction,
+            auction_addresses.submission_counter,
+            auction_addresses.accumulator,
+            addresses.key_epoch,
+        ],
+    )?
+    .into_iter();
+    let market = deserialize_anchor_account::<beatex::Market>(
+        account_bytes.next().flatten(),
+        "market has not been initialized",
+    )?;
+    let auction = deserialize_anchor_account::<beatex::Auction>(
+        account_bytes.next().flatten(),
+        "auction has not been initialized",
+    )?;
+    let counter = deserialize_anchor_account::<SubmissionCounter>(
+        account_bytes.next().flatten(),
+        "submission counter is missing",
+    )?;
+    let accumulator = deserialize_anchor_account::<AggregateAccumulator>(
+        account_bytes.next().flatten(),
+        "aggregate accumulator is missing",
+    )?;
+    let key_epoch = deserialize_anchor_account::<beatex::KeyEpoch>(
+        account_bytes.next().flatten(),
+        "key epoch has not been initialized",
+    )?;
     let slot = current_slot(&config.rpc_url)?;
     if slot < auction.submission_end_slot {
         return Err(format!(
@@ -2131,16 +4307,6 @@ fn execute_publish(config: PublishConfig) -> Result<(), Box<dyn Error>> {
     if slot >= auction.decryption_deadline_slot {
         return Err("auction publication deadline has passed".into());
     }
-    let counter = fetch_anchor_account::<SubmissionCounter>(
-        &config.rpc_url,
-        &auction_addresses.submission_counter,
-    )?
-    .ok_or("submission counter is missing")?;
-    let accumulator = fetch_anchor_account::<AggregateAccumulator>(
-        &config.rpc_url,
-        &auction_addresses.accumulator,
-    )?
-    .ok_or("aggregate accumulator is missing")?;
     if counter.accepted_order_count != accumulator.folded_order_count {
         return Err(format!(
             "aggregation is incomplete: accepted {}, folded {}",
@@ -2151,12 +4317,9 @@ fn execute_publish(config: PublishConfig) -> Result<(), Box<dyn Error>> {
     if counter.accepted_order_count == 0 {
         return Err("cannot publish an empty auction aggregate".into());
     }
-    let key_epoch =
-        fetch_anchor_account::<beatex::KeyEpoch>(&config.rpc_url, &addresses.key_epoch)?
-            .ok_or("key epoch has not been initialized")?;
     let aggregate = ciphertext_array(&accumulator.ciphertexts)?;
     let participant_ids = [1, 4, 7];
-    let prover = AggregatePublicationProver::deterministic_devnet()?;
+    let prover = devnet_fast_publication_prover()?;
     if prover.committee().encryption_key != key_epoch.babyjub_encryption_pubkey
         || prover.committee().participant_public_shares
             != key_epoch.babyjub_participant_public_shares
@@ -2187,41 +4350,99 @@ fn execute_publish(config: PublishConfig) -> Result<(), Box<dyn Error>> {
         QueueCircuitKind::AggregatePublication,
         queue::AGGREGATE_PUBLICATION_CIRCUIT_VERSION,
     );
-    send(
-        &config.wallet,
-        &config.rpc_url,
-        "publish aggregate curves and clear auction",
-        vec![
-            meta(addresses.market, true, false),
-            meta(auction_addresses.auction, true, false),
-            meta(addresses.key_epoch, false, false),
-            meta(auction_addresses.submission_counter, false, false),
-            meta(auction_addresses.accumulator, false, false),
-            meta(publication_key, false, false),
-        ],
-        beatex::instruction::PublishAndClear {
-            args: PublishAggregateCurvesArgs {
-                participant_ids: output.participant_ids,
-                demand: output.demand,
-                supply: output.supply,
-                proof: proof_input(
-                    output.proof_a,
-                    output.proof_b,
-                    output.proof_c,
-                    output.public_input,
-                ),
-            },
-        }
-        .data(),
-        vec![],
-    )?;
-    let settled =
-        fetch_anchor_account::<beatex::Auction>(&config.rpc_url, &auction_addresses.auction)?
-            .ok_or("settled auction account disappeared")?;
-    println!(
-        "auction {} settled at price {} with volume {} (level {})",
-        config.auction_id, settled.clearing_price, settled.clearing_volume, settled.clearing_index
-    );
+    let grid_size = auction.active_grid_size();
+    let grid = beatex::auction::PriceGrid {
+        reference_price: auction.reference_price,
+        grid_step_bps: auction.grid_step_bps,
+        level_count: auction.grid_size as u16,
+    };
+    let tie_break_price = if market.last_clearing_price == 0 {
+        auction.reference_price
+    } else {
+        market.last_clearing_price
+    };
+    let clearing = beatex::auction::clear_auction_with_tiebreak(
+        &grid,
+        &output.demand[..grid_size],
+        &output.supply[..grid_size],
+        tie_break_price,
+    )
+    .map_err(|error| format!("cannot calculate aggregate clearing result: {error:?}"))?;
+    let accounts = vec![
+        meta(addresses.market, true, false),
+        meta(auction_addresses.auction, true, false),
+        meta(addresses.key_epoch, false, false),
+        meta(auction_addresses.submission_counter, true, false),
+        meta(auction_addresses.accumulator, true, false),
+        meta(publication_key, false, false),
+        meta(market.authority, true, false),
+    ]
+    .into_iter()
+    .chain(event_cpi_metas())
+    .collect::<Vec<_>>();
+    let data = beatex::instruction::PublishAndClear {
+        args: PublishAggregateCurvesArgs {
+            participant_ids: output.participant_ids,
+            demand: output.demand,
+            supply: output.supply,
+            proof: proof_input(
+                output.proof_a,
+                output.proof_b,
+                output.proof_c,
+                output.public_input,
+            ),
+        },
+    }
+    .data();
+    if config.coordinator_logs {
+        send_committee(
+            &config.wallet,
+            &config.rpc_url,
+            "publish aggregate curves and clear auction",
+            accounts,
+            data,
+        )?;
+    } else {
+        send(
+            &config.wallet,
+            &config.rpc_url,
+            "publish aggregate curves and clear auction",
+            accounts,
+            data,
+            vec![],
+        )?;
+    }
+    if config.coordinator_logs {
+        // The auction two ahead can be initialized early with this price only
+        // if it lands by close + (submission duration - preinitialization) slots.
+        let settled_after = current_slot_with_timeout(&config.rpc_url, "2")
+            .map(|slot| {
+                format!(
+                    "close+{} slots",
+                    slot.saturating_sub(auction.submission_end_slot)
+                )
+            })
+            .unwrap_or_else(|_| "close+? slots".to_owned());
+        coordinator_auction_log(
+            config.auction_id,
+            &format!(
+                "aggregate published at {settled_after}, took {:.1}s (price {}, volume {})",
+                started.elapsed().as_secs_f64(),
+                clearing.price,
+                clearing.executable_volume
+            ),
+        );
+    } else {
+        println!(
+            "auction {} settled at price {} with volume {} (level {})",
+            config.auction_id, clearing.price, clearing.executable_volume, clearing.index
+        );
+        println!(
+            "BEATEX_EVENT\tauction\t{}\tpublished\t{:.1}",
+            config.auction_id,
+            started.elapsed().as_secs_f64()
+        );
+    }
     Ok(())
 }
 
@@ -2231,6 +4452,8 @@ fn execute_cancel(config: FoldConfig) -> Result<(), Box<dyn Error>> {
     }
     let addresses = addresses(&config.common);
     let auction = auction_addresses(&addresses, config.auction_id);
+    let market = fetch_anchor_account::<beatex::Market>(&config.rpc_url, &addresses.market)?
+        .ok_or("market has not been initialized")?;
     send(
         &config.wallet,
         &config.rpc_url,
@@ -2238,18 +4461,28 @@ fn execute_cancel(config: FoldConfig) -> Result<(), Box<dyn Error>> {
         vec![
             meta(addresses.market, false, false),
             meta(auction.auction, true, false),
-            meta(auction.submission_counter, false, false),
-            meta(auction.accumulator, false, false),
-        ],
+            meta(auction.submission_counter, true, false),
+            meta(auction.accumulator, true, false),
+            meta(market.authority, true, false),
+        ]
+        .into_iter()
+        .chain(event_cpi_metas())
+        .collect(),
         beatex::instruction::CancelPendingAuction {}.data(),
         vec![],
     )?;
-    let cancelled = fetch_anchor_account::<beatex::Auction>(&config.rpc_url, &auction.auction)?
-        .ok_or("cancelled auction account disappeared")?;
+    let cancelled =
+        fetch_anchor_account::<beatex::AuctionResult>(&config.rpc_url, &auction.auction)?
+            .ok_or("cancelled auction account disappeared")?;
     if cancelled.state != beatex::AuctionState::Cancelled {
         return Err("auction did not enter the cancelled state".into());
     }
-    println!("auction {} cancelled", config.auction_id);
+    if config.coordinator_logs {
+        coordinator_auction_log(config.auction_id, "cancelled after deadline");
+    } else {
+        println!("auction {} cancelled", config.auction_id);
+        println!("BEATEX_EVENT\tauction\t{}\tcancelled", config.auction_id);
+    }
     Ok(())
 }
 
@@ -2434,8 +4667,8 @@ fn execute_claim(config: ClaimConfig) -> Result<(), Box<dyn Error>> {
     let market = fetch_anchor_account::<beatex::Market>(&config.rpc_url, &addresses.market)?
         .ok_or("market has not been initialized")?;
     let auction =
-        fetch_anchor_account::<beatex::Auction>(&config.rpc_url, &auction_addresses.auction)?
-            .ok_or("auction has not been initialized")?;
+        fetch_anchor_account::<beatex::AuctionResult>(&config.rpc_url, &auction_addresses.auction)?
+            .ok_or("auction has not settled or been cancelled")?;
     let (expected_auction_state, withdrawal_kind, circuit_kind, operation) = match config.kind {
         PrivateWithdrawalKind::Claim => (
             beatex::AuctionState::Settled,
@@ -2458,12 +4691,10 @@ fn execute_claim(config: ClaimConfig) -> Result<(), Box<dyn Error>> {
     let mut trader_state = read_trader_state(&config.common.state_dir, &owner)?
         .ok_or("the trader private-state file is missing")?;
     let stored = trader_state
-        .active_order
-        .clone()
-        .ok_or("the trader has no locally opened active order")?;
-    if stored.auction_id != config.auction_id
-        || stored.auction != auction_addresses.auction.to_string()
-    {
+        .order(config.auction_id)
+        .cloned()
+        .ok_or("the trader has no locally opened order for this auction")?;
+    if stored.auction != auction_addresses.auction.to_string() {
         return Err("the local active order belongs to a different auction".into());
     }
     let order_address = Pubkey::from_str(&stored.event)?;
@@ -2512,8 +4743,8 @@ fn execute_claim(config: ClaimConfig) -> Result<(), Box<dyn Error>> {
         return Err("the local order opening does not match the on-chain commitment".into());
     }
     let clearing_index = usize::from(auction.clearing_index);
-    let demand = auction.decrypted_demand[clearing_index];
-    let supply = auction.decrypted_supply[clearing_index];
+    let demand = auction.demand_at_clearing;
+    let supply = auction.supply_at_clearing;
     let (base_payout, quote_payout) = match config.kind {
         PrivateWithdrawalKind::Claim => {
             let allocation = allocation::allocate(allocation::AllocationInput {
@@ -2784,7 +5015,7 @@ fn execute_claim(config: ClaimConfig) -> Result<(), Box<dyn Error>> {
     if let Err(error) = cleanup_result {
         eprintln!("warning: claim succeeded but proof-context rent cleanup failed: {error}");
     }
-    trader_state.active_order = None;
+    trader_state.remove_order(config.auction_id);
     write_trader_state(&config.common.state_dir, &owner, &trader_state)?;
     println!(
         "auction {} private {} completed: {} base units and {} quote units",
@@ -2800,8 +5031,8 @@ fn execute_balance_settlement(config: BalanceSettlementConfig) -> Result<(), Box
     let addresses = addresses(&config.common);
     let auction_addresses = auction_addresses(&addresses, config.auction_id);
     let auction =
-        fetch_anchor_account::<beatex::Auction>(&config.rpc_url, &auction_addresses.auction)?
-            .ok_or("auction has not been initialized")?;
+        fetch_anchor_account::<beatex::AuctionResult>(&config.rpc_url, &auction_addresses.auction)?
+            .ok_or("auction has not settled or been cancelled")?;
     let expected_state = match config.kind {
         PrivateWithdrawalKind::Claim => beatex::AuctionState::Settled,
         PrivateWithdrawalKind::Refund => beatex::AuctionState::Cancelled,
@@ -2813,12 +5044,10 @@ fn execute_balance_settlement(config: BalanceSettlementConfig) -> Result<(), Box
     let mut state = read_trader_state(&config.common.state_dir, &owner)?
         .ok_or("the trader private-state file is missing")?;
     let stored = state
-        .active_order
-        .clone()
-        .ok_or("the trader has no locally opened active order")?;
-    if stored.auction_id != config.auction_id
-        || stored.auction != auction_addresses.auction.to_string()
-    {
+        .order(config.auction_id)
+        .cloned()
+        .ok_or("the trader has no locally opened order for this auction")?;
+    if stored.auction != auction_addresses.auction.to_string() {
         return Err("the local active order belongs to a different auction".into());
     }
     let order_address = Pubkey::from_str(&stored.event)?;
@@ -2848,45 +5077,50 @@ fn execute_balance_settlement(config: BalanceSettlementConfig) -> Result<(), Box
     if !active.active || active.latest_event != order_address {
         return Err("the queued order is not the active revision".into());
     }
+    let fill = if config.kind == PrivateWithdrawalKind::Claim {
+        fill_event(&auction, &stored)?
+    } else {
+        None
+    };
     let private_balance = private_balance_address(&addresses.market, &owner);
     let key_epoch = fetch_anchor_account::<beatex::KeyEpoch>(&config.rpc_url, &auction.key_epoch)?
         .ok_or("key epoch account is missing")?;
 
     match config.kind {
         PrivateWithdrawalKind::Claim => {
-            let clearing_index = usize::from(auction.clearing_index);
-            let prover = RolloverProver::deterministic_devnet()?;
             let mut rng = ChaCha20Rng::from_entropy();
-            let output = prover.prove(
-                RolloverProofRequest {
-                    market: addresses.market.to_bytes(),
-                    auction: auction_addresses.auction.to_bytes(),
-                    order: order_address.to_bytes(),
-                    active_order: active_order.to_bytes(),
-                    owner: owner.to_bytes(),
-                    key_epoch: auction.key_epoch.to_bytes(),
-                    client_order_nonce: order.client_order_nonce,
-                    sequence: order.sequence,
-                    allocation_rule_version: auction.allocation_rule_version,
-                    order_circuit_version: auction.order_circuit_version,
-                    claim_circuit_version: auction.claim_circuit_version,
-                    buy: stored.buy,
-                    sell: stored.sell,
-                    base_reserve: stored.base_reserve,
-                    quote_reserve: stored.quote_reserve,
-                    order_salt: stored.order_salt,
-                    expected_order_commitment: order.order_commitment,
-                    clearing_index: auction.clearing_index,
-                    clearing_price: auction.clearing_price,
-                    demand: auction.decrypted_demand[clearing_index],
-                    supply: auction.decrypted_supply[clearing_index],
-                    clearing_volume: auction.clearing_volume,
-                    balance_revision: state.revision,
-                    committee_key: key_epoch.babyjub_encryption_pubkey,
-                    old_balance: state.balance.opening(),
-                },
-                &mut rng,
-            )?;
+            let output = with_rollover_prover(|prover| {
+                prover.prove(
+                    RolloverProofRequest {
+                        market: addresses.market.to_bytes(),
+                        auction: auction_addresses.auction.to_bytes(),
+                        order: order_address.to_bytes(),
+                        active_order: active_order.to_bytes(),
+                        owner: owner.to_bytes(),
+                        key_epoch: auction.key_epoch.to_bytes(),
+                        client_order_nonce: order.client_order_nonce,
+                        sequence: order.sequence,
+                        allocation_rule_version: auction.allocation_rule_version,
+                        order_circuit_version: auction.order_circuit_version,
+                        claim_circuit_version: auction.claim_circuit_version,
+                        buy: stored.buy,
+                        sell: stored.sell,
+                        base_reserve: stored.base_reserve,
+                        quote_reserve: stored.quote_reserve,
+                        order_salt: stored.order_salt,
+                        expected_order_commitment: order.order_commitment,
+                        clearing_index: auction.clearing_index,
+                        clearing_price: auction.clearing_price,
+                        demand: auction.demand_at_clearing,
+                        supply: auction.supply_at_clearing,
+                        clearing_volume: auction.clearing_volume,
+                        balance_revision: state.revision,
+                        committee_key: key_epoch.babyjub_encryption_pubkey,
+                        old_balance: state.balance.opening(),
+                    },
+                    &mut rng,
+                )
+            })?;
             let rollover_key = verification_key_address(
                 &addresses.market,
                 QueueCircuitKind::RolloverSettlement,
@@ -2962,33 +5196,38 @@ fn execute_balance_settlement(config: BalanceSettlementConfig) -> Result<(), Box
                 vec![],
             )?;
             state.balance = output.credited_balance.into();
-            println!(
-                "auction {} settled internally: {} base units and {} quote units",
-                config.auction_id, output.base_payout, output.quote_payout
-            );
+            if let Some(fill) = fill {
+                emit_order_event(NativeOrderEvent::Fill {
+                    auction_id: config.auction_id,
+                    side: fill.side.to_owned(),
+                    base_amount: fill.base_amount,
+                    quote_amount: fill.quote_amount,
+                });
+            }
         }
         PrivateWithdrawalKind::Refund => {
-            let prover = CollateralReleaseProver::deterministic_devnet()?;
             let mut rng = ChaCha20Rng::from_entropy();
-            let output = prover.prove(
-                CollateralReleaseProofRequest {
-                    market: addresses.market.to_bytes(),
-                    auction: auction_addresses.auction.to_bytes(),
-                    active_order: active_order.to_bytes(),
-                    owner: owner.to_bytes(),
-                    balance_revision: state.revision,
-                    client_order_nonce: stored.client_order_nonce,
-                    buy: stored.buy,
-                    sell: stored.sell,
-                    base_reserve: stored.base_reserve,
-                    quote_reserve: stored.quote_reserve,
-                    order_salt: stored.order_salt,
-                    expected_order_commitment: stored.order_commitment,
-                    committee_key: key_epoch.babyjub_encryption_pubkey,
-                    old_balance: state.balance.opening(),
-                },
-                &mut rng,
-            )?;
+            let output = with_collateral_release_prover(|prover| {
+                prover.prove(
+                    CollateralReleaseProofRequest {
+                        market: addresses.market.to_bytes(),
+                        auction: auction_addresses.auction.to_bytes(),
+                        active_order: active_order.to_bytes(),
+                        owner: owner.to_bytes(),
+                        balance_revision: state.revision,
+                        client_order_nonce: stored.client_order_nonce,
+                        buy: stored.buy,
+                        sell: stored.sell,
+                        base_reserve: stored.base_reserve,
+                        quote_reserve: stored.quote_reserve,
+                        order_salt: stored.order_salt,
+                        expected_order_commitment: stored.order_commitment,
+                        committee_key: key_epoch.babyjub_encryption_pubkey,
+                        old_balance: state.balance.opening(),
+                    },
+                    &mut rng,
+                )
+            })?;
             let release_key = verification_key_address(
                 &addresses.market,
                 QueueCircuitKind::OrderModification,
@@ -3023,15 +5262,21 @@ fn execute_balance_settlement(config: BalanceSettlementConfig) -> Result<(), Box
                 .data(),
                 vec![],
             )?;
+            let released_base = output.released_balance.base_value;
+            let released_quote = output.released_balance.quote_value;
             state.balance = output.released_balance.into();
-            println!("auction {} refunded internally", config.auction_id);
+            emit_order_event(NativeOrderEvent::Refund {
+                auction_id: config.auction_id,
+                base_amount: released_base,
+                quote_amount: released_quote,
+            });
         }
     }
     state.revision = state
         .revision
         .checked_add(1)
         .ok_or("private balance revision overflow")?;
-    state.active_order = None;
+    state.remove_order(config.auction_id);
     write_trader_state(&config.common.state_dir, &owner, &state)
 }
 
@@ -3050,30 +5295,47 @@ fn execute_public_balance_withdrawal(
     let owner = wallet_pubkey(&config.wallet)?;
     let mut state = read_trader_state(&config.common.state_dir, &owner)?
         .ok_or("the trader private-state file is missing")?;
-    if state.active_order.is_some() {
-        return Err("settle or cancel the active order before withdrawing".into());
+    if state.has_active_orders() {
+        return Err("settle or cancel all active orders before withdrawing".into());
     }
-    let prover = DepositProver::deterministic_devnet()?;
+    let private_balance = private_balance_address(&addresses.market, &owner);
+    let onchain_balance =
+        fetch_anchor_account::<beatex::EncryptedPrivateBalance>(&config.rpc_url, &private_balance)?
+            .ok_or("on-chain private balance is missing")?;
+    if onchain_balance.market != addresses.market
+        || onchain_balance.owner != owner
+        || onchain_balance.key_epoch != addresses.key_epoch
+    {
+        return Err("on-chain private balance does not match this trader and market".into());
+    }
+    if onchain_balance.revision != state.revision {
+        return Err(format!(
+            "local private-balance revision {} does not match on-chain revision {}",
+            state.revision, onchain_balance.revision
+        )
+        .into());
+    }
     let mut rng = ChaCha20Rng::from_entropy();
-    let output = prover.prove_public_withdrawal(
-        PublicWithdrawalProofRequest {
-            market: addresses.market.to_bytes(),
-            owner: owner.to_bytes(),
-            key_epoch: addresses.key_epoch.to_bytes(),
-            committee_key: key_epoch.babyjub_encryption_pubkey,
-            current_revision: state.revision,
-            base_amount: config.base_amount,
-            quote_amount: config.quote_amount,
-            current_balance: state.balance.opening(),
-        },
-        &mut rng,
-    )?;
+    let output = with_deposit_prover(|prover| {
+        prover.prove_public_withdrawal(
+            PublicWithdrawalProofRequest {
+                market: addresses.market.to_bytes(),
+                owner: owner.to_bytes(),
+                key_epoch: addresses.key_epoch.to_bytes(),
+                committee_key: key_epoch.babyjub_encryption_pubkey,
+                current_revision: state.revision,
+                base_amount: config.base_amount,
+                quote_amount: config.quote_amount,
+                current_balance: state.balance.opening(),
+            },
+            &mut rng,
+        )
+    })?;
     let deposit_key = verification_key_address(
         &addresses.market,
         QueueCircuitKind::BalanceDeposit,
         queue::BALANCE_DEPOSIT_CIRCUIT_VERSION,
     );
-    let private_balance = private_balance_address(&addresses.market, &owner);
     send(
         &config.wallet,
         &config.rpc_url,
@@ -3144,7 +5406,11 @@ fn write_manifest(config: &InitializeConfig, addresses: &Addresses) -> Result<()
         QueueCircuitKind::RolloverSettlement,
     ];
     for kind in kinds {
-        let version = queue::circuit_version(kind);
+        let version = if kind == QueueCircuitKind::OrderSubmission {
+            queue::DEVNET_FAST_ORDER_CIRCUIT_VERSION
+        } else {
+            queue::circuit_version(kind)
+        };
         contents.push_str(&format!(
             "vk-{:?}-v{}\t{}\n",
             kind,
@@ -3192,11 +5458,40 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
     match args[0].as_str() {
         "addresses" => print_addresses(&common(&args[1..])?),
-        "auction" => initialize_current_auction(
+        "committee" => run_committee_bot(
             common(&args[1..])?,
             PathBuf::from(value(&args[1..], "--wallet")?),
             optional(&args[1..], "--rpc-url").unwrap_or_else(|| DEFAULT_RPC_URL.to_owned()),
         ),
+        "watch-auctions" => watch_and_initialize_auctions(
+            common(&args[1..])?,
+            PathBuf::from(value(&args[1..], "--wallet")?),
+            optional(&args[1..], "--rpc-url").unwrap_or_else(|| DEFAULT_RPC_URL.to_owned()),
+        ),
+        "auction" => initialize_current_auction(
+            common(&args[1..])?,
+            PathBuf::from(value(&args[1..], "--wallet")?),
+            optional(&args[1..], "--rpc-url").unwrap_or_else(|| DEFAULT_RPC_URL.to_owned()),
+            optional(&args[1..], "--auction-id")
+                .map(|value| value.parse())
+                .transpose()?,
+        ),
+        "market-status" => execute_market_status(MarketStatusConfig {
+            common: common(&args[1..])?,
+            rpc_url: optional(&args[1..], "--rpc-url")
+                .unwrap_or_else(|| DEFAULT_RPC_URL.to_owned()),
+        }),
+        "pipeline-status" => execute_pipeline_status(MarketStatusConfig {
+            common: common(&args[1..])?,
+            rpc_url: optional(&args[1..], "--rpc-url")
+                .unwrap_or_else(|| DEFAULT_RPC_URL.to_owned()),
+        }),
+        "auction-status" => execute_auction_status(AuctionStatusConfig {
+            common: common(&args[1..])?,
+            rpc_url: optional(&args[1..], "--rpc-url")
+                .unwrap_or_else(|| DEFAULT_RPC_URL.to_owned()),
+            auction_id: value(&args[1..], "--auction-id")?.parse()?,
+        }),
         "order" => execute_order(OrderConfig {
             common: common(&args[1..])?,
             wallet: PathBuf::from(value(&args[1..], "--wallet")?),
@@ -3205,10 +5500,10 @@ fn run() -> Result<(), Box<dyn Error>> {
             rpc_url: optional(&args[1..], "--rpc-url")
                 .unwrap_or_else(|| DEFAULT_RPC_URL.to_owned()),
             deposit_base: optional(&args[1..], "--deposit-base")
-                .unwrap_or_else(|| "100".to_owned())
+                .unwrap_or_else(|| "100000".to_owned())
                 .parse()?,
             deposit_quote: optional(&args[1..], "--deposit-quote")
-                .unwrap_or_else(|| "10000000".to_owned())
+                .unwrap_or_else(|| "1000000000".to_owned())
                 .parse()?,
         }),
         "fold" => execute_fold(FoldConfig {
@@ -3217,6 +5512,10 @@ fn run() -> Result<(), Box<dyn Error>> {
             rpc_url: optional(&args[1..], "--rpc-url")
                 .unwrap_or_else(|| DEFAULT_RPC_URL.to_owned()),
             auction_id: value(&args[1..], "--auction-id")?.parse()?,
+            max_batches: optional(&args[1..], "--max-batches")
+                .unwrap_or_else(|| usize::MAX.to_string())
+                .parse()?,
+            coordinator_logs: false,
         }),
         "publish" => execute_publish(PublishConfig {
             common: common(&args[1..])?,
@@ -3224,6 +5523,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             rpc_url: optional(&args[1..], "--rpc-url")
                 .unwrap_or_else(|| DEFAULT_RPC_URL.to_owned()),
             auction_id: value(&args[1..], "--auction-id")?.parse()?,
+            coordinator_logs: false,
         }),
         "cancel" => execute_cancel(FoldConfig {
             common: common(&args[1..])?,
@@ -3231,6 +5531,8 @@ fn run() -> Result<(), Box<dyn Error>> {
             rpc_url: optional(&args[1..], "--rpc-url")
                 .unwrap_or_else(|| DEFAULT_RPC_URL.to_owned()),
             auction_id: value(&args[1..], "--auction-id")?.parse()?,
+            max_batches: usize::MAX,
+            coordinator_logs: false,
         }),
         "settle-balance" => execute_balance_settlement(BalanceSettlementConfig {
             common: common(&args[1..])?,
@@ -3317,6 +5619,21 @@ fn main() {
 mod tests {
     use super::*;
 
+    fn stored_order(auction_id: u64) -> StoredOrder {
+        StoredOrder {
+            auction_id,
+            auction: format!("auction-{auction_id}"),
+            event: format!("event-{auction_id}"),
+            client_order_nonce: auction_id,
+            buy: [0; beatex_babyjubjub_groth16_spike::LEVELS],
+            sell: [0; beatex_babyjubjub_groth16_spike::LEVELS],
+            order_salt: [0; 32],
+            order_commitment: [0; 32],
+            base_reserve: 0,
+            quote_reserve: 0,
+        }
+    }
+
     #[test]
     fn address_derivation_is_stable() {
         let config = CommonConfig {
@@ -3331,5 +5648,100 @@ mod tests {
     fn feed_id_decodes_exactly() {
         assert_eq!(decode_hex_32(PYTH_BTC_USD_FEED).unwrap()[0], 0xe6);
         assert!(decode_hex_32("ff").is_err());
+    }
+
+    #[test]
+    fn only_system_allocate_races_are_benign() {
+        assert!(is_already_initialized_race(
+            "returned deterministic JSON-RPC error: Allocate: account Address { address: auction } already in use"
+        ));
+        assert!(!is_already_initialized_race(
+            "AnchorError: the queued-order state transition violates an invariant"
+        ));
+        assert!(!is_already_initialized_race(
+            "account already in use by an unrelated instruction"
+        ));
+    }
+
+    #[test]
+    fn auction_target_preinitializes_at_phase_end_and_rejects_stale_workers() {
+        let start = 1_000;
+        let duration = 100;
+        assert!(auction_target_is_fresh(start, duration, start, 0));
+        assert!(!auction_target_is_fresh(start, duration, start, 1));
+        assert!(!auction_target_is_fresh(start, duration, start + 87, 1));
+        assert!(auction_target_is_fresh(start, duration, start + 88, 1));
+        assert!(auction_target_is_fresh(start, duration, start + 99, 1));
+        assert!(!auction_target_is_fresh(start, duration, start + 100, 0));
+        assert!(auction_target_is_fresh(start, duration, start + 100, 1));
+    }
+
+    #[test]
+    fn trader_state_migrates_and_tracks_multiple_auctions() {
+        let mut state = TraderPrivateState {
+            revision: 2,
+            balance: StoredBalance {
+                base_value: 100,
+                quote_value: 200,
+                base_randomness: [0; 32],
+                quote_randomness: [0; 32],
+            },
+            active_orders: vec![stored_order(4)],
+            active_order: Some(stored_order(3)),
+        }
+        .normalize();
+        assert_eq!(
+            state
+                .active_orders
+                .iter()
+                .map(|order| order.auction_id)
+                .collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+        state.upsert_order(stored_order(5));
+        state.remove_order(4);
+        assert!(state.order(3).is_some());
+        assert!(state.order(4).is_none());
+        assert!(state.order(5).is_some());
+    }
+
+    fn pipeline_auction(accepted_orders: u64, folded_orders: u64) -> PipelineAuction {
+        PipelineAuction {
+            auction_id: 1,
+            state: beatex::AuctionState::Pending,
+            submission_end_slot: 20,
+            aggregation_deadline_slot: 30,
+            decryption_deadline_slot: 40,
+            accepted_orders,
+            folded_orders,
+        }
+    }
+
+    #[test]
+    fn committee_reclaims_empty_auctions_after_collection() {
+        let auction = pipeline_auction(0, 0);
+        assert!(!committee_action_needed(&auction, 19));
+        assert!(committee_action_needed(&auction, 20));
+        assert!(committee_action_needed(&auction, u64::MAX));
+    }
+
+    #[test]
+    fn committee_handles_nonempty_auction_deadlines() {
+        let complete = pipeline_auction(1, 1);
+        assert!(committee_action_needed(&complete, 20));
+        assert!(committee_action_needed(&complete, 40));
+
+        let stalled = pipeline_auction(1, 0);
+        assert!(committee_action_needed(&stalled, 30));
+    }
+
+    #[test]
+    fn committee_starts_the_final_fold_before_the_close() {
+        let queued = pipeline_auction(1, 0);
+        assert!(!committee_action_needed(
+            &queued,
+            20 - FINAL_FOLD_LEAD_SLOTS - 1
+        ));
+        assert!(committee_action_needed(&queued, 20 - FINAL_FOLD_LEAD_SLOTS));
     }
 }

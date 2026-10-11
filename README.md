@@ -45,7 +45,7 @@ authority from leaving simultaneous opposite orders in the auction, although a
 permissionless market cannot prevent the same person from using unrelated
 wallets.
 
-### Can a market maker claim auction N and place auction N+1's order atomically?
+### Can a recurring trader claim auction N and place auction N+1's order atomically?
 
 Yes. One version-1 user transaction carries six BeatEx instructions:
 `prepare_rollover`, settlement-proof verification, settlement-statement
@@ -69,10 +69,17 @@ claim and deposit path.
 
 ### How is an auction's reference price selected?
 
-The version-2 policy uses the previous clearing price when the previous
-clearing volume meets a configured minimum; otherwise it uses a fresh Pyth
-BTC/USD price. The first auction has previous volume zero and therefore uses
-Pyth. For the 8-decimal tBTC / 6-decimal tUSD market, one base quantity unit is
+The version-2 policy centers auction N+1 on auction N-1's clearing price: while
+auction N collects orders, the committee decrypts and settles N-1. If N-1 (or a
+later auction) has cleared with volume at least the configured minimum, its
+price is used; otherwise a fresh Pyth BTC/USD price is used. The first auctions
+have no cleared predecessor and therefore use Pyth.
+
+Initialization timing enforces this. Once N-1 has cleared, N+1 may be
+initialized up to 12 slots before it opens so traders can prepare orders
+against its grid. Until then, initialization is accepted only in the last 2
+slots before opening (or during the auction's own window), so a permissionless
+caller cannot lock in the oracle price while N-1 is still settling. For the 8-decimal tBTC / 6-decimal tUSD market, one base quantity unit is
 100 satoshis and one quote accounting unit is one micro-tUSD. The oracle
 exponent adjustment is therefore `0`, and an integer protocol price of `85_500`
 means approximately 85,500 tUSD per tBTC. A stale update, wrong feed, excessive
@@ -100,8 +107,8 @@ unit, with exact halves upward. Initialization rejects overflow and any rounded
 grid with duplicate or non-increasing levels. The Auction account snapshots the
 reference price, basis-point step, and level count; every client derives the
 same exact 17 prices from those immutable fields. That account—not a local
-oracle fetch or command-line argument—is authoritative for the SDK, market
-makers, proofs, and clearing.
+oracle fetch or command-line argument—is authoritative for the SDK, clients,
+proofs, and clearing.
 
 Order `buy[i]` and `sell[i]` values are counts of 100-satoshi base units. The
 minimum order increment is therefore 100 satoshis; the version-2 proof permits
@@ -283,8 +290,12 @@ transaction versions. The session bearer token stays in the URL fragment and
 is never persisted. The local page has no remote scripts.
 
 Open the terminal interface with `target/debug/beatex tui`. The current screen
-shows wallet status and the intended trading actions; interactive forms are
-still being connected. Every existing native Devnet operation is already
+shows wallet status, the live Pyth BTC/USD price, a rolling Ratatui line chart,
+and the intended trading actions; interactive forms are still being connected.
+The price is read from the configured Pyth account on Solana Devnet every two seconds. Override the
+defaults with `BEATEX_RPC_URL`, `BEATEX_RPC_FALLBACK_URLS`,
+`BEATEX_PYTH_PRICE_ACCOUNT`, and `BEATEX_PYTH_FEED_ID` when needed. Every
+existing native Devnet operation is already
 available through the browser-wallet wrapper. Put the ordinary
 `beatex-devnet-client` arguments after `--` and omit `--wallet`; for example:
 
@@ -307,8 +318,8 @@ bytes. Returned transactions are rejected if the wallet changed the compiled
 message. The ephemeral session descriptor is deleted when the command exits.
 
 Create or reuse the test assets, deploy the program, initialize the custody
-vaults, 3-of-7 key epoch and all eight versioned verification-key PDAs, and fund
-the two persistent market-maker identities with one command:
+vaults, 3-of-7 key epoch and all eight versioned verification-key PDAs with one
+command:
 
 ```sh
 scripts/devnet/devnetSetup.sh --wallet /absolute/path/to/devnet-wallet.json
@@ -328,29 +339,24 @@ identical JSON is skipped, while a changed IDL requires confirmation. Use
 `--skip-idl` to omit this step or `--allow-idl-update` for an already-approved,
 non-interactive metadata update.
 
-The market-maker process supports either the configured onchain Pyth Devnet
-BTC/USD account or Binance BTC/USDT and generates non-crossed 17-level V-shaped
-curves. The runner starts one process for each source:
+A separate permissionless coordinator handles auction initialization, queue
+folding, and aggregate publication:
 
 ```sh
-scripts/devnet/run-market-makers.sh
+scripts/devnet/run-committee-bot.sh \
+  --wallet .devnet/devnet/devnet-wallet.json
 ```
 
-Each process reads the live slot-derived Auction account and derives its
-17-price grid from the stored reference and basis-point parameters. There are
-no manual reference-price or absolute-tick arguments.
-The default executor initializes and funds
-the maker's encrypted balance, generates deposit/order/replacement proofs,
-persists the private opening, and sends a version-1 transaction. Use
-`--print-only` to inspect intents without sending them, or `--executor` to
-replace the built-in adapter.
+The coordinator can be run by any funded fee payer. PDA and counter checks make
+repeated initialization, folding, and publication attempts safe; expected
+errors while an auction is still collecting are retried.
 
 The reusable `OrderProver` API accepts arbitrary 17-level curves, a canonical
 committee key, and the trader's private encrypted-balance opening. It returns
 all 34 ciphertexts, the updated encrypted balance and opening, order commitment,
 reserve amounts, and a self-verified Solana-format Groth16 proof.
 `ReplacementProver` atomically chains collateral release into that order proof,
-while `MarketMakerRolloverProver` chains the exact settled payout into the next
+while the rollover prover chains the exact settled payout into the next
 auction's order. Cancellation uses the standalone `CollateralReleaseProver`.
 These APIs reject non-canonical points/scalars and private state that does not
 reopen the onchain order commitment.
@@ -365,7 +371,7 @@ instructions and additional signers. The stateful adapter in
 ledger, and `withdraw` proves a ledger debit and transfers public Token-2022
 funds. The optional `claim` and `refund` commands retain the slower confidential
 Token-2022 bridge. The adapter also assembles the six-instruction atomic
-rollover transaction used by recurring market makers.
+rollover transaction used by recurring traders.
 
 ### Build and deployment pipeline
 
@@ -397,7 +403,7 @@ address.
 non-skipped build. `scripts/devnet/devnetSetup.sh` invokes the generator again
 after token, market, committee, and verification-key initialization, so the
 new market and vault addresses are captured in the same manifest. Consumers
-such as the CLI and market-maker runner read the state manifests; no frontend,
+such as the CLI and devnet runners read the state manifests; no frontend,
 prover, CLI, TUI, or bot source file needs to be edited after a redeployment.
 The scripts still require explicit approval before upgrading an existing
 program; this pipeline does not send a deployment transaction by itself.
@@ -414,7 +420,7 @@ proof-context transaction paid 10,000 lamports because it has two signatures;
 the withdrawal and cleanup transactions paid 5,000 lamports each. Priority fees
 are zero, and all context-account rent is returned during cleanup.
 
-The live recurring-liquidity path rolled the Pyth maker from auction 528 into
+The live recurring-liquidity path rolled a trader from auction 528 into
 auction 819 in one 4,093-byte transaction. It privately credited a payout of
 9 base units and 7,155 quote units, then placed the next order. The successful
 transaction is
@@ -423,7 +429,7 @@ The path was then repeated from a freshly submitted, folded, and settled
 auction 822 into auction 823. That second 4,093-byte rollover consumed 694,958
 CU, paid the 5,000-lamport base fee with zero priority fee, and finalized as
 `4UGNJtAXKwEHFFUKTPtw29LeZrjU73BGfzLinKhPXHArPWY1KySYUBhscWgq9XNXtTkTLxe1tXnsgsh1Ym8sLJfC`.
-The maker then replaced that auction 823 order in one 3,618-byte transaction;
+The trader then replaced that auction 823 order in one 3,618-byte transaction;
 the two initial/replacement queue deltas folded together and the auction
 settled normally. This verifies that order edits do not require a withdrawal
 or a new auction.

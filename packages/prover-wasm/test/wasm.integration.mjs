@@ -19,7 +19,7 @@ test(
     const directory = resolve(assetDirectory);
     const wasm = await readFile(resolve(directory, "beatex_trader_wasm_prover_bg.wasm"));
     await init({ module_or_path: wasm });
-    assert.equal(traderProverApiVersion(), 1);
+    assert.equal(traderProverApiVersion(), 2);
 
     const prover = new TraderProver();
     const key = await readFile(resolve(directory, "balance-v1.pk"));
@@ -45,7 +45,7 @@ test(
       },
     });
 
-    assert.equal(output.backend, "beatex-arkworks-groth16-wasm-v1");
+    assert.equal(output.backend, "beatex-arkworks-groth16-wasm-v2");
     assert.equal(output.circuitVersion, 1);
     assert.equal(output.newBalance.baseValue, 100n);
     assert.equal(output.newBalance.quoteValue, 10_000n);
@@ -85,13 +85,13 @@ test(
     await init({ module_or_path: wasm });
     const prover = new TraderProver();
     const keyLoadTimes = [];
-    for (const [circuit, file] of [
-      ["order", "order-v1.pk"],
-      ["release", "release-v1.pk"],
-      ["settlement", "settlement-v1.pk"],
+    for (const [circuit, version, file] of [
+      ["order", 3, "order-v3.pk"],
+      ["release", 2, "release-v2.pk"],
+      ["settlement", 3, "settlement-v3.pk"],
     ]) {
       const started = performance.now();
-      prover.loadProvingKey(circuit, await readFile(resolve(directory, file)));
+      prover.loadProvingKeyForVersion(circuit, version, await readFile(resolve(directory, file)));
       keyLoadTimes.push(`${circuit} ${(performance.now() - started).toFixed(1)} ms`);
     }
 
@@ -150,9 +150,9 @@ test(
       keyEpoch,
       clientOrderNonce: 7n,
       auctionSequence: 0n,
-      allocationRuleVersion: 1,
-      orderCircuitVersion: 1,
-      claimCircuitVersion: 1,
+      allocationRuleVersion: 2,
+      orderCircuitVersion: 3,
+      claimCircuitVersion: 3,
       curve,
       baseReserve: order.baseReserve,
       quoteReserve: order.quoteReserve,
@@ -209,9 +209,9 @@ test(
         keyEpoch,
         clientOrderNonce: 7n,
         auctionSequence: 0n,
-        allocationRuleVersion: 1,
-        orderCircuitVersion: 1,
-        claimCircuitVersion: 1,
+        allocationRuleVersion: 2,
+        orderCircuitVersion: 3,
+        claimCircuitVersion: 3,
         curve,
         baseReserve: order.baseReserve,
         quoteReserve: order.quoteReserve,

@@ -3,6 +3,7 @@ import {
   BeatExError,
   type BeatExClientConfig,
   type CancelOrderParams,
+  type CloseOrderEventsParams,
   type ConfirmedTransaction,
   type DepositParams,
   type DepositResult,
@@ -43,6 +44,9 @@ import {
   decodeActiveOrder,
   decodeAggregateAccumulator,
   decodeAuction,
+  decodeAnyAuction,
+  isAuctionResult,
+  clearingQuantities,
   decodeEncryptedPrivateBalance,
   decodeKeyEpoch,
   decodeMarket,
@@ -53,12 +57,14 @@ import {
   deriveAuctionPda,
   derivePrivateBalancePda,
   deriveQueuedOrderPda,
+  deriveRolloverOrderPda,
   deriveSubmissionCounterPda,
   deriveVerificationKeyPda,
   deriveVaultAuthorityPda,
   encodeBindRolloverOrder,
   encodeBindRolloverSettlement,
   encodeCancelActiveOrder,
+  encodeCloseOrderEvents,
   encodeDepositCollateral,
   encodeInitializeAuction,
   encodeInitializePrivateBalance,
@@ -74,6 +80,7 @@ import {
   type ActiveOrderAccount,
   type AggregateAccumulatorAccount,
   type AuctionAccount,
+  type AnyAuctionAccount,
   type EncryptedPrivateBalanceAccount,
   type KeyEpochAccount,
   type MarketAccount,
@@ -81,6 +88,7 @@ import {
   type SubmissionCounterAccount,
 } from "./protocol/index.js";
 import { createKitTransactionCompiler } from "./kit-compiler.js";
+import { auctionIdAtSlot, deriveAuctionPhase, type AuctionPhase } from "./schedule.js";
 
 const addressEncoder = getAddressEncoder();
 const DEFAULT_TRANSACTION_CONFIG = {
@@ -92,15 +100,6 @@ const DEFAULT_TRANSACTION_CONFIG = {
   priorityFeeLamports: 0n,
 };
 
-export type AuctionPhase =
-  | "not-started"
-  | "collecting"
-  | "aggregating"
-  | "publishing"
-  | "settled"
-  | "cancelled"
-  | "expired";
-
 export interface QueueProgress {
   readonly acceptedOrderCount: bigint;
   readonly foldedOrderCount: bigint;
@@ -111,7 +110,8 @@ export interface QueueProgress {
 interface ActiveContext {
   readonly record: PrivateStateRecord;
   readonly stored: StoredActiveOrder;
-  readonly auction: AuctionAccount;
+  /** Pending while the order can still change; compacted once it settles or is cancelled. */
+  readonly auction: AnyAuctionAccount;
   readonly activeOrder: ActiveOrderAccount;
   readonly queueEvent: QueuedOrderAccount;
   readonly marketState: MarketAccount;
@@ -279,31 +279,29 @@ export class BeatExClient {
     return this.#required(market, decodeMarket, "market");
   }
 
-  async getAuction(market: string, auctionId: bigint): Promise<AuctionAccount | null> {
+  /** The auction in its current form: pending, or compacted once settled or cancelled. */
+  async getAuction(market: string, auctionId: bigint): Promise<AnyAuctionAccount | null> {
     const [auction] = await deriveAuctionPda(market as KitAddress, asU64(auctionId), this.programId as KitAddress);
     const data = await this.#accountData(auction);
-    return data === null ? null : decodeAuction(data);
+    return data === null ? null : decodeAnyAuction(data);
   }
 
   async getCurrentAuctionId(market: string, slot?: bigint): Promise<bigint> {
     const marketState = await this.getMarket(market);
-    const currentSlot = slot ?? (await this.#config.rpc.getSlot());
-    if (currentSlot < marketState.marketStartSlot) {
+    const auctionId = auctionIdAtSlot(marketState, slot ?? (await this.#config.rpc.getSlot()));
+    if (auctionId === null) {
       throw new BeatExError("AUCTION_NOT_OPEN", "the market has not reached its start slot");
     }
-    return (currentSlot - marketState.marketStartSlot) / marketState.submissionDurationSlots;
+    return auctionId;
   }
 
   async getAuctionPhase(market: string, auctionId: bigint, slot?: bigint): Promise<AuctionPhase> {
     const auction = await this.getAuction(market, auctionId);
     if (auction === null) return "not-started";
-    if (auction.state === AuctionState.Settled) return "settled";
-    if (auction.state === AuctionState.Cancelled) return "cancelled";
-    const currentSlot = slot ?? (await this.#config.rpc.getSlot());
-    if (currentSlot < auction.submissionEndSlot) return "collecting";
-    if (currentSlot < auction.aggregationDeadlineSlot) return "aggregating";
-    if (currentSlot < auction.decryptionDeadlineSlot) return "publishing";
-    return "expired";
+    if (isAuctionResult(auction)) {
+      return auction.state === AuctionState.Settled ? "settled" : "cancelled";
+    }
+    return deriveAuctionPhase(auction, slot ?? (await this.#config.rpc.getSlot()));
   }
 
   async getPrivateBalance(market: string, owner = this.owner): Promise<EncryptedPrivateBalanceAccount | null> {
@@ -348,6 +346,9 @@ export class BeatExClient {
       visited.add(cursor);
       const order = await this.getQueuedOrder(cursor);
       if (order === null) {
+        // Superseded events are closed once their auction ends; the remaining
+        // on-chain history stops at the first reclaimed link.
+        if (cursor !== startEvent) break;
         throw new BeatExError("ACCOUNT_NOT_FOUND", `queued order ${cursor} was not found`);
       }
       history.push(order);
@@ -688,6 +689,9 @@ export class BeatExClient {
       auction = await this.getAuction(market, auctionId);
     }
     if (auction === null) throw new BeatExError("AUCTION_NOT_OPEN", "current auction is not initialized");
+    if (isAuctionResult(auction)) {
+      throw new BeatExError("AUCTION_NOT_OPEN", "current auction has already finished");
+    }
     return {
       auctionId,
       auctionAddress,
@@ -709,11 +713,6 @@ export class BeatExClient {
       current.auctionAddress as KitAddress,
       this.programId as KitAddress,
     );
-    const counter = await this.#required<SubmissionCounterAccount>(
-      counterAddress,
-      decodeSubmissionCounter,
-      "submission counter",
-    );
     const nonce = params.clientOrderNonce ?? randomU64();
     const output = await this.#config.prover.proveOrder(
       {
@@ -730,9 +729,9 @@ export class BeatExClient {
     );
     const [[privateBalance], [event], [activeOrder], [orderKey]] = await Promise.all([
       derivePrivateBalancePda(params.market as KitAddress, this.owner as KitAddress, this.programId as KitAddress),
-      deriveQueuedOrderPda(current.auctionAddress as KitAddress, counter.acceptedOrderCount, this.programId as KitAddress),
+      deriveQueuedOrderPda(current.auctionAddress as KitAddress, this.owner as KitAddress, nonce, this.programId as KitAddress),
       deriveActiveOrderPda(current.auctionAddress as KitAddress, this.owner as KitAddress, this.programId as KitAddress),
-      deriveVerificationKeyPda(params.market as KitAddress, QueueCircuitKind.OrderSubmission, circuitVersion(QueueCircuitKind.OrderSubmission), this.programId as KitAddress),
+      deriveVerificationKeyPda(params.market as KitAddress, QueueCircuitKind.OrderSubmission, current.auction.orderCircuitVersion, this.programId as KitAddress),
     ]);
     const active: StoredActiveOrder = {
       auctionId: current.auctionId,
@@ -798,7 +797,7 @@ export class BeatExClient {
       throw new BeatExError("INVALID_ARGUMENT", "the active order belongs to a different auction");
     }
     const [auction, activeOrder, queueEvent, marketState] = await Promise.all([
-      this.#required<AuctionAccount>(stored.auction, decodeAuction, "auction"),
+      this.#required<AnyAuctionAccount>(stored.auction, decodeAnyAuction, "auction"),
       this.#required<ActiveOrderAccount>(stored.activeOrder, decodeActiveOrder, "active order"),
       this.#required<QueuedOrderAccount>(stored.queueEvent, decodeQueuedOrder, "queued order"),
       this.getMarket(market),
@@ -846,11 +845,6 @@ export class BeatExClient {
       context.stored.auction as KitAddress,
       this.programId as KitAddress,
     );
-    const counter = await this.#required<SubmissionCounterAccount>(
-      counterAddress,
-      decodeSubmissionCounter,
-      "submission counter",
-    );
     const nonce = params.clientOrderNonce ?? randomU64();
     const output = await this.#config.prover.proveReplacement(
       {
@@ -868,9 +862,9 @@ export class BeatExClient {
       params.proofOptions,
     );
     const [[event], [releaseKey], [orderKey]] = await Promise.all([
-      deriveQueuedOrderPda(context.stored.auction as KitAddress, counter.acceptedOrderCount, this.programId as KitAddress),
+      deriveQueuedOrderPda(context.stored.auction as KitAddress, this.owner as KitAddress, nonce, this.programId as KitAddress),
       deriveVerificationKeyPda(params.market as KitAddress, QueueCircuitKind.OrderModification, circuitVersion(QueueCircuitKind.OrderModification), this.programId as KitAddress),
-      deriveVerificationKeyPda(params.market as KitAddress, QueueCircuitKind.OrderSubmission, circuitVersion(QueueCircuitKind.OrderSubmission), this.programId as KitAddress),
+      deriveVerificationKeyPda(params.market as KitAddress, QueueCircuitKind.OrderSubmission, context.auction.orderCircuitVersion, this.programId as KitAddress),
     ]);
     const active: StoredActiveOrder = {
       auctionId: context.stored.auctionId,
@@ -939,17 +933,13 @@ export class BeatExClient {
       context.stored.auction as KitAddress,
       this.programId as KitAddress,
     );
-    const counter = await this.#required<SubmissionCounterAccount>(
-      counterAddress,
-      decodeSubmissionCounter,
-      "submission counter",
-    );
+    const nonce = randomU64();
     const output = await this.#config.prover.proveCancellation(
       this.#releaseRequest(context),
       params.proofOptions,
     );
     const [[event], [releaseKey]] = await Promise.all([
-      deriveQueuedOrderPda(context.stored.auction as KitAddress, counter.acceptedOrderCount, this.programId as KitAddress),
+      deriveQueuedOrderPda(context.stored.auction as KitAddress, this.owner as KitAddress, nonce, this.programId as KitAddress),
       deriveVerificationKeyPda(params.market as KitAddress, QueueCircuitKind.OrderModification, circuitVersion(QueueCircuitKind.OrderModification), this.programId as KitAddress),
     ]);
     const next = nextState(context.record.state, {
@@ -974,6 +964,7 @@ export class BeatExClient {
           meta(SYSTEM_PROGRAM_ADDRESS),
         ],
         encodeCancelActiveOrder({
+          clientOrderNonce: nonce,
           releasedEncryptedBase: output.releasedEncryptedBase,
           releasedEncryptedQuote: output.releasedEncryptedQuote,
           proof: output.proof,
@@ -983,10 +974,30 @@ export class BeatExClient {
     return { ...result, proof: output };
   }
 
+  /** Reclaim the rent of this owner's finished queued-order events in one auction. */
+  async closeOrderEvents(params: CloseOrderEventsParams): Promise<ConfirmedTransaction> {
+    const [activeOrder] = await deriveActiveOrderPda(
+      params.auction as KitAddress,
+      this.owner as KitAddress,
+      this.programId as KitAddress,
+    );
+    return this.#send([
+      this.#instruction(
+        [
+          meta(this.owner, true, true),
+          meta(params.market),
+          meta(params.auction),
+          meta(activeOrder, true),
+          ...params.events.map((event) => meta(event, true)),
+        ],
+        encodeCloseOrderEvents(),
+      ),
+    ]);
+  }
+
   #settlementRequest(context: ActiveContext) {
     const index = context.auction.clearingIndex;
-    const demand = context.auction.decryptedDemand[index];
-    const supply = context.auction.decryptedSupply[index];
+    const { demand, supply } = clearingQuantities(context.auction);
     if (demand === undefined || supply === undefined) {
       throw new BeatExError("INVALID_ACCOUNT_DATA", "clearing index is outside the auction grid");
     }
@@ -1057,7 +1068,7 @@ export class BeatExClient {
       meta(INSTRUCTIONS_SYSVAR_ADDRESS),
     ];
     const finalAccounts = bindingAccounts.map((account, index) =>
-      index === 4 || index === 5 || index === 6 ? { ...account, writable: true } : account,
+      index === 0 || index === 4 || index === 5 || index === 6 ? { ...account, writable: true } : account,
     );
     const next = nextState(context.record.state, {
       balance: output.creditedBalance,
@@ -1161,11 +1172,6 @@ export class BeatExClient {
       nextAuction.auctionAddress as KitAddress,
       this.programId as KitAddress,
     );
-    const nextCounter = await this.#required<SubmissionCounterAccount>(
-      nextCounterAddress,
-      decodeSubmissionCounter,
-      "next submission counter",
-    );
     const nonce = params.clientOrderNonce ?? randomU64();
     const output = await this.#config.prover.proveRollover(
       {
@@ -1183,10 +1189,10 @@ export class BeatExClient {
       params.proofOptions,
     );
     const [[nextOrder], [nextActiveOrder], [rolloverKey], [orderKey]] = await Promise.all([
-      deriveQueuedOrderPda(nextAuction.auctionAddress as KitAddress, nextCounter.acceptedOrderCount, this.programId as KitAddress),
+      deriveRolloverOrderPda(nextAuction.auctionAddress as KitAddress, this.owner as KitAddress, this.programId as KitAddress),
       deriveActiveOrderPda(nextAuction.auctionAddress as KitAddress, this.owner as KitAddress, this.programId as KitAddress),
       deriveVerificationKeyPda(params.market as KitAddress, QueueCircuitKind.RolloverSettlement, circuitVersion(QueueCircuitKind.RolloverSettlement), this.programId as KitAddress),
-      deriveVerificationKeyPda(params.market as KitAddress, QueueCircuitKind.OrderSubmission, circuitVersion(QueueCircuitKind.OrderSubmission), this.programId as KitAddress),
+      deriveVerificationKeyPda(params.market as KitAddress, QueueCircuitKind.OrderSubmission, nextAuction.auction.orderCircuitVersion, this.programId as KitAddress),
     ]);
     const settlementExpectedInput = reverse32(output.settlement.proof.publicInput);
     const orderExpectedInput = reverse32(output.nextOrder.proof.publicInput);

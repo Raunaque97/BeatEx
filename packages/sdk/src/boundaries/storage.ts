@@ -263,9 +263,13 @@ export class InMemoryPrivateStateStorage implements PrivateStateStorage {
   }
 }
 
+/**
+ * localStorage-shaped key/value persistence. Methods may be asynchronous, which lets an
+ * application layer encryption or IndexedDB underneath the same journal semantics.
+ */
 export interface WebStorageLike {
-  getItem(key: string): string | null;
-  setItem(key: string, value: string): void;
+  getItem(key: string): string | null | Promise<string | null>;
+  setItem(key: string, value: string): void | Promise<void>;
 }
 
 export interface BrowserLockManagerLike {
@@ -280,7 +284,7 @@ export interface BrowserPrivateStateStorageOptions {
   readonly allowSingleContextFallback?: boolean;
 }
 
-/** localStorage-compatible persistence with a Web Locks atomicity boundary. */
+/** localStorage-compatible (sync or async) persistence with a Web Locks atomicity boundary. */
 export class BrowserPrivateStateStorage implements PrivateStateStorage {
   readonly #storage: WebStorageLike;
   readonly #prefix: string;
@@ -296,7 +300,7 @@ export class BrowserPrivateStateStorage implements PrivateStateStorage {
   }
 
   async load(key: PrivateStateKey): Promise<PrivateStateSnapshot> {
-    return cloneValue(this.#read(this.#entryKey(key)));
+    return cloneValue(await this.#read(this.#entryKey(key)));
   }
 
   async stage(
@@ -305,9 +309,9 @@ export class BrowserPrivateStateStorage implements PrivateStateStorage {
   ): Promise<StagedPrivateStateTransition> {
     return this.#exclusive(key, async () => {
       const storageKey = this.#entryKey(key);
-      const envelope = this.#read(storageKey);
+      const envelope = await this.#read(storageKey);
       const pending = assertCanStage(envelope, transition);
-      this.#write(storageKey, { ...envelope, pending });
+      await this.#write(storageKey, { ...envelope, pending });
       return cloneValue(pending);
     });
   }
@@ -319,9 +323,9 @@ export class BrowserPrivateStateStorage implements PrivateStateStorage {
   ): Promise<PrivateStateRecord> {
     return this.#exclusive(key, async () => {
       const storageKey = this.#entryKey(key);
-      const envelope = this.#read(storageKey);
+      const envelope = await this.#read(storageKey);
       const record = commitEnvelope(envelope, transitionId, confirmation);
-      this.#write(storageKey, { record, pending: null });
+      await this.#write(storageKey, { record, pending: null });
       return cloneValue(record);
     });
   }
@@ -335,7 +339,7 @@ export class BrowserPrivateStateStorage implements PrivateStateStorage {
   ): Promise<StagedPrivateStateTransition> {
     return this.#exclusive(key, async () => {
       const storageKey = this.#entryKey(key);
-      const envelope = this.#read(storageKey);
+      const envelope = await this.#read(storageKey);
       const pending = markBroadcastEnvelope(
         envelope,
         transitionId,
@@ -343,7 +347,7 @@ export class BrowserPrivateStateStorage implements PrivateStateStorage {
         blockhash,
         lastValidBlockHeight,
       );
-      this.#write(storageKey, { ...envelope, pending });
+      await this.#write(storageKey, { ...envelope, pending });
       return cloneValue(pending);
     });
   }
@@ -351,7 +355,7 @@ export class BrowserPrivateStateStorage implements PrivateStateStorage {
   async abort(key: PrivateStateKey, transitionId: string): Promise<void> {
     await this.#exclusive(key, async () => {
       const storageKey = this.#entryKey(key);
-      const envelope = this.#read(storageKey);
+      const envelope = await this.#read(storageKey);
       if (envelope.pending === null) return;
       if (envelope.pending.id !== transitionId) {
         throw new PrivateStateConflictError("refusing to abort a different pending transition", {
@@ -359,7 +363,7 @@ export class BrowserPrivateStateStorage implements PrivateStateStorage {
           actualTransitionId: envelope.pending.id,
         });
       }
-      this.#write(storageKey, { ...envelope, pending: null });
+      await this.#write(storageKey, { ...envelope, pending: null });
     });
   }
 
@@ -367,13 +371,13 @@ export class BrowserPrivateStateStorage implements PrivateStateStorage {
     return this.#prefix + encodeStorageKey(key);
   }
 
-  #read(key: string): StoredEnvelope {
-    const value = this.#storage.getItem(key);
+  async #read(key: string): Promise<StoredEnvelope> {
+    const value = await this.#storage.getItem(key);
     return value === null ? emptyEnvelope() : decodeJson<StoredEnvelope>(value);
   }
 
-  #write(key: string, envelope: StoredEnvelope): void {
-    this.#storage.setItem(key, encodeJson(envelope));
+  async #write(key: string, envelope: StoredEnvelope): Promise<void> {
+    await this.#storage.setItem(key, encodeJson(envelope));
   }
 
   async #exclusive<T>(key: PrivateStateKey, callback: () => Promise<T>): Promise<T> {

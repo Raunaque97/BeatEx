@@ -13,6 +13,7 @@ import {
 export const ACCOUNT_DISCRIMINATORS = {
   market: Uint8Array.of(219, 190, 213, 55, 0, 227, 198, 154),
   auction: Uint8Array.of(218, 94, 247, 242, 126, 233, 131, 81),
+  auctionResult: Uint8Array.of(182, 105, 71, 113, 228, 147, 117, 135),
   queueVerificationKey: Uint8Array.of(187, 29, 111, 248, 250, 134, 144, 100),
   queuedOrder: Uint8Array.of(35, 99, 163, 153, 175, 232, 22, 207),
   activeOrder: Uint8Array.of(141, 51, 124, 142, 175, 61, 58, 58),
@@ -79,6 +80,17 @@ export interface MarketAccount {
   paused: boolean;
   vaultAuthorityBump: number;
   bump: number;
+  /** Latest published clearings, highest auction id first; empty slots have price 0. */
+  recentClearings: readonly RecentClearing[];
+}
+
+/** Number of published clearings the market account keeps. */
+export const RECENT_CLEARINGS = 8;
+
+export interface RecentClearing {
+  auctionId: bigint;
+  clearingPrice: bigint;
+  clearingVolume: bigint;
 }
 
 export function decodeMarket(data: Uint8Array): MarketAccount {
@@ -118,7 +130,13 @@ export function decodeMarket(data: Uint8Array): MarketAccount {
   const paused = reader.bool();
   const vaultAuthorityBump = reader.u8();
   const bump = reader.u8();
+  const recentClearings = Array.from({ length: RECENT_CLEARINGS }, () => ({
+    auctionId: reader.u64(),
+    clearingPrice: reader.u64(),
+    clearingVolume: reader.u64(),
+  }));
   return {
+    recentClearings,
     version,
     authority,
     baseMint,
@@ -187,6 +205,86 @@ export interface AuctionAccount {
   quoteResidual: bigint;
   bump: number;
 }
+
+/**
+ * The compact record an auction is rewritten to, at the same address, once it
+ * settles or is cancelled. Settlement needs only these fields.
+ */
+export interface AuctionResultAccount {
+  version: number;
+  market: Address;
+  auctionId: bigint;
+  keyEpoch: Address;
+  state: AuctionState;
+  referencePrice: bigint;
+  referenceFromOracle: boolean;
+  gridStepBps: number;
+  gridSize: number;
+  allocationRuleVersion: number;
+  orderCircuitVersion: number;
+  claimCircuitVersion: number;
+  clearingIndex: number;
+  clearingPrice: bigint;
+  clearingVolume: bigint;
+  demandAtClearing: bigint;
+  supplyAtClearing: bigint;
+  bump: number;
+}
+
+export function decodeAuctionResult(data: Uint8Array): AuctionResultAccount {
+  const reader = accountReader(data, ACCOUNT_DISCRIMINATORS.auctionResult, "AuctionResult");
+  return {
+    version: reader.u8(),
+    market: reader.address(),
+    auctionId: reader.u64(),
+    keyEpoch: reader.address(),
+    state: reader.u8() as AuctionState,
+    referencePrice: reader.u64(),
+    referenceFromOracle: reader.bool(),
+    gridStepBps: reader.u16(),
+    gridSize: reader.u8(),
+    allocationRuleVersion: reader.u16(),
+    orderCircuitVersion: reader.u16(),
+    claimCircuitVersion: reader.u16(),
+    clearingIndex: reader.u8(),
+    clearingPrice: reader.u64(),
+    clearingVolume: reader.u64(),
+    demandAtClearing: reader.u64(),
+    supplyAtClearing: reader.u64(),
+    bump: reader.u8(),
+  };
+}
+
+/** An auction PDA in either form: pending (`Auction`) or finished (`AuctionResult`). */
+export type AnyAuctionAccount = AuctionAccount | AuctionResultAccount;
+
+export function isAuctionResult(auction: AnyAuctionAccount): auction is AuctionResultAccount {
+  return "demandAtClearing" in auction;
+}
+
+/** Decode an auction PDA in whichever form it currently has. */
+export function decodeAnyAuction(data: Uint8Array): AnyAuctionAccount {
+  return data.length >= 8 && bytesEqual(data.subarray(0, 8), ACCOUNT_DISCRIMINATORS.auctionResult)
+    ? decodeAuctionResult(data)
+    : decodeAuction(data);
+}
+
+/** Aggregate demand and supply at an auction's clearing level, in either form. */
+export function clearingQuantities(auction: AnyAuctionAccount): { demand: bigint; supply: bigint } {
+  return isAuctionResult(auction)
+    ? { demand: auction.demandAtClearing, supply: auction.supplyAtClearing }
+    : {
+        demand: auction.decryptedDemand[auction.clearingIndex] ?? 0n,
+        supply: auction.decryptedSupply[auction.clearingIndex] ?? 0n,
+      };
+}
+
+/** Fixed `Auction` account layout, for `getProgramAccounts` filters and data slices. */
+export const AUCTION_ACCOUNT_LAYOUT = {
+  size: 2642,
+  marketOffset: 9,
+  auctionIdOffset: 41,
+} as const;
 
 export function decodeAuction(data: Uint8Array): AuctionAccount {
   const reader = accountReader(data, ACCOUNT_DISCRIMINATORS.auction, "Auction");

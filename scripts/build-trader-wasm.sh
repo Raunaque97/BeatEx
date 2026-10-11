@@ -36,6 +36,7 @@ fi
   --target web \
   --out-dir "$build_temp" \
   --out-name beatex_trader_wasm_prover \
+  --omit-default-module-path \
   --typescript
 
 mkdir -p "$generated_dir"

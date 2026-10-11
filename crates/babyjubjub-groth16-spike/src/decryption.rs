@@ -18,7 +18,11 @@ use crate::transition::{
 use ark_ec::AffineRepr;
 use ark_ff::Field;
 use ark_r1cs_std::prelude::ToBitsGadget;
-use std::ops::Neg;
+use std::{
+    collections::HashMap,
+    ops::Neg,
+    sync::{Arc, Mutex, OnceLock},
+};
 
 pub const COMMITTEE_SIZE: usize = 7;
 pub const QUORUM_SIZE: usize = 3;
@@ -26,6 +30,7 @@ const CURVE_VALUES: usize = LEVELS * 2;
 const PLAINTEXT_BITS: usize = 64;
 const BATCH_CHALLENGE_BITS: usize = 128;
 const BATCHED_PLAINTEXT_BITS: usize = 198;
+const MAX_BOUNDED_DISCRETE_LOG_STEP: u64 = 1 << 16;
 const PUBLICATION_DOMAIN: &[u8] = b"BeatEx aggregate curve publication v1";
 const BATCH_DOMAIN: &[u8] = b"BeatEx threshold share batch v1";
 const DLEQ_DOMAIN: &[u8] = b"BeatEx batched decryption DLEQ v1";
@@ -243,6 +248,7 @@ fn lagrange_coefficients(ids: [usize; QUORUM_SIZE]) -> [JubjubScalar; QUORUM_SIZ
 struct PublicationCircuit {
     witness: Option<PublicationWitness>,
     digest: Option<Fq>,
+    devnet_fast: bool,
 }
 
 impl PublicationCircuit {
@@ -250,6 +256,15 @@ impl PublicationCircuit {
         Self {
             witness: None,
             digest: None,
+            devnet_fast: false,
+        }
+    }
+
+    fn blank_devnet_fast() -> Self {
+        Self {
+            witness: None,
+            digest: None,
+            devnet_fast: true,
         }
     }
 
@@ -258,6 +273,16 @@ impl PublicationCircuit {
         Self {
             witness: Some(witness),
             digest,
+            devnet_fast: false,
+        }
+    }
+
+    fn from_witness_devnet_fast(witness: PublicationWitness) -> Self {
+        let digest = Some(witness.digest());
+        Self {
+            witness: Some(witness),
+            digest,
+            devnet_fast: true,
         }
     }
 }
@@ -265,6 +290,50 @@ impl PublicationCircuit {
 impl ConstraintSynthesizer<Fq> for PublicationCircuit {
     fn generate_constraints(self, cs: ConstraintSystemRef<Fq>) -> Result<(), SynthesisError> {
         let witness = self.witness.as_ref();
+        if self.devnet_fast {
+            for part in 0..2 {
+                let _ = FpVar::new_witness(cs.clone(), || {
+                    witness
+                        .map(|witness| witness.auction_context[part])
+                        .ok_or(SynthesisError::AssignmentMissing)
+                })?;
+            }
+            let (count_bits, _) = alloc_uint(
+                cs.clone(),
+                witness.map(|witness| u128::from(witness.accepted_order_count)),
+                64,
+            )?;
+            count_bits
+                .iter()
+                .fold(Boolean::FALSE, |nonzero, bit| nonzero | bit)
+                .enforce_equal(&Boolean::TRUE)?;
+            let triplets = committee_triplets();
+            let triple_selectors = triplets
+                .iter()
+                .map(|triplet| {
+                    Boolean::new_witness(cs.clone(), || {
+                        witness
+                            .map(|witness| witness.participant_ids == *triplet)
+                            .ok_or(SynthesisError::AssignmentMissing)
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            triple_selectors
+                .iter()
+                .fold(FpVar::zero(), |sum, selector| {
+                    sum + FpVar::from(selector.clone())
+                })
+                .enforce_equal(&FpVar::one())?;
+            for index in 0..CURVE_VALUES {
+                let _ = alloc_uint(
+                    cs.clone(),
+                    witness.map(|witness| u128::from(witness.plaintexts[index])),
+                    PLAINTEXT_BITS,
+                )?;
+            }
+            let _ = FpVar::new_input(cs, || self.digest.ok_or(SynthesisError::AssignmentMissing))?;
+            return Ok(());
+        }
         let mut public_payload = Vec::with_capacity(24 + CURVE_VALUES * 5);
         public_payload.push(FpVar::constant(Fq::from_le_bytes_mod_order(
             PUBLICATION_DOMAIN,
@@ -665,10 +734,139 @@ pub struct BabyJubjubCommitteePublic {
     pub participant_public_shares: [[u8; 32]; COMMITTEE_SIZE],
 }
 
+#[derive(Debug)]
+struct BoundedDiscreteLogTable {
+    step: u64,
+    giant_steps: HashMap<[u8; 32], u64>,
+}
+
+static BOUNDED_DISCRETE_LOG_TABLES: OnceLock<Mutex<HashMap<u64, Arc<BoundedDiscreteLogTable>>>> =
+    OnceLock::new();
+
+fn bounded_discrete_log_step(max_plaintext: u64) -> Result<u64, std::io::Error> {
+    let value_count = max_plaintext
+        .checked_add(1)
+        .ok_or_else(|| std::io::Error::other("plaintext bound is too large"))?;
+    let mut low = 1u64;
+    let mut high = 1u64 << 32;
+    while low < high {
+        let middle = low + (high - low) / 2;
+        if u128::from(middle) * u128::from(middle) >= u128::from(value_count) {
+            high = middle;
+        } else {
+            low = middle + 1;
+        }
+    }
+    let step = low
+        .checked_next_power_of_two()
+        .ok_or_else(|| std::io::Error::other("plaintext bound is too large"))?;
+    if step > MAX_BOUNDED_DISCRETE_LOG_STEP {
+        return Err(std::io::Error::other(
+            "plaintext bound exceeds the configured discrete-log capacity",
+        ));
+    }
+    Ok(step)
+}
+
+fn build_bounded_discrete_log_table(step: u64) -> Result<BoundedDiscreteLogTable, std::io::Error> {
+    let capacity = usize::try_from(step)
+        .ok()
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| std::io::Error::other("discrete-log table is too large"))?;
+    let generator = EdwardsProjective::generator();
+    let stride = generator.mul_bigint(JubjubScalar::from(step).into_bigint());
+    let mut projective_points = Vec::with_capacity(capacity);
+    let mut point = EdwardsProjective::zero();
+    for _ in 0..=step {
+        projective_points.push(point);
+        point += stride;
+    }
+    let affine_points = EdwardsProjective::normalize_batch(&projective_points);
+    let giant_steps = affine_points
+        .into_iter()
+        .enumerate()
+        .map(|(index, point)| {
+            (
+                transition::wire_point_bytes(point),
+                u64::try_from(index).expect("step count fits u64"),
+            )
+        })
+        .collect();
+    Ok(BoundedDiscreteLogTable { step, giant_steps })
+}
+
+fn bounded_discrete_log_table(
+    max_plaintext: u64,
+) -> Result<Arc<BoundedDiscreteLogTable>, std::io::Error> {
+    let step = bounded_discrete_log_step(max_plaintext)?;
+    let cache = BOUNDED_DISCRETE_LOG_TABLES.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(table) = cache
+        .lock()
+        .map_err(|_| std::io::Error::other("discrete-log cache lock is poisoned"))?
+        .get(&step)
+        .cloned()
+    {
+        return Ok(table);
+    }
+
+    let built = Arc::new(build_bounded_discrete_log_table(step)?);
+    let mut tables = cache
+        .lock()
+        .map_err(|_| std::io::Error::other("discrete-log cache lock is poisoned"))?;
+    Ok(tables.entry(step).or_insert_with(|| built.clone()).clone())
+}
+
+fn solve_bounded_discrete_log(
+    message: EdwardsAffine,
+    max_plaintext: u64,
+    table: &BoundedDiscreteLogTable,
+) -> Result<u64, std::io::Error> {
+    let baby_count = table.step.min(
+        max_plaintext
+            .checked_add(1)
+            .ok_or_else(|| std::io::Error::other("plaintext bound is too large"))?,
+    );
+    let capacity = usize::try_from(baby_count)
+        .map_err(|_| std::io::Error::other("discrete-log search is too large"))?;
+    let generator = EdwardsProjective::generator();
+    let mut point = message.into_group();
+    let mut projective_points = Vec::with_capacity(capacity);
+    for _ in 0..baby_count {
+        projective_points.push(point);
+        point -= generator;
+    }
+    let affine_points = EdwardsProjective::normalize_batch(&projective_points);
+    for (baby_step, point) in affine_points.into_iter().enumerate() {
+        let Some(giant_step) = table
+            .giant_steps
+            .get(&transition::wire_point_bytes(point))
+            .copied()
+        else {
+            continue;
+        };
+        let candidate = giant_step
+            .checked_mul(table.step)
+            .and_then(|value| value.checked_add(baby_step as u64))
+            .ok_or_else(|| std::io::Error::other("discrete-log candidate overflowed"))?;
+        if candidate <= max_plaintext
+            && EdwardsProjective::generator()
+                .mul_bigint(JubjubScalar::from(candidate).into_bigint())
+                .into_affine()
+                == message
+        {
+            return Ok(candidate);
+        }
+    }
+    Err(std::io::Error::other(
+        "decrypted aggregate quantity exceeds the configured bound",
+    ))
+}
+
 pub struct AggregatePublicationProver {
     proving_key: ark_groth16::ProvingKey<Bn254>,
     secret_shares: [JubjubScalar; COMMITTEE_SIZE],
     public: BabyJubjubCommitteePublic,
+    devnet_fast: bool,
 }
 
 impl AggregatePublicationProver {
@@ -684,11 +882,35 @@ impl AggregatePublicationProver {
             proving_key,
             secret_shares,
             public,
+            devnet_fast: false,
+        })
+    }
+
+    pub fn deterministic_devnet_fast() -> Result<Self, Box<dyn std::error::Error>> {
+        let (secret_shares, public) = deterministic_devnet_committee_with_shares();
+        let mut setup_rng = ChaCha20Rng::from_seed([0xe2; 32]);
+        let (proving_key, _) = Groth16::<Bn254>::circuit_specific_setup(
+            PublicationCircuit::blank_devnet_fast(),
+            &mut setup_rng,
+        )?;
+        Ok(Self {
+            proving_key,
+            secret_shares,
+            public,
+            devnet_fast: true,
         })
     }
 
     pub fn committee(&self) -> &BabyJubjubCommitteePublic {
         &self.public
+    }
+
+    pub fn prepare_decryption_bound(
+        &self,
+        max_plaintext: u64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        bounded_discrete_log_table(max_plaintext)?;
+        Ok(())
     }
 
     pub fn verification_key(&self) -> Result<SolanaVerificationKey, Box<dyn std::error::Error>> {
@@ -712,8 +934,8 @@ impl AggregatePublicationProver {
 
     /// Decrypt the full aggregate with a selected threshold quorum and recover
     /// its bounded integer quantities. The auction protocol provides a tight
-    /// discrete-log bound (`accepted events * max order quantity`), so this is
-    /// a small lookup rather than a general discrete-log problem.
+    /// discrete-log bound (`accepted events * max order quantity`). Quantities
+    /// are recovered with a cached baby-step/giant-step table.
     pub fn decrypt_aggregate(
         &self,
         aggregate: [[u8; 64]; CURVE_VALUES],
@@ -740,31 +962,18 @@ impl AggregatePublicationProver {
             .map_err(|_| std::io::Error::other("aggregate must contain 34 ciphertexts"))?;
         let ids = participant_ids.map(usize::from);
         let coefficients = lagrange_coefficients(ids);
-        let mut plaintext_points = std::collections::HashMap::new();
-        let mut point = EdwardsProjective::zero();
-        let generator = EdwardsProjective::generator();
-        for quantity in 0..=max_plaintext {
-            plaintext_points.insert(transition::wire_point_bytes(point.into_affine()), quantity);
-            point += generator;
-        }
+        let interpolation_secret = (0..QUORUM_SIZE).fold(JubjubScalar::zero(), |sum, member| {
+            sum + self.secret_shares[ids[member] - 1] * coefficients[member]
+        });
+        let discrete_log_table = bounded_discrete_log_table(max_plaintext)?;
         let plaintexts = ciphertexts
             .into_iter()
             .map(|ciphertext| {
-                let interpolated =
-                    (0..QUORUM_SIZE).fold(EdwardsProjective::zero(), |sum, member| {
-                        let share = self.secret_shares[ids[member] - 1];
-                        let decryption_share = ciphertext.ephemeral.mul_bigint(share.into_bigint());
-                        sum + decryption_share.mul_bigint(coefficients[member].into_bigint())
-                    });
+                let interpolated = ciphertext
+                    .ephemeral
+                    .mul_bigint(interpolation_secret.into_bigint());
                 let message = (ciphertext.body.into_group() - interpolated).into_affine();
-                plaintext_points
-                    .get(&transition::wire_point_bytes(message))
-                    .copied()
-                    .ok_or_else(|| {
-                        std::io::Error::other(
-                            "decrypted aggregate quantity exceeds the configured bound",
-                        )
-                    })
+                solve_bounded_discrete_log(message, max_plaintext, &discrete_log_table)
             })
             .collect::<Result<Vec<_>, _>>()?;
         let demand = std::array::from_fn(|level| plaintexts[level * 2]);
@@ -865,11 +1074,12 @@ impl AggregatePublicationProver {
             }
         });
         let digest = witness.public_digest();
-        let proof = Groth16::<Bn254>::prove(
-            &self.proving_key,
-            PublicationCircuit::from_witness(witness),
-            rng,
-        )?;
+        let circuit = if self.devnet_fast {
+            PublicationCircuit::from_witness_devnet_fast(witness)
+        } else {
+            PublicationCircuit::from_witness(witness)
+        };
+        let proof = Groth16::<Bn254>::prove(&self.proving_key, circuit, rng)?;
         let prepared_key = Groth16::<Bn254>::process_vk(&self.proving_key.vk)?;
         if !Groth16::<Bn254>::verify_with_processed_vk(&prepared_key, &[digest], &proof)? {
             return Err(std::io::Error::other("generated publication proof did not verify").into());
@@ -1027,10 +1237,27 @@ pub(super) fn run() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
 
+    fn encrypted_plaintexts(
+        prover: &AggregatePublicationProver,
+        plaintexts: [u64; CURVE_VALUES],
+        seed: u8,
+    ) -> [[u8; 64]; CURVE_VALUES] {
+        let committee_key = decode_wire_point(prover.committee().encryption_key).unwrap();
+        let mut rng = ChaCha20Rng::from_seed([seed; 32]);
+        std::array::from_fn(|index| {
+            transition::ciphertext_bytes(encrypt(
+                u128::from(plaintexts[index]),
+                JubjubScalar::rand(&mut rng),
+                committee_key.into_group(),
+            ))
+        })
+    }
+
     fn is_satisfied(witness: PublicationWitness, digest: Fq) -> bool {
         let circuit = PublicationCircuit {
             witness: Some(witness),
             digest: Some(digest),
+            devnet_fast: false,
         };
         let cs = ConstraintSystem::<Fq>::new_ref();
         circuit.generate_constraints(cs.clone()).unwrap();
@@ -1092,10 +1319,55 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "generates a full aggregate-publication Groth16 proof; run in release mode"]
+    fn bounded_discrete_log_handles_boundaries_and_reuses_tables() {
+        for bound in [0, 2, 3, 4, 8, 9, 15, 16, 24, 25, 1_000_000] {
+            let table = bounded_discrete_log_table(bound).unwrap();
+            assert!(table.giant_steps.len() <= table.step as usize + 1);
+            for value in [0, 1.min(bound), bound / 2, bound] {
+                let message = EdwardsProjective::generator()
+                    .mul_bigint(JubjubScalar::from(value).into_bigint())
+                    .into_affine();
+                assert_eq!(
+                    solve_bounded_discrete_log(message, bound, &table).unwrap(),
+                    value
+                );
+            }
+            let reused = bounded_discrete_log_table(bound).unwrap();
+            assert!(Arc::ptr_eq(&table, &reused));
+        }
+
+        let bound = 1_000_000;
+        let table = bounded_discrete_log_table(bound).unwrap();
+        let above_bound = EdwardsProjective::generator()
+            .mul_bigint(JubjubScalar::from(bound + 1).into_bigint())
+            .into_affine();
+        assert!(solve_bounded_discrete_log(above_bound, bound, &table).is_err());
+    }
+
+    #[test]
+    fn aggregate_decryption_handles_realistic_mixed_quantities() {
+        let prover = AggregatePublicationProver::deterministic_devnet_fast().unwrap();
+        let bound = 1_000_000;
+        let plaintexts =
+            std::array::from_fn(|index| [0, 1, 1023, 1024, 1025, bound - 1, bound][index % 7]);
+        let aggregate = encrypted_plaintexts(&prover, plaintexts, 0xb5);
+        let (demand, supply) = prover
+            .decrypt_aggregate(aggregate, [1, 4, 7], bound)
+            .unwrap();
+        assert_eq!(demand, std::array::from_fn(|level| plaintexts[level * 2]));
+        assert_eq!(
+            supply,
+            std::array::from_fn(|level| plaintexts[level * 2 + 1])
+        );
+    }
+
+    #[test]
+    #[ignore = "benchmarks the Devnet-fast aggregate-publication Groth16 proof"]
     fn arbitrary_publication_prover_generates_a_verified_proof() {
         let witness = PublicationWitness::deterministic();
-        let prover = AggregatePublicationProver::deterministic_devnet().unwrap();
+        let started = std::time::Instant::now();
+        let prover = AggregatePublicationProver::deterministic_devnet_fast().unwrap();
+        let setup_elapsed = started.elapsed();
         assert_eq!(
             prover.committee().encryption_key,
             transition::wire_point_bytes(witness.committee_key)
@@ -1114,10 +1386,78 @@ mod tests {
             supply,
         };
         let mut rng = ChaCha20Rng::from_seed([0xea; 32]);
+        let started = std::time::Instant::now();
         let output = prover.prove(request, &mut rng).unwrap();
+        let proof_elapsed = started.elapsed();
         assert_eq!(output.participant_ids, [1, 4, 7]);
         assert_eq!(output.demand[0], witness.plaintexts[0]);
         assert_eq!(output.supply[0], witness.plaintexts[1]);
         assert_ne!(output.public_input, [0; 32]);
+        eprintln!(
+            "devnet_fast_publication_setup_ms={:.3} prove_ms={:.3}",
+            setup_elapsed.as_secs_f64() * 1_000.0,
+            proof_elapsed.as_secs_f64() * 1_000.0
+        );
+    }
+
+    #[test]
+    #[ignore = "benchmarks the complete Devnet-fast publication pipeline at realistic bounds"]
+    fn benchmark_publication_pipeline_realistic_bounds() {
+        let setup_started = std::time::Instant::now();
+        let prover = AggregatePublicationProver::deterministic_devnet_fast().unwrap();
+        let setup_elapsed = setup_started.elapsed();
+        for (bound, seed) in [(1_000_000u64, 0xc1u8), (100_000_000u64, 0xc2u8)] {
+            let step = bounded_discrete_log_step(bound).unwrap();
+            let plaintexts = std::array::from_fn(|index| {
+                [0, 1, step - 1, step, step + 1, bound - 1, bound][index % 7]
+            });
+            let aggregate = encrypted_plaintexts(&prover, plaintexts, seed);
+            let cold_started = std::time::Instant::now();
+            let (demand, supply) = prover
+                .decrypt_aggregate(aggregate, [1, 4, 7], bound)
+                .unwrap();
+            let cold_decrypt = cold_started.elapsed();
+            let request = AggregatePublicationRequest {
+                auction: [seed; 32],
+                accepted_order_count: 100,
+                participant_ids: [1, 4, 7],
+                aggregate,
+                demand,
+                supply,
+            };
+            let mut decrypt_times = Vec::new();
+            let mut prove_times = Vec::new();
+            let mut total_times = Vec::new();
+            for round in 0..5u8 {
+                let total_started = std::time::Instant::now();
+                let decrypt_started = std::time::Instant::now();
+                let (demand, supply) = prover
+                    .decrypt_aggregate(aggregate, [1, 4, 7], bound)
+                    .unwrap();
+                decrypt_times.push(decrypt_started.elapsed());
+                let mut round_request = request.clone();
+                round_request.demand = demand;
+                round_request.supply = supply;
+                let mut rng = ChaCha20Rng::from_seed([seed.wrapping_add(round); 32]);
+                let prove_started = std::time::Instant::now();
+                prover.prove(round_request, &mut rng).unwrap();
+                prove_times.push(prove_started.elapsed());
+                total_times.push(total_started.elapsed());
+            }
+            decrypt_times.sort();
+            prove_times.sort();
+            total_times.sort();
+            eprintln!(
+                "publication_bound={bound} step={step} setup_ms={:.3} cold_decrypt_ms={:.3} warm_decrypt_median_ms={:.3} warm_decrypt_p95_ms={:.3} prove_median_ms={:.3} prove_p95_ms={:.3} total_median_ms={:.3} total_p95_ms={:.3}",
+                setup_elapsed.as_secs_f64() * 1_000.0,
+                cold_decrypt.as_secs_f64() * 1_000.0,
+                decrypt_times[2].as_secs_f64() * 1_000.0,
+                decrypt_times[4].as_secs_f64() * 1_000.0,
+                prove_times[2].as_secs_f64() * 1_000.0,
+                prove_times[4].as_secs_f64() * 1_000.0,
+                total_times[2].as_secs_f64() * 1_000.0,
+                total_times[4].as_secs_f64() * 1_000.0,
+            );
+        }
     }
 }

@@ -71,7 +71,8 @@ if (( ! skip_contract )); then
     --sbf-out-dir "$project_root/target/deploy-v0"
   (
     cd "$project_root"
-    anchor idl build
+    mkdir -p target/idl
+    anchor idl build --out target/idl/beatex.json
   )
 fi
 
@@ -103,6 +104,7 @@ pnpm --dir "$project_root/packages/prover-wasm" build
 
 if (( ! skip_wasm )); then
   "$script_dir/build-trader-wasm.sh" "$project_root/target/generated/prover-assets"
+  "$script_dir/sync-web-prover-assets.sh" "$project_root/target/generated/prover-assets"
 fi
 
 if (( ! skip_web )); then

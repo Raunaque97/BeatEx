@@ -119,12 +119,33 @@ export function deriveVerificationKeyPda(
 
 export function deriveQueuedOrderPda(
   auction: Address,
-  sequence: bigint,
+  owner: Address,
+  clientOrderNonce: bigint,
   programAddress: Address = BEATEX_PROGRAM_ADDRESS,
 ): Promise<ProgramDerivedAddress> {
   return getProgramDerivedAddress({
     programAddress,
-    seeds: ["queued-order", addressEncoder.encode(auction), u64Bytes(sequence)],
+    seeds: [
+      "queued-order",
+      addressEncoder.encode(auction),
+      addressEncoder.encode(owner),
+      u64Bytes(clientOrderNonce),
+    ],
+  });
+}
+
+export function deriveRolloverOrderPda(
+  auction: Address,
+  owner: Address,
+  programAddress: Address = BEATEX_PROGRAM_ADDRESS,
+): Promise<ProgramDerivedAddress> {
+  return getProgramDerivedAddress({
+    programAddress,
+    seeds: [
+      "rollover-order",
+      addressEncoder.encode(auction),
+      addressEncoder.encode(owner),
+    ],
   });
 }
 

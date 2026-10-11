@@ -6,6 +6,7 @@ use {
     ark_groth16::Groth16,
     ark_snark::SNARK,
     beatex::{
+        AuctionResult, RecentClearing, RECENT_CLEARINGS,
         ActiveOrder, Auction, AuctionState, DleqProofInput, KeyEpoch, Market,
         PrivateWithdrawalArgs, QueueCircuitKind, QueueVerificationKey, QueuedOrder,
         QueuedOrderState, WithdrawalState,
@@ -363,6 +364,7 @@ fn exact_private_claim_executes_atomically_in_sbf() {
         paused: false,
         vault_authority_bump,
         bump: 0,
+        recent_clearings: [RecentClearing::default(); RECENT_CLEARINGS],
     };
     let key_epoch_state = KeyEpoch {
         authority: payer.pubkey(),

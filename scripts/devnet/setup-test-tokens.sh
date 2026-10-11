@@ -3,6 +3,7 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 project_root="$(cd "$script_dir/../.." && pwd)"
+source "$script_dir/load-rpc-env.sh"
 if [[ -d "$project_root/.devnet/tools/bin" ]]; then
   PATH="$project_root/.devnet/tools/bin:$PATH"
 fi
@@ -77,6 +78,13 @@ esac
 
 if [[ -z "$state_dir" ]]; then
   state_dir=".devnet/$cluster"
+fi
+if [[ "$state_dir" != /* ]]; then
+  state_dir="$project_root/$state_dir"
+fi
+beatex_load_rpc_env "$state_dir"
+if [[ "$cluster" == devnet ]]; then
+  rpc_url="${BEATEX_RPC_SESSION_URL:-${BEATEX_RPC_URL:-$rpc_url}}"
 fi
 
 if (( dry_run )); then

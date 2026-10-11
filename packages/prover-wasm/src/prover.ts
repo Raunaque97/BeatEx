@@ -44,7 +44,7 @@ export class WasmBeatExProver implements BeatExProver {
       ...(options.assetBaseUrl === undefined ? {} : { base: options.assetBaseUrl }),
     });
     const factory = options.workerFactory ?? defaultWorkerFactory(options.workerUrl);
-    this.#rpc = new WorkerRpc(factory());
+    this.#rpc = new WorkerRpc(factory(), options.workerStartupTimeoutMs);
   }
 
   async proveDeposit(
@@ -214,7 +214,7 @@ function defaultWorkerFactory(workerUrl?: string | URL): () => ProverWorker {
 
 function validateManifest(manifest: ProverAssetManifest): void {
   if (manifest.schemaVersion !== 1) throw new TypeError("Unsupported prover manifest schema version");
-  if (manifest.backend !== "beatex-arkworks-groth16-wasm-v1") {
+  if (manifest.backend !== "beatex-arkworks-groth16-wasm-v2") {
     throw new TypeError(`Unsupported prover backend ${manifest.backend}`);
   }
   if (manifest.provingKeyEncoding !== "arkworks-canonical-uncompressed-v1") {
@@ -223,8 +223,15 @@ function validateManifest(manifest: ProverAssetManifest): void {
   validateAssetDescriptor(manifest.runtime, "manifest.runtime");
   for (const circuit of ["balance", "order", "release", "settlement"] as const) {
     const descriptor = manifest.circuits[circuit];
-    if (descriptor.circuitVersion !== 1) {
-      throw new TypeError(`manifest.circuits.${circuit}.circuitVersion must be 1`);
+    const supported =
+      (circuit === "balance" && descriptor.circuitVersion === 1) ||
+      (circuit === "order" && [2, 3].includes(descriptor.circuitVersion)) ||
+      (circuit === "release" && descriptor.circuitVersion === 2) ||
+      (circuit === "settlement" && descriptor.circuitVersion === 3);
+    if (!supported) {
+      throw new TypeError(
+        `manifest.circuits.${circuit}.circuitVersion ${descriptor.circuitVersion} is unsupported`,
+      );
     }
     validateAssetDescriptor(descriptor.provingKey, `manifest.circuits.${circuit}.provingKey`);
   }

@@ -1,7 +1,9 @@
 use {
     beatex_babyjubjub_groth16_spike::{
         deposit::DepositProver, release::CollateralReleaseProver, rollover::RolloverProver,
-        transition::OrderProver,
+        transition::OrderProver, BALANCE_DEPOSIT_CIRCUIT_VERSION,
+        DEVNET_FAST_ORDER_CIRCUIT_VERSION, ORDER_MODIFICATION_CIRCUIT_VERSION,
+        ROLLOVER_SETTLEMENT_CIRCUIT_VERSION,
     },
     serde::Serialize,
     sha2::{Digest, Sha256},
@@ -57,9 +59,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let specs = [
         "balance-v1.pk",
-        "order-v2.pk",
+        "order-v3.pk",
         "release-v2.pk",
-        "settlement-v2.pk",
+        "settlement-v3.pk",
     ];
     for file in specs {
         reject_existing(&output_dir.join(file))?;
@@ -72,9 +74,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let artifacts = [
         DepositProver::deterministic_devnet()?.to_uncompressed_bytes()?,
-        OrderProver::deterministic_devnet()?.to_uncompressed_bytes()?,
+        OrderProver::deterministic_devnet_fast()?.to_uncompressed_bytes()?,
         CollateralReleaseProver::deterministic_devnet()?.to_uncompressed_bytes()?,
-        RolloverProver::deterministic_devnet()?.to_uncompressed_bytes()?,
+        RolloverProver::deterministic_devnet_fast()?.to_uncompressed_bytes()?,
     ];
     let mut descriptors = Vec::with_capacity(specs.len());
     for (file, bytes) in specs.into_iter().zip(artifacts) {
@@ -101,19 +103,19 @@ fn main() -> Result<(), Box<dyn Error>> {
         },
         circuits: CircuitEntries {
             balance: CircuitEntry {
-                circuit_version: 1,
+                circuit_version: BALANCE_DEPOSIT_CIRCUIT_VERSION,
                 proving_key: balance,
             },
             order: CircuitEntry {
-                circuit_version: 2,
+                circuit_version: DEVNET_FAST_ORDER_CIRCUIT_VERSION,
                 proving_key: order,
             },
             release: CircuitEntry {
-                circuit_version: 2,
+                circuit_version: ORDER_MODIFICATION_CIRCUIT_VERSION,
                 proving_key: release,
             },
             settlement: CircuitEntry {
-                circuit_version: 2,
+                circuit_version: ROLLOVER_SETTLEMENT_CIRCUIT_VERSION,
                 proving_key: settlement,
             },
         },

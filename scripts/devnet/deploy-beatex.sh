@@ -3,6 +3,7 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 project_root="$(cd "$script_dir/../.." && pwd)"
+source "$script_dir/load-rpc-env.sh"
 
 cluster='localnet'
 wallet=''
@@ -92,6 +93,10 @@ if [[ -z "$state_dir" ]]; then
 elif [[ "$state_dir" != /* ]]; then
   state_dir="$project_root/$state_dir"
 fi
+beatex_load_rpc_env "$state_dir"
+if [[ "$cluster" == devnet ]]; then
+  rpc_url="${BEATEX_RPC_SESSION_URL:-${BEATEX_RPC_URL:-$rpc_url}}"
+fi
 if [[ ! -f "$program_keypair" ]]; then
   printf 'Program keypair does not exist: %s\n' "$program_keypair" >&2
   exit 2
@@ -133,7 +138,7 @@ if [[ -z "$declared_id" || "$declared_id" != "$localnet_id" || "$declared_id" !=
 fi
 
 program_status=''
-if program_status="$(solana program show "$program_key_id" --url "$rpc_url" 2>&1)"; then
+if program_status="$(solana program show "$program_key_id" --url "$rpc_url" --keypair "$wallet" 2>&1)"; then
   printf 'BeatEx program %s is already deployed on %s.\n' "$program_key_id" "$cluster"
   if (( ! allow_redeploy )); then
     if [[ ! -t 0 ]]; then

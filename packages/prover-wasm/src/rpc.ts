@@ -15,14 +15,34 @@ interface PendingRequest {
   readonly removeAbort?: () => void;
 }
 
+/** How long a new worker may take to evaluate its script and announce readiness. */
+export const DEFAULT_WORKER_STARTUP_TIMEOUT_MS = 30_000;
+
 export class WorkerRpc {
   readonly #worker: ProverWorker;
   readonly #pending = new Map<number, PendingRequest>();
+  /**
+   * Settles when the worker posts `ready`. Bundlers may evaluate a worker's entry
+   * asynchronously, so a message posted before then could arrive before its listener.
+   */
+  readonly #ready: Promise<void>;
+  #markReady!: () => void;
+  #failStartup!: (error: Error) => void;
+  #startupTimer: ReturnType<typeof setTimeout> | undefined;
   #nextId = 1;
   #disposed = false;
 
-  constructor(worker: ProverWorker) {
+  constructor(worker: ProverWorker, startupTimeoutMs = DEFAULT_WORKER_STARTUP_TIMEOUT_MS) {
     this.#worker = worker;
+    this.#ready = new Promise<void>((resolve, reject) => {
+      this.#markReady = resolve;
+      this.#failStartup = reject;
+    });
+    // Rejections are delivered through each request; never leave this one unhandled.
+    this.#ready.catch(() => undefined);
+    this.#startupTimer = setTimeout(() => {
+      this.#failStartup(new ProverWorkerError("The prover worker did not start"));
+    }, startupTimeoutMs);
     worker.addEventListener("message", this.#onMessage);
     worker.addEventListener("error", this.#onWorkerError);
   }
@@ -53,17 +73,24 @@ export class WorkerRpc {
       this.#pending.set(id, pending);
       options?.signal?.addEventListener?.("abort", onAbort, { once: true });
 
-      try {
-        this.#worker.postMessage(createMessage(id), transfer);
-      } catch (error) {
-        this.#finish(id)?.reject(error);
-      }
+      this.#ready.then(
+        () => {
+          if (!this.#pending.has(id)) return;
+          try {
+            this.#worker.postMessage(createMessage(id), transfer);
+          } catch (error) {
+            this.#finish(id)?.reject(error);
+          }
+        },
+        (error: unknown) => this.#finish(id)?.reject(error),
+      );
     });
   }
 
   dispose(): void {
     if (this.#disposed) return;
     this.#disposed = true;
+    clearTimeout(this.#startupTimer);
     this.#worker.postMessage({ type: "dispose" } satisfies MainToWorkerMessage);
     this.#worker.terminate();
     this.#worker.removeEventListener("message", this.#onMessage);
@@ -73,6 +100,11 @@ export class WorkerRpc {
   }
 
   readonly #onMessage = (event: WorkerMessageEventLike): void => {
+    if (isReadyMessage(event.data)) {
+      clearTimeout(this.#startupTimer);
+      this.#markReady();
+      return;
+    }
     if (!isWorkerResponse(event.data)) return;
     const message = event.data;
     const pending = this.#pending.get(message.id);
@@ -98,6 +130,8 @@ export class WorkerRpc {
     const error = new ProverWorkerError(event.message ?? "The prover worker crashed", {
       ...(event.error === undefined ? {} : { cause: event.error }),
     });
+    clearTimeout(this.#startupTimer);
+    this.#failStartup(error);
     for (const id of [...this.#pending.keys()]) this.#finish(id)?.reject(error);
   };
 
@@ -108,6 +142,10 @@ export class WorkerRpc {
     pending.removeAbort?.();
     return pending;
   }
+}
+
+function isReadyMessage(value: unknown): boolean {
+  return typeof value === "object" && value !== null && "type" in value && value.type === "ready";
 }
 
 function isWorkerResponse(value: unknown): value is WorkerToMainMessage {

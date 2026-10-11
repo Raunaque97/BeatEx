@@ -1,10 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+project_root="$(cd "$script_dir/../.." && pwd)"
+source "$script_dir/load-rpc-env.sh"
+npm_cache="${NPM_CONFIG_CACHE:-$project_root/.devnet/npm-cache}"
+mkdir -p "$npm_cache"
+export NPM_CONFIG_CACHE="$npm_cache"
+
 program_id=''
 idl_file=''
 wallet=''
 rpc_url=''
+state_dir='.devnet/devnet'
 allow_update=0
 
 usage() {
@@ -17,6 +25,7 @@ Options:
   --program-id <ADDRESS>  Deployed Solana program address
   --idl <FILE>            Anchor IDL JSON file
   --wallet <KEYPAIR>      Program authority and transaction fee payer
+  --state-dir <DIRECTORY> RPC environment directory (default: .devnet/devnet)
   --rpc-url <URL>         Localnet or Devnet RPC URL
   --allow-update          Authorize publication without an interactive prompt
   -h, --help              Show this help
@@ -43,6 +52,10 @@ while (( $# > 0 )); do
       ;;
     --rpc-url)
       rpc_url="${2:?--rpc-url requires a value}"
+      shift 2
+      ;;
+    --state-dir)
+      state_dir="${2:?--state-dir requires a value}"
       shift 2
       ;;
     --allow-update)
@@ -73,10 +86,23 @@ if [[ -z "$wallet" || ! -f "$wallet" ]]; then
   printf 'A valid --wallet keypair is required: %s\n' "$wallet" >&2
   exit 2
 fi
+if [[ "$state_dir" != /* ]]; then
+  state_dir="$project_root/$state_dir"
+fi
+beatex_load_rpc_env "$state_dir"
+if [[ "$rpc_url" == 'https://api.devnet.solana.com' ]]; then
+  rpc_url="${BEATEX_RPC_SESSION_URL:-${BEATEX_RPC_URL:-$rpc_url}}"
+fi
 case "$rpc_url" in
-  http://127.0.0.1:8899|http://localhost:8899|https://api.devnet.solana.com) ;;
+  http://*|https://*) ;;
   *)
-    printf 'Unsupported RPC URL %q; only localnet and Devnet are allowed.\n' "$rpc_url" >&2
+    printf 'Unsupported RPC URL %q; expected an http(s) URL.\n' "$rpc_url" >&2
+    exit 2
+    ;;
+esac
+case "$rpc_url" in
+  *[Mm][Aa][Ii][Nn][Nn][Ee][Tt]*|*[Mm][Aa][Ii][Nn][Nn][Ee][Tt]-[Bb][Ee][Tt][Aa]*)
+    printf 'Mainnet RPC URLs are not allowed: %q\n' "$rpc_url" >&2
     exit 2
     ;;
 esac
@@ -175,7 +201,6 @@ fi
 npx --yes @solana-program/program-metadata@latest write idl \
   "$program_id" "$idl_file" \
   --keypair "$wallet" \
-  --payer "$wallet" \
   --rpc "$rpc_url"
 
 printf 'Published canonical IDL metadata for %s from %s.\n' \

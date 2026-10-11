@@ -124,14 +124,34 @@ They discover the slot-derived auction and derive its 17-level price grid from
 the snapshotted reference price and basis-point step
 before constructing a curve:
 
+Run one maker per terminal. The source is explicit so each process has its own
+wallet and retry loop:
+
 ```sh
-scripts/devnet/run-market-makers.sh
+scripts/devnet/run-market-maker.sh --source pyth
+scripts/devnet/run-market-maker.sh --source binance
 ```
 
-If no current Auction account exists, a process may submit the permissionless
-initialization instruction and then re-read the created account. A locally
-fetched Pyth or Binance price influences a maker's desired quantities only; it
-never replaces the Auction account's price levels.
+Paid RPC credentials stay outside tracked source. Copy
+`scripts/devnet/rpc.env.example` to `.devnet/devnet/rpc.env`, set
+`BEATEX_RPC_SESSION_URL` to the Helius Devnet endpoint, and put the Alchemy
+Devnet endpoint first in `BEATEX_RPC_FALLBACK_URLS` (with the public Devnet
+endpoint optional as a final fallback). Each long-running bot keeps stateful
+reads and transaction submissions on its primary endpoint, then fails over in
+the configured order for a transport failure or HTTP 429. A
+deterministic simulation/program error is returned immediately and is never
+replayed against another provider. The primary and every fallback must target
+the same Solana cluster. Endpoint diagnostics redact Helius query keys and
+Alchemy path keys.
+
+The Rust bot prints the maker's private ledger balance every ten auctions by
+default. Change that cadence with `--balance-every-auctions N`, or use
+`--print-only --once` to inspect one generated intent without submitting it.
+
+The committee bot initializes each Auction account. Market makers wait for that
+account and never submit initialization transactions. A locally fetched Pyth
+or Binance price influences a maker's desired quantities only; it never
+replaces the Auction account's price levels.
 
 The reference oracle is Pyth's sponsored BTC/USD shard-zero price-feed
 account, which is available on Solana Devnet:
@@ -251,15 +271,27 @@ v1-capable current validator for the complete large-transaction flow.
 configures the Token-2022 custody vaults, transfers their ownership to the vault PDA,
 initializes the market and committee, and installs every verifier key. The
 ignored `.devnet/devnet/market.tsv` manifest records all resulting addresses.
+The Devnet market uses a 40-slot order-collection interval (approximately ten
+seconds under normal Devnet slot timing). Auction N-1 is folded, decrypted, and
+published while auction N collects orders, so auction N+1 can be centered on
+N-1's clearing price; publication takes about four seconds, which a 20-slot
+window could not fit alongside the traders' 12-slot preparation lead.
 It also regenerates `target/idl/beatex.json` with `anchor idl build` and
 publishes it with `@solana-program/program-metadata`. The
 publication helper fetches the canonical IDL first, skips semantically
 identical JSON, and asks before replacing a different or unconfirmed value.
 Use `--skip-idl` to omit publication or `--allow-idl-update` only for an
 explicitly approved unattended update.
-`scripts/devnet/run-market-makers.sh` uses the stateful proof/sign/send adapter
-by default; `--print-only` keeps the strategy inspection mode. The same adapter
-provides `fold`, `publish`, and `cancel` commands plus `settle-balance`,
+`scripts/devnet/run-market-maker.sh` uses the stateful proof/sign/send adapter
+by default; `--print-only` keeps the strategy inspection mode. The separate
+`scripts/devnet/run-committee-bot.sh` is a permissionless coordinator: it
+observes the temporal schedule without allocating empty auction accounts,
+folds queued orders, and publishes aggregate curves when the gates permit it.
+Its scheduler reads the overlapping pipeline in one batched RPC snapshot and
+launches concurrent workers only for auctions requiring a fold, publication,
+or cancellation, so proof work does not block later auction boundaries.
+The same adapter provides `fold`,
+`publish`, and `cancel` commands plus `settle-balance`,
 `refund-balance`, and `withdraw` for the default lifecycle. The older `claim`
 and `refund` commands retain the optional confidential Token-2022 exit. Its
 rollover path sends one version-1 transaction with
@@ -268,6 +300,14 @@ settlement-statement binding, order-proof verification, order-statement
 binding, and the final state mutation. The preparation and binding handlers use
 the instructions sysvar to authenticate the complete atomic chain; no reusable
 proof receipt or partial rollover state is stored.
+
+`scripts/devnet/run-indexer.sh` runs the auction-history indexer. It follows
+the program's event-authority PDA, decodes the auction outcome events, stores
+them under `.devnet/<cluster>/indexer`, and serves
+`GET /v1/markets/<market>/auctions?limit=60` on `127.0.0.1:8787` by default.
+Settled and cancelled auction accounts are compacted on chain, so the web
+chart reads finished batches from this API (`NEXT_PUBLIC_BEATEX_INDEXER_URL`)
+and only in-flight batches from chain.
 
 ## Legacy version-1 settlement checkpoint
 

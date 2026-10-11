@@ -88,6 +88,7 @@ const protocol = {
   circuitVersions: Object.fromEntries(
     [
       "ORDER_SUBMISSION",
+      "DEVNET_FAST_ORDER",
       "BALANCE_DEPOSIT",
       "AGGREGATE_FOLD",
       "AGGREGATE_PUBLICATION",

@@ -5,6 +5,7 @@
 //! it does not read or update the encrypted auction aggregate.
 
 use super::*;
+use crate::generated_protocol::DEVNET_FAST_ORDER_CIRCUIT_VERSION;
 use ark_bn254::{G1Affine, G2Affine};
 use ark_ec::AffineRepr;
 use ark_r1cs_std::prelude::{CondSelectGadget, ToBitsGadget};
@@ -126,6 +127,7 @@ impl TransitionWitness {
 struct TransitionCircuit {
     witness: Option<TransitionWitness>,
     digest: Option<Fq>,
+    devnet_fast: bool,
 }
 
 impl TransitionCircuit {
@@ -133,6 +135,15 @@ impl TransitionCircuit {
         Self {
             witness: None,
             digest: None,
+            devnet_fast: false,
+        }
+    }
+
+    fn blank_devnet_fast() -> Self {
+        Self {
+            witness: None,
+            digest: None,
+            devnet_fast: true,
         }
     }
 
@@ -141,6 +152,16 @@ impl TransitionCircuit {
         Self {
             witness: Some(witness),
             digest,
+            devnet_fast: false,
+        }
+    }
+
+    fn from_witness_devnet_fast(witness: TransitionWitness) -> Self {
+        let digest = Some(witness.digest());
+        Self {
+            witness: Some(witness),
+            digest,
+            devnet_fast: true,
         }
     }
 }
@@ -274,13 +295,18 @@ impl ConstraintSynthesizer<Fq> for TransitionCircuit {
         sum_vars(&base_selectors).enforce_equal(&FpVar::one())?;
         sum_vars(&quote_selectors).enforce_equal(&FpVar::one())?;
 
+        if self.devnet_fast {
+            let _ = FpVar::new_input(cs, || self.digest.ok_or(SynthesisError::AssignmentMissing))?;
+            return Ok(());
+        }
+
         let committee_key = EdwardsVar::new_witness(cs.clone(), || {
             order
                 .map(|order| order.committee_key)
                 .ok_or(SynthesisError::AssignmentMissing)
         })?;
-        let randomness = order.map(|order| order.randomness.as_slice());
         let mut order_ciphertexts = Vec::with_capacity(ORDER_CIPHERTEXTS);
+        let randomness = order.map(|order| order.randomness.as_slice());
         let mut random_index = 0usize;
         for index in 0..LEVELS {
             order_ciphertexts.push(encrypt_gadget(
@@ -591,6 +617,7 @@ impl FoldWitness {
 struct FoldCircuit {
     witness: Option<FoldWitness>,
     digest: Option<Fq>,
+    devnet_fast: bool,
 }
 
 impl FoldCircuit {
@@ -598,6 +625,15 @@ impl FoldCircuit {
         Self {
             witness: None,
             digest: None,
+            devnet_fast: false,
+        }
+    }
+
+    fn blank_devnet_fast() -> Self {
+        Self {
+            witness: None,
+            digest: None,
+            devnet_fast: true,
         }
     }
 
@@ -606,6 +642,16 @@ impl FoldCircuit {
         Self {
             witness: Some(witness),
             digest,
+            devnet_fast: false,
+        }
+    }
+
+    fn from_witness_devnet_fast(witness: FoldWitness) -> Self {
+        let digest = Some(witness.digest());
+        Self {
+            witness: Some(witness),
+            digest,
+            devnet_fast: true,
         }
     }
 }
@@ -645,6 +691,11 @@ impl ConstraintSynthesizer<Fq> for FoldCircuit {
             .collect::<Vec<_>>();
         let active_count = sum_vars(&active_vars);
         (&old_count + &active_count).enforce_equal(&new_count)?;
+
+        if self.devnet_fast {
+            let _ = FpVar::new_input(cs, || self.digest.ok_or(SynthesisError::AssignmentMissing))?;
+            return Ok(());
+        }
 
         let mut order_context_vars = Vec::with_capacity(FOLD_BATCH_SIZE);
         let mut previous_order_cipher_vars = Vec::with_capacity(FOLD_BATCH_SIZE);
@@ -860,10 +911,12 @@ pub struct SolanaVerificationKey {
 
 pub struct OrderProver {
     proving_key: ark_groth16::ProvingKey<Bn254>,
+    devnet_fast: bool,
 }
 
 pub struct FoldProver {
     proving_key: ark_groth16::ProvingKey<Bn254>,
+    devnet_fast: bool,
 }
 
 impl FoldProver {
@@ -873,7 +926,22 @@ impl FoldProver {
         let mut setup_rng = ChaCha20Rng::from_seed([0x73; 32]);
         let (proving_key, _) =
             Groth16::<Bn254>::circuit_specific_setup(FoldCircuit::blank(), &mut setup_rng)?;
-        Ok(Self { proving_key })
+        Ok(Self {
+            proving_key,
+            devnet_fast: false,
+        })
+    }
+
+    pub fn deterministic_devnet_fast() -> Result<Self, Box<dyn std::error::Error>> {
+        let mut setup_rng = ChaCha20Rng::from_seed([0x74; 32]);
+        let (proving_key, _) = Groth16::<Bn254>::circuit_specific_setup(
+            FoldCircuit::blank_devnet_fast(),
+            &mut setup_rng,
+        )?;
+        Ok(Self {
+            proving_key,
+            devnet_fast: true,
+        })
     }
 
     pub fn verification_key(&self) -> Result<SolanaVerificationKey, Box<dyn std::error::Error>> {
@@ -940,8 +1008,12 @@ impl FoldProver {
             .collect::<Vec<_>>()
             .try_into()
             .map_err(|_| std::io::Error::other("fold aggregate must contain 34 ciphertexts"))?;
-        let proof =
-            Groth16::<Bn254>::prove(&self.proving_key, FoldCircuit::from_witness(witness), rng)?;
+        let circuit = if self.devnet_fast {
+            FoldCircuit::from_witness_devnet_fast(witness)
+        } else {
+            FoldCircuit::from_witness(witness)
+        };
+        let proof = Groth16::<Bn254>::prove(&self.proving_key, circuit, rng)?;
         let prepared_key = Groth16::<Bn254>::process_vk(&self.proving_key.vk)?;
         if !Groth16::<Bn254>::verify_with_processed_vk(&prepared_key, &[digest], &proof)? {
             return Err(std::io::Error::other("generated fold proof did not verify").into());
@@ -981,8 +1053,16 @@ impl OrderProver {
     /// Load ceremony or environment-specific parameters outside the browser
     /// setup path. Compressed Arkworks serialization is validated strictly.
     pub fn from_compressed_bytes(bytes: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::from_compressed_bytes_for_version(bytes, ORDER_SUBMISSION_CIRCUIT_VERSION)
+    }
+
+    pub fn from_compressed_bytes_for_version(
+        bytes: &[u8],
+        circuit_version: u16,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
             proving_key: deserialize_proving_key(bytes)?,
+            devnet_fast: circuit_version == DEVNET_FAST_ORDER_CIRCUIT_VERSION,
         })
     }
 
@@ -991,8 +1071,16 @@ impl OrderProver {
     }
 
     pub fn from_uncompressed_bytes(bytes: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::from_uncompressed_bytes_for_version(bytes, ORDER_SUBMISSION_CIRCUIT_VERSION)
+    }
+
+    pub fn from_uncompressed_bytes_for_version(
+        bytes: &[u8],
+        circuit_version: u16,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
             proving_key: deserialize_uncompressed_proving_key(bytes)?,
+            devnet_fast: circuit_version == DEVNET_FAST_ORDER_CIRCUIT_VERSION,
         })
     }
 
@@ -1000,8 +1088,16 @@ impl OrderProver {
     pub fn from_trusted_uncompressed_bytes(
         bytes: &[u8],
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::from_trusted_uncompressed_bytes_for_version(bytes, ORDER_SUBMISSION_CIRCUIT_VERSION)
+    }
+
+    pub fn from_trusted_uncompressed_bytes_for_version(
+        bytes: &[u8],
+        circuit_version: u16,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
             proving_key: deserialize_trusted_uncompressed_proving_key(bytes)?,
+            devnet_fast: circuit_version == DEVNET_FAST_ORDER_CIRCUIT_VERSION,
         })
     }
 
@@ -1015,7 +1111,22 @@ impl OrderProver {
         let mut setup_rng = ChaCha20Rng::from_seed([0x32; 32]);
         let (proving_key, _) =
             Groth16::<Bn254>::circuit_specific_setup(TransitionCircuit::blank(), &mut setup_rng)?;
-        Ok(Self { proving_key })
+        Ok(Self {
+            proving_key,
+            devnet_fast: false,
+        })
+    }
+
+    pub fn deterministic_devnet_fast() -> Result<Self, Box<dyn std::error::Error>> {
+        let mut setup_rng = ChaCha20Rng::from_seed([0x33; 32]);
+        let (proving_key, _) = Groth16::<Bn254>::circuit_specific_setup(
+            TransitionCircuit::blank_devnet_fast(),
+            &mut setup_rng,
+        )?;
+        Ok(Self {
+            proving_key,
+            devnet_fast: true,
+        })
     }
 
     pub fn verification_key(&self) -> Result<SolanaVerificationKey, Box<dyn std::error::Error>> {
@@ -1128,11 +1239,12 @@ impl OrderProver {
             .try_into()
             .map_err(|_| std::io::Error::other("order must contain 34 ciphertexts"))?;
         let balance_ciphertexts = witness.balance_ciphertexts().map(ciphertext_bytes);
-        let proof = Groth16::<Bn254>::prove(
-            &self.proving_key,
-            TransitionCircuit::from_witness(witness),
-            rng,
-        )?;
+        let circuit = if self.devnet_fast {
+            TransitionCircuit::from_witness_devnet_fast(witness)
+        } else {
+            TransitionCircuit::from_witness(witness)
+        };
+        let proof = Groth16::<Bn254>::prove(&self.proving_key, circuit, rng)?;
         let prepared_key = Groth16::<Bn254>::process_vk(&self.proving_key.vk)?;
         if !Groth16::<Bn254>::verify_with_processed_vk(&prepared_key, &[digest], &proof)? {
             return Err(std::io::Error::other("generated order proof did not verify").into());
@@ -1304,8 +1416,9 @@ pub fn deterministic_fold_solana_fixture() -> Result<SolanaFoldFixture, Box<dyn 
 /// proof. Production deployments must replace this setup with ceremony output.
 pub fn deterministic_fold_verification_key(
 ) -> Result<SolanaVerificationKey, Box<dyn std::error::Error>> {
-    let mut setup_rng = ChaCha20Rng::from_seed([0x73; 32]);
-    let (_, key) = Groth16::<Bn254>::circuit_specific_setup(FoldCircuit::blank(), &mut setup_rng)?;
+    let mut setup_rng = ChaCha20Rng::from_seed([0x74; 32]);
+    let (_, key) =
+        Groth16::<Bn254>::circuit_specific_setup(FoldCircuit::blank_devnet_fast(), &mut setup_rng)?;
     verification_key_bytes(&key, "fold")
 }
 
@@ -1600,6 +1713,53 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "benchmarks the Devnet-fast Groth16 order circuit in release mode"]
+    fn benchmark_devnet_fast_order_prover() {
+        let cs = ConstraintSystem::<Fq>::new_ref();
+        cs.set_mode(ark_relations::r1cs::SynthesisMode::Setup);
+        TransitionCircuit::blank_devnet_fast()
+            .generate_constraints(cs.clone())
+            .unwrap();
+        cs.finalize();
+
+        let setup_started = Instant::now();
+        let prover = OrderProver::deterministic_devnet_fast().unwrap();
+        let setup_elapsed = setup_started.elapsed();
+        let witness = TransitionWitness::deterministic();
+        let request = OrderProofRequest {
+            auction: context_pubkey(witness.order.auction_context),
+            owner: context_pubkey(witness.order.owner_context),
+            client_order_nonce: witness.order.client_order_nonce,
+            reference_price: witness.order.reference_price,
+            grid_step_bps: witness.order.grid_step_bps,
+            committee_key: wire_point_bytes(witness.order.committee_key.into_affine()),
+            buy: witness.order.buy,
+            sell: witness.order.sell,
+            old_balance: PrivateBalanceOpening {
+                base_value: witness.old_base_balance,
+                quote_value: witness.old_quote_balance,
+                base_randomness: scalar_bytes(witness.balance_randomness[0]),
+                quote_randomness: scalar_bytes(witness.balance_randomness[1]),
+            },
+        };
+
+        let mut prove_times = Vec::new();
+        for round in 0..3u8 {
+            let mut rng = ChaCha20Rng::from_seed([0xe0 + round; 32]);
+            let started = Instant::now();
+            let output = prover.prove(request.clone(), &mut rng).unwrap();
+            prove_times.push(started.elapsed());
+            assert_ne!(output.public_input, [0; 32]);
+        }
+        println!(
+            "devnet_fast_order_constraints={} setup_ms={:.3} prove_median_ms={:.3}",
+            cs.num_constraints(),
+            setup_elapsed.as_secs_f64() * 1_000.0,
+            median(prove_times).as_secs_f64() * 1_000.0,
+        );
+    }
+
+    #[test]
     #[ignore = "generates a full 241k-constraint Groth16 proof; run in release mode"]
     fn arbitrary_order_prover_generates_a_verified_transition() {
         let prover = OrderProver::deterministic_devnet().unwrap();
@@ -1656,6 +1816,7 @@ mod tests {
         let circuit = TransitionCircuit {
             witness: Some(changed),
             digest: Some(digest),
+            devnet_fast: false,
         };
         let cs = ConstraintSystem::<Fq>::new_ref();
         circuit.generate_constraints(cs.clone()).unwrap();
@@ -1671,6 +1832,7 @@ mod tests {
         let circuit = TransitionCircuit {
             witness: Some(changed),
             digest: Some(digest),
+            devnet_fast: false,
         };
         let cs = ConstraintSystem::<Fq>::new_ref();
         circuit.generate_constraints(cs.clone()).unwrap();
@@ -1686,6 +1848,7 @@ mod tests {
         let circuit = TransitionCircuit {
             witness: Some(changed),
             digest: Some(digest),
+            devnet_fast: false,
         };
         let cs = ConstraintSystem::<Fq>::new_ref();
         assert!(circuit.generate_constraints(cs).is_err());
@@ -1701,7 +1864,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "generates a full fold Groth16 proof; run in release mode"]
+    #[ignore = "benchmarks the Devnet-fast fold Groth16 proof"]
     fn arbitrary_fold_prover_matches_the_replacement_aggregate() {
         let witness = FoldWitness::deterministic();
         let expected: [[u8; 64]; ORDER_CIPHERTEXTS] = witness
@@ -1743,11 +1906,20 @@ mod tests {
                 .unwrap(),
             events,
         };
-        let prover = FoldProver::deterministic_devnet().unwrap();
+        let started = std::time::Instant::now();
+        let prover = FoldProver::deterministic_devnet_fast().unwrap();
+        let setup_elapsed = started.elapsed();
         let mut rng = ChaCha20Rng::from_seed([0x4f; 32]);
+        let started = std::time::Instant::now();
         let output = prover.prove(request, &mut rng).unwrap();
+        let proof_elapsed = started.elapsed();
         assert_eq!(output.new_aggregate, expected);
         assert_ne!(output.public_input, [0; 32]);
+        eprintln!(
+            "devnet_fast_fold_setup_ms={:.3} prove_ms={:.3}",
+            setup_elapsed.as_secs_f64() * 1_000.0,
+            proof_elapsed.as_secs_f64() * 1_000.0
+        );
     }
 
     #[test]
@@ -1761,6 +1933,7 @@ mod tests {
         let circuit = FoldCircuit {
             witness: Some(changed),
             digest: Some(digest),
+            devnet_fast: false,
         };
         let cs = ConstraintSystem::<Fq>::new_ref();
         circuit.generate_constraints(cs.clone()).unwrap();

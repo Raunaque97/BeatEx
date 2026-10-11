@@ -18,21 +18,22 @@ pub const ELGAMAL_CIPHERTEXT_BYTES: usize = 64;
 /// Digest size used to bind ciphertext account data to Groth16 public inputs.
 pub const QUEUE_DIGEST_BYTES: usize = 32;
 pub const ORDER_SUBMISSION_CIRCUIT_VERSION: u16 = 2;
+pub const DEVNET_FAST_ORDER_CIRCUIT_VERSION: u16 = 3;
 pub const BALANCE_DEPOSIT_CIRCUIT_VERSION: u16 = 1;
-pub const AGGREGATE_FOLD_CIRCUIT_VERSION: u16 = 2;
+pub const AGGREGATE_FOLD_CIRCUIT_VERSION: u16 = 3;
 pub const ORDER_MODIFICATION_CIRCUIT_VERSION: u16 = 2;
-pub const ROLLOVER_SETTLEMENT_CIRCUIT_VERSION: u16 = 2;
+pub const ROLLOVER_SETTLEMENT_CIRCUIT_VERSION: u16 = 3;
 pub const PRIVATE_ORDER_QUANTITY_BITS: u32 = 28;
 pub const MAX_PRIVATE_ORDER_QUANTITY: u64 = (1_u64 << PRIVATE_ORDER_QUANTITY_BITS) - 1;
 /// Version 2 replaces per-entry threshold interpolation with one
 /// transcript-randomized batch equation while preserving full curve output.
-pub const AGGREGATE_PUBLICATION_CIRCUIT_VERSION: u16 = 2;
+pub const AGGREGATE_PUBLICATION_CIRCUIT_VERSION: u16 = 3;
 /// First private-claim circuit version. Its arithmetic and transcript are
 /// intentionally versioned independently from order submission.
-pub const PRIVATE_CLAIM_CIRCUIT_VERSION: u16 = 2;
+pub const PRIVATE_CLAIM_CIRCUIT_VERSION: u16 = 3;
 /// First cancellation-refund circuit version. A distinct proof kind prevents
 /// a refund proof from being replayed through the settled-auction claim path.
-pub const CANCELLATION_REFUND_CIRCUIT_VERSION: u16 = 2;
+pub const CANCELLATION_REFUND_CIRCUIT_VERSION: u16 = 3;
 
 pub type EncryptedValue = [u8; ELGAMAL_CIPHERTEXT_BYTES];
 pub type EncryptedOrder = [EncryptedValue; QUEUED_CIPHERTEXT_COUNT];
@@ -102,6 +103,10 @@ pub const fn circuit_version(kind: QueueCircuitKind) -> u16 {
         QueueCircuitKind::OrderSubmission => ORDER_SUBMISSION_CIRCUIT_VERSION,
         QueueCircuitKind::BalanceDeposit => BALANCE_DEPOSIT_CIRCUIT_VERSION,
     }
+}
+
+pub const fn valid_order_circuit_version(version: u16) -> bool {
+    version == ORDER_SUBMISSION_CIRCUIT_VERSION || version == DEVNET_FAST_ORDER_CIRCUIT_VERSION
 }
 
 /// Authority-installed circuit-specific Groth16 verification key. The PDA
@@ -261,7 +266,19 @@ pub struct ActiveOrder {
     pub bump: u8,
 }
 
+/// Accepted events awaiting a fold, held in a fixed ring of this many slots.
+/// A slot is reused only after a fold consumes its event, so a submission is
+/// rejected while this many events are still unfolded.
+pub const PENDING_EVENT_CAPACITY: usize = 64;
+
 /// Lightweight shared state written by accepted order submissions.
+///
+/// The account is allocated with [`SUBMISSION_COUNTER_SPACE`] bytes: the
+/// serialized fields are followed by a raw ring of [`PENDING_EVENT_CAPACITY`]
+/// event addresses. Slot `sequence % PENDING_EVENT_CAPACITY` holds each
+/// accepted event until it is folded, so fold bots read the queue from this
+/// one account instead of scanning program accounts. The ring stays outside
+/// the struct so deserializing the counter never copies it onto the SBF stack.
 #[account]
 #[derive(InitSpace)]
 pub struct SubmissionCounter {
@@ -269,6 +286,75 @@ pub struct SubmissionCounter {
     pub auction: Pubkey,
     pub accepted_order_count: u64,
     pub bump: u8,
+}
+
+/// Byte offset of the pending-event ring within a submission counter account.
+pub const PENDING_EVENTS_OFFSET: usize = 8 + SubmissionCounter::INIT_SPACE;
+/// Total allocated size of a submission counter account.
+pub const SUBMISSION_COUNTER_SPACE: usize = PENDING_EVENTS_OFFSET + PENDING_EVENT_CAPACITY * 32;
+
+/// The ring slot an accepted event's sequence maps to.
+pub fn pending_slot(sequence: u64) -> usize {
+    (sequence % PENDING_EVENT_CAPACITY as u64) as usize
+}
+
+fn pending_slot_range(
+    data_len: usize,
+    sequence: u64,
+) -> QueueInvariantResult<core::ops::Range<usize>> {
+    let start = PENDING_EVENTS_OFFSET + pending_slot(sequence) * 32;
+    if data_len < SUBMISSION_COUNTER_SPACE {
+        return Err(QueueInvariantError::MissingPendingRing);
+    }
+    Ok(start..start + 32)
+}
+
+/// The event recorded for `sequence`, or `Pubkey::default()` once folded.
+pub fn pending_event(counter_data: &[u8], sequence: u64) -> QueueInvariantResult<Pubkey> {
+    let range = pending_slot_range(counter_data.len(), sequence)?;
+    Ok(Pubkey::new_from_array(
+        counter_data[range]
+            .try_into()
+            .map_err(|_| QueueInvariantError::MissingPendingRing)?,
+    ))
+}
+
+/// Record the event accepted at `sequence` in its ring slot.
+pub fn record_pending_event(
+    counter_data: &mut [u8],
+    sequence: u64,
+    event: Pubkey,
+) -> QueueInvariantResult<()> {
+    if pending_event(counter_data, sequence)? != Pubkey::default() {
+        return Err(QueueInvariantError::PendingQueueFull);
+    }
+    let range = pending_slot_range(counter_data.len(), sequence)?;
+    counter_data[range].copy_from_slice(event.as_ref());
+    Ok(())
+}
+
+/// Consume the events a fold starting at `folded_order_count` covers. They
+/// must be exactly the next pending events in sequence order; nothing changes
+/// unless the whole batch matches.
+pub fn take_pending_events(
+    counter_data: &mut [u8],
+    folded_order_count: u64,
+    events: &[Pubkey],
+) -> QueueInvariantResult<()> {
+    let mut ranges = Vec::with_capacity(events.len());
+    for (offset, event) in (0u64..).zip(events) {
+        let sequence = folded_order_count
+            .checked_add(offset)
+            .ok_or(QueueInvariantError::CountOverflow)?;
+        if *event == Pubkey::default() || pending_event(counter_data, sequence)? != *event {
+            return Err(QueueInvariantError::FoldOutOfOrder);
+        }
+        ranges.push(pending_slot_range(counter_data.len(), sequence)?);
+    }
+    for range in ranges {
+        counter_data[range].fill(0);
+    }
+    Ok(())
 }
 
 /// The single encrypted aggregate advanced by permissionless fold transactions.
@@ -322,6 +408,9 @@ pub enum QueueInvariantError {
     CollectionStillOpen,
     AggregationIncomplete,
     AggregationAlreadyComplete,
+    PendingQueueFull,
+    FoldOutOfOrder,
+    MissingPendingRing,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -570,6 +659,40 @@ mod tests {
             circuit_version(QueueCircuitKind::RolloverSettlement),
             ROLLOVER_SETTLEMENT_CIRCUIT_VERSION
         );
+        assert_eq!(
+            circuit_version(QueueCircuitKind::AggregatePublication),
+            AGGREGATE_PUBLICATION_CIRCUIT_VERSION
+        );
+        assert_eq!(
+            circuit_version(QueueCircuitKind::BalanceDeposit),
+            BALANCE_DEPOSIT_CIRCUIT_VERSION
+        );
+    }
+
+    #[test]
+    fn order_submission_accepts_production_and_devnet_fast_versions_only() {
+        assert!(valid_order_circuit_version(
+            ORDER_SUBMISSION_CIRCUIT_VERSION
+        ));
+        assert!(valid_order_circuit_version(
+            DEVNET_FAST_ORDER_CIRCUIT_VERSION
+        ));
+
+        for version in [0, 1, 4, u16::MAX] {
+            assert!(
+                !valid_order_circuit_version(version),
+                "unexpected order version {version}"
+            );
+        }
+
+        assert_eq!(
+            circuit_version(QueueCircuitKind::OrderSubmission),
+            ORDER_SUBMISSION_CIRCUIT_VERSION
+        );
+        assert_eq!(
+            circuit_version(QueueCircuitKind::AggregateFold),
+            AGGREGATE_FOLD_CIRCUIT_VERSION
+        );
     }
 
     #[test]
@@ -755,7 +878,10 @@ mod tests {
             release: release.clone(),
             replacement: submit.clone(),
         };
-        let cancellation = CancelActiveOrderArgs { release };
+        let cancellation = CancelActiveOrderArgs {
+            client_order_nonce: 1,
+            release,
+        };
         let rollover = RolloverOrderArgs {
             settlement: RolloverSettlementArgs {
                 terminal_nullifier: [1; 32],
@@ -808,7 +934,7 @@ mod tests {
         assert_eq!(submit_bytes.len(), 2_636);
         assert_eq!(fold_bytes.len(), 2_468);
         assert_eq!(replacement_bytes.len(), 3_052);
-        assert_eq!(cancellation_bytes.len(), 416);
+        assert_eq!(cancellation_bytes.len(), 424);
         assert_eq!(rollover_bytes.len(), 2_508);
         assert_eq!(rollover_verification_bytes.len(), 321);
         assert_eq!(settlement_binding_bytes.len(), 192);
@@ -824,5 +950,67 @@ mod tests {
         assert!(fold_bytes.len() < 3_000);
         assert!(replacement_bytes.len() < 3_200);
         assert!(rollover_instruction_data < 3_500);
+    }
+
+    fn empty_counter() -> Vec<u8> {
+        vec![0; SUBMISSION_COUNTER_SPACE]
+    }
+
+    #[test]
+    fn pending_ring_rejects_submissions_past_unfolded_capacity() {
+        let mut counter = empty_counter();
+        let events: Vec<Pubkey> = (0..=PENDING_EVENT_CAPACITY)
+            .map(|_| Pubkey::new_unique())
+            .collect();
+        for (sequence, event) in (0u64..).zip(&events[..PENDING_EVENT_CAPACITY]) {
+            record_pending_event(&mut counter, sequence, *event).unwrap();
+        }
+        let next = PENDING_EVENT_CAPACITY as u64;
+        assert_eq!(
+            record_pending_event(&mut counter, next, events[PENDING_EVENT_CAPACITY]),
+            Err(QueueInvariantError::PendingQueueFull)
+        );
+        // Folding the oldest event frees exactly its slot for the next sequence.
+        take_pending_events(&mut counter, 0, &events[..1]).unwrap();
+        record_pending_event(&mut counter, next, events[PENDING_EVENT_CAPACITY]).unwrap();
+        assert_eq!(
+            pending_event(&counter, next).unwrap(),
+            events[PENDING_EVENT_CAPACITY]
+        );
+    }
+
+    #[test]
+    fn folds_consume_pending_events_in_sequence_order() {
+        let mut counter = empty_counter();
+        let events = [
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        ];
+        for (sequence, event) in (0u64..).zip(&events) {
+            record_pending_event(&mut counter, sequence, *event).unwrap();
+        }
+        for bad_batch in [&[events[1]][..], &[events[0], events[0]][..]] {
+            assert_eq!(
+                take_pending_events(&mut counter, 0, bad_batch),
+                Err(QueueInvariantError::FoldOutOfOrder)
+            );
+        }
+        assert_eq!(
+            take_pending_events(&mut counter, 3, &[Pubkey::default()]),
+            Err(QueueInvariantError::FoldOutOfOrder)
+        );
+        take_pending_events(&mut counter, 0, &events[..2]).unwrap();
+        assert_eq!(pending_event(&counter, 0).unwrap(), Pubkey::default());
+        assert_eq!(pending_event(&counter, 2).unwrap(), events[2]);
+    }
+
+    #[test]
+    fn counters_without_a_ring_are_rejected() {
+        let mut short = vec![0; PENDING_EVENTS_OFFSET];
+        assert_eq!(
+            record_pending_event(&mut short, 0, Pubkey::new_unique()),
+            Err(QueueInvariantError::MissingPendingRing)
+        );
     }
 }

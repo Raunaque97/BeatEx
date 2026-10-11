@@ -140,6 +140,7 @@ impl RolloverSettlementWitness {
 pub struct RolloverSettlementCircuit {
     pub witness: Option<RolloverSettlementWitness>,
     pub digest: Option<Fq>,
+    devnet_fast: bool,
 }
 
 impl RolloverSettlementCircuit {
@@ -147,6 +148,15 @@ impl RolloverSettlementCircuit {
         Self {
             witness: None,
             digest: None,
+            devnet_fast: false,
+        }
+    }
+
+    pub const fn blank_devnet_fast() -> Self {
+        Self {
+            witness: None,
+            digest: None,
+            devnet_fast: true,
         }
     }
 
@@ -155,6 +165,18 @@ impl RolloverSettlementCircuit {
         Ok(Self {
             witness: Some(witness),
             digest,
+            devnet_fast: false,
+        })
+    }
+
+    pub fn from_witness_devnet_fast(
+        witness: RolloverSettlementWitness,
+    ) -> Result<Self, SynthesisError> {
+        let digest = Some(witness.digest()?);
+        Ok(Self {
+            witness: Some(witness),
+            digest,
+            devnet_fast: true,
         })
     }
 }
@@ -209,8 +231,10 @@ impl ConstraintSynthesizer<Fq> for RolloverSettlementCircuit {
             16,
         )?;
         allocation_version.enforce_equal(&FpVar::constant(Fq::from(2u64)))?;
-        order_version.enforce_equal(&FpVar::constant(Fq::from(2u64)))?;
-        claim_version.enforce_equal(&FpVar::constant(Fq::from(2u64)))?;
+        let order_v2 = &order_version - FpVar::constant(Fq::from(2u64));
+        let order_v3 = &order_version - FpVar::constant(Fq::from(3u64));
+        (&order_v2 * &order_v3).enforce_equal(&FpVar::zero())?;
+        claim_version.enforce_equal(&FpVar::constant(Fq::from(3u64)))?;
 
         let mut buy = Vec::with_capacity(LEVELS);
         let mut sell = Vec::with_capacity(LEVELS);
@@ -357,6 +381,11 @@ impl ConstraintSynthesizer<Fq> for RolloverSettlementCircuit {
             alloc_uint(cs.clone(), credited_quote_value, BALANCE_BITS)?;
         (&old_base + &base_payout).enforce_equal(&credited_base)?;
         (&old_quote + &quote_payout).enforce_equal(&credited_quote)?;
+
+        if self.devnet_fast {
+            let _ = FpVar::new_input(cs, || self.digest.ok_or(SynthesisError::AssignmentMissing))?;
+            return Ok(());
+        }
 
         let committee_key = EdwardsVar::new_witness(cs.clone(), || {
             witness
@@ -516,14 +545,23 @@ pub struct RolloverProofOutput {
 
 pub struct RolloverProver {
     proving_key: ProvingKey<Bn254>,
+    devnet_fast: bool,
 }
 
 impl RolloverProver {
     /// Load ceremony or environment-specific parameters outside the browser
     /// setup path. Compressed Arkworks serialization is validated strictly.
     pub fn from_compressed_bytes(bytes: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::from_compressed_bytes_for_version(bytes, 2)
+    }
+
+    pub fn from_compressed_bytes_for_version(
+        bytes: &[u8],
+        circuit_version: u16,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
             proving_key: deserialize_proving_key(bytes)?,
+            devnet_fast: circuit_version == 3,
         })
     }
 
@@ -532,8 +570,16 @@ impl RolloverProver {
     }
 
     pub fn from_uncompressed_bytes(bytes: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::from_uncompressed_bytes_for_version(bytes, 2)
+    }
+
+    pub fn from_uncompressed_bytes_for_version(
+        bytes: &[u8],
+        circuit_version: u16,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
             proving_key: deserialize_uncompressed_proving_key(bytes)?,
+            devnet_fast: circuit_version == 3,
         })
     }
 
@@ -541,8 +587,16 @@ impl RolloverProver {
     pub fn from_trusted_uncompressed_bytes(
         bytes: &[u8],
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::from_trusted_uncompressed_bytes_for_version(bytes, 2)
+    }
+
+    pub fn from_trusted_uncompressed_bytes_for_version(
+        bytes: &[u8],
+        circuit_version: u16,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
             proving_key: deserialize_trusted_uncompressed_proving_key(bytes)?,
+            devnet_fast: circuit_version == 3,
         })
     }
 
@@ -556,6 +610,15 @@ impl RolloverProver {
         let mut setup_rng = ChaCha20Rng::from_seed([0xf1; 32]);
         Ok(Self {
             proving_key: setup(&mut setup_rng)?,
+            devnet_fast: false,
+        })
+    }
+
+    pub fn deterministic_devnet_fast() -> Result<Self, Box<dyn std::error::Error>> {
+        let mut setup_rng = ChaCha20Rng::from_seed([0xf3; 32]);
+        Ok(Self {
+            proving_key: setup_devnet_fast(&mut setup_rng)?,
+            devnet_fast: true,
         })
     }
 
@@ -650,11 +713,12 @@ impl RolloverProver {
             .balance_ciphertexts()
             .map_err(|_| std::io::Error::other("invalid rollover balances"))?
             .map(ciphertext_bytes);
-        let proof = Groth16::<Bn254>::prove(
-            &self.proving_key,
-            RolloverSettlementCircuit::from_witness(witness)?,
-            rng,
-        )?;
+        let circuit = if self.devnet_fast {
+            RolloverSettlementCircuit::from_witness_devnet_fast(witness)?
+        } else {
+            RolloverSettlementCircuit::from_witness(witness)?
+        };
+        let proof = Groth16::<Bn254>::prove(&self.proving_key, circuit, rng)?;
         let prepared_key = Groth16::<Bn254>::process_vk(&self.proving_key.vk)?;
         if !Groth16::<Bn254>::verify_with_processed_vk(&prepared_key, &[digest], &proof)? {
             return Err(std::io::Error::other("generated rollover proof did not verify").into());
@@ -693,8 +757,8 @@ pub struct MarketMakerRolloverProofOutput {
 impl MarketMakerRolloverProver {
     pub fn deterministic_devnet() -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
-            rollover: RolloverProver::deterministic_devnet()?,
-            order: OrderProver::deterministic_devnet()?,
+            rollover: RolloverProver::deterministic_devnet_fast()?,
+            order: OrderProver::deterministic_devnet_fast()?,
         })
     }
 
@@ -739,6 +803,16 @@ pub fn setup<R: RngCore + CryptoRng>(
 ) -> Result<ProvingKey<Bn254>, Box<dyn std::error::Error>> {
     let (proving_key, _) =
         Groth16::<Bn254>::circuit_specific_setup(RolloverSettlementCircuit::blank(), rng)?;
+    Ok(proving_key)
+}
+
+pub fn setup_devnet_fast<R: RngCore + CryptoRng>(
+    rng: &mut R,
+) -> Result<ProvingKey<Bn254>, Box<dyn std::error::Error>> {
+    let (proving_key, _) = Groth16::<Bn254>::circuit_specific_setup(
+        RolloverSettlementCircuit::blank_devnet_fast(),
+        rng,
+    )?;
     Ok(proving_key)
 }
 
@@ -916,6 +990,7 @@ mod tests {
         RolloverSettlementCircuit {
             witness: Some(changed),
             digest: Some(original_digest),
+            devnet_fast: false,
         }
         .generate_constraints(cs.clone())
         .unwrap();
@@ -947,6 +1022,45 @@ mod tests {
             "rollover constraints={constraints}, setup_ms={}, recurring_proof_ms={}",
             setup_elapsed.as_millis(),
             proof_elapsed.as_millis()
+        );
+    }
+
+    #[test]
+    #[ignore = "benchmarks the Devnet-fast rollover circuit in release mode"]
+    fn benchmark_devnet_fast_rollover_prover() {
+        let witness = RolloverSettlementWitness::deterministic();
+        let cs = ConstraintSystem::<Fq>::new_ref();
+        RolloverSettlementCircuit::from_witness_devnet_fast(witness.clone())
+            .unwrap()
+            .generate_constraints(cs.clone())
+            .unwrap();
+        assert!(cs.is_satisfied().unwrap());
+        let constraints = cs.num_constraints();
+
+        let mut setup_rng = ChaCha20Rng::from_seed([0xf3; 32]);
+        let setup_started = Instant::now();
+        let proving_key = setup_devnet_fast(&mut setup_rng).unwrap();
+        let setup_elapsed = setup_started.elapsed();
+        let prepared_key = Groth16::<Bn254>::process_vk(&proving_key.vk).unwrap();
+        let mut timings = Vec::with_capacity(5);
+        for seed in 0..5 {
+            let witness = RolloverSettlementWitness::deterministic();
+            let digest = witness.digest().unwrap();
+            let circuit = RolloverSettlementCircuit::from_witness_devnet_fast(witness).unwrap();
+            let mut proof_rng = ChaCha20Rng::from_seed([0xf4 + seed; 32]);
+            let started = Instant::now();
+            let proof = Groth16::<Bn254>::prove(&proving_key, circuit, &mut proof_rng).unwrap();
+            timings.push(started.elapsed());
+            assert!(
+                Groth16::<Bn254>::verify_with_processed_vk(&prepared_key, &[digest], &proof)
+                    .unwrap()
+            );
+        }
+        timings.sort_unstable();
+        eprintln!(
+            "devnet_fast_rollover_constraints={constraints} setup_ms={:.3} prove_median_ms={:.3}",
+            setup_elapsed.as_secs_f64() * 1_000.0,
+            timings[timings.len() / 2].as_secs_f64() * 1_000.0
         );
     }
 }

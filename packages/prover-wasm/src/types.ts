@@ -74,6 +74,8 @@ export interface WasmBeatExProverOptions {
   readonly workerFactory?: ProverWorkerFactory;
   /** Override only when hosting a separately bundled copy of the package worker. */
   readonly workerUrl?: string | URL;
+  /** Reject requests if the worker has not announced readiness within this time. */
+  readonly workerStartupTimeoutMs?: number;
 }
 
 export interface WorkerInitializeRequest {

@@ -6,10 +6,11 @@ use {
         AccountSerialize, InstructionData,
     },
     beatex::{
-        ActiveOrder, Auction, AuctionState, ConfidentialTransferArgs, DepositCollateralArgs,
-        DleqProofInput, EncryptedPrivateBalance, Groth16ProofInput, KeyEpoch, Market, Order,
-        OrderState, PrivateWithdrawalArgs, QueueCircuitKind, QueueVerificationKey, QueuedOrder,
-        QueuedOrderState, WithdrawPublicBalanceArgs, WithdrawalState,
+        ActiveOrder, Auction, AuctionResult, AuctionState, ConfidentialTransferArgs,
+        DepositCollateralArgs, DleqProofInput, EncryptedPrivateBalance, Groth16ProofInput,
+        KeyEpoch, Market, Order, OrderState, PrivateWithdrawalArgs, QueueCircuitKind,
+        QueueVerificationKey, QueuedOrder, QueuedOrderState, RecentClearing,
+        WithdrawPublicBalanceArgs, WithdrawalState, RECENT_CLEARINGS,
     },
     beatex_babyjubjub_groth16_spike::{
         deposit::{DepositProofRequest, DepositProver, PublicWithdrawalProofRequest},
@@ -210,6 +211,7 @@ fn fixture_market(
         paused: false,
         vault_authority_bump,
         bump: 0,
+        recent_clearings: [RecentClearing::default(); RECENT_CLEARINGS],
     };
     let proof = DleqProofInput {
         commitment_1: [0; 32],

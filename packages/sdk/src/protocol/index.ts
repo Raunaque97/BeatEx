@@ -3,4 +3,5 @@ export * from "./bytes.js";
 export * from "./constants.js";
 export * from "./generated.js";
 export * from "./instructions.js";
+export * from "./oracle.js";
 export * from "./pdas.js";

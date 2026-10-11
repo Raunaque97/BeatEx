@@ -3,14 +3,16 @@
 use {
     anchor_lang::{
         prelude::{Clock, Pubkey},
-        AccountDeserialize, AccountSerialize, InstructionData, Space,
+        AccountDeserialize, AccountSerialize, AnchorDeserialize, InstructionData, Space,
     },
     beatex::{
-        queue_hash, ActiveOrder, AggregateAccumulator, Auction, AuctionState, DecryptionShareInput,
-        DleqProofInput, EncryptedPrivateBalance, FoldQueuedOrdersArgs, Groth16ProofInput, KeyEpoch,
-        Market, PublishAggregateCurvesArgs, QueueCircuitKind, QueueVerificationKey, QueuedOrder,
-        QueuedOrderState, ReleaseOrderCollateralArgs, SubmissionCounter, SubmitQueuedOrderArgs,
-        VerifyThresholdDecryptionArgs, WithdrawalState, COMMITTEE_SIZE,
+        queue::{pending_event, record_pending_event, SUBMISSION_COUNTER_SPACE},
+        queue_hash, ActiveOrder, AggregateAccumulator, Auction, AuctionResult, AuctionState,
+        DecryptionShareInput, DleqProofInput, EncryptedPrivateBalance, FoldQueuedOrdersArgs,
+        Groth16ProofInput, KeyEpoch, Market, PublishAggregateCurvesArgs, QueueCircuitKind,
+        QueueVerificationKey, QueuedOrder, QueuedOrderState, RecentClearing,
+        ReleaseOrderCollateralArgs, SubmissionCounter, SubmitQueuedOrderArgs,
+        VerifyThresholdDecryptionArgs, WithdrawalState, COMMITTEE_SIZE, RECENT_CLEARINGS,
     },
     beatex_threshold_crypto::{
         create_decryption_share, dealer_setup_3_of_7, DecryptionProofContext,
@@ -96,6 +98,40 @@ fn put_owned_anchor_account<T: AccountSerialize>(
         },
     )
     .unwrap();
+}
+
+/// Write a submission counter with its pending-event ring, as `initialize_auction` allocates it.
+fn put_submission_counter(
+    svm: &mut LiteSVM,
+    address: Pubkey,
+    counter: &SubmissionCounter,
+    pending: &[(u64, Pubkey)],
+) {
+    let mut data = Vec::new();
+    counter.try_serialize(&mut data).unwrap();
+    data.resize(SUBMISSION_COUNTER_SPACE, 0);
+    for (sequence, event) in pending {
+        record_pending_event(&mut data, *sequence, *event).unwrap();
+    }
+    svm.set_account(
+        address,
+        Account {
+            lamports: 1_000_000_000,
+            data,
+            owner: beatex::ID,
+            ..Account::default()
+        },
+    )
+    .unwrap();
+}
+
+fn event_authority() -> Pubkey {
+    Pubkey::find_program_address(&[b"__event_authority"], &beatex::ID).0
+}
+
+fn account_is_closed(svm: &LiteSVM, address: &Pubkey) -> bool {
+    svm.get_account(address)
+        .is_none_or(|account| account.lamports == 0 && account.data.is_empty())
 }
 
 fn deserialize_account<T: AccountDeserialize>(svm: &LiteSVM, address: &Pubkey) -> T {
@@ -803,6 +839,7 @@ fn temporal_auction_initialization_and_timeout_are_permissionless() {
         paused: false,
         vault_authority_bump: 0,
         bump: 0,
+        recent_clearings: [RecentClearing::default(); RECENT_CLEARINGS],
     };
     let key_epoch_state = KeyEpoch {
         authority: market_authority,
@@ -900,8 +937,11 @@ fn temporal_auction_initialization_and_timeout_are_permissionless() {
         accounts: vec![
             AccountMeta::new_readonly(market, false),
             AccountMeta::new(auction, false),
-            AccountMeta::new_readonly(counter, false),
-            AccountMeta::new_readonly(accumulator, false),
+            AccountMeta::new(counter, false),
+            AccountMeta::new(accumulator, false),
+            AccountMeta::new(market_authority, false),
+            AccountMeta::new_readonly(event_authority(), false),
+            AccountMeta::new_readonly(beatex::ID, false),
         ],
         data: beatex::instruction::CancelPendingAuction {}.data(),
     };
@@ -910,9 +950,26 @@ fn temporal_auction_initialization_and_timeout_are_permissionless() {
         Message::new(&[cancel], Some(&relayer.pubkey())),
         svm.latest_blockhash(),
     );
-    svm.send_transaction(transaction).unwrap();
-    let cancelled: Auction = deserialize_account(&svm, &auction);
+    let authority_before = svm.get_balance(&market_authority).unwrap_or(0);
+    let cancel_metadata = svm.send_transaction(transaction).unwrap();
+    // The cancellation event is a self-CPI an indexer can decode.
+    let event = cancel_metadata.inner_instructions[0]
+        .iter()
+        .map(|inner| &inner.instruction.data)
+        .find(|data| data.starts_with(anchor_lang::event::EVENT_IX_TAG_LE))
+        .expect("cancellation emits an event");
+    let event = beatex::AuctionCancelled::try_from_slice(event[16..].as_ref()).unwrap();
+    assert_eq!(event.market, market);
+    // Cancellation compacts the auction and reclaims its queue accounts.
+    let cancelled: AuctionResult = deserialize_account(&svm, &auction);
     assert_eq!(cancelled.state, AuctionState::Cancelled);
+    assert_eq!(
+        svm.get_account(&auction).unwrap().data.len(),
+        8 + AuctionResult::INIT_SPACE
+    );
+    assert!(account_is_closed(&svm, &counter));
+    assert!(account_is_closed(&svm, &accumulator));
+    assert!(svm.get_balance(&market_authority).unwrap_or(0) > authority_before);
 }
 
 #[test]
@@ -978,6 +1035,7 @@ fn cancelled_order_refund_to_balance_executes_inside_sbf() {
         paused: false,
         vault_authority_bump: 0,
         bump: 0,
+        recent_clearings: [RecentClearing::default(); RECENT_CLEARINGS],
     };
     let auction_state = Auction {
         version: beatex::state::PROTOCOL_VERSION,
@@ -1086,7 +1144,11 @@ fn cancelled_order_refund_to_balance_executes_inside_sbf() {
         bump: 0,
     };
     put_anchor_account(&mut svm, market, &market_state);
-    put_anchor_account(&mut svm, auction, &auction_state);
+    put_anchor_account(
+        &mut svm,
+        auction,
+        &AuctionResult::from_auction(&auction_state),
+    );
     put_anchor_account(&mut svm, key_epoch, &key_epoch_state);
     put_anchor_account(&mut svm, private_balance, &balance_state);
     put_anchor_account(&mut svm, previous_event, &previous_event_state);
@@ -1132,11 +1194,10 @@ fn cancelled_order_refund_to_balance_executes_inside_sbf() {
         svm.latest_blockhash(),
     );
     let metadata = svm.send_transaction(transaction).unwrap();
-    let refunded: QueuedOrder = deserialize_account(&svm, &previous_event);
-    let active: ActiveOrder = deserialize_account(&svm, &active_order);
     let balance: EncryptedPrivateBalance = deserialize_account(&svm, &private_balance);
-    assert_eq!(refunded.withdrawal_state, WithdrawalState::Refunded);
-    assert!(!active.active);
+    // The refunded order is terminal, so both accounts are closed.
+    assert!(account_is_closed(&svm, &previous_event));
+    assert!(account_is_closed(&svm, &active_order));
     assert_eq!(balance.encrypted_base, fixture.balance_ciphertexts[2]);
     assert_eq!(balance.encrypted_quote, fixture.balance_ciphertexts[3]);
     eprintln!(
@@ -1203,6 +1264,7 @@ fn queued_order_and_replacement_aware_fold_execute_inside_sbf() {
         paused: false,
         vault_authority_bump: 0,
         bump: 0,
+        recent_clearings: [RecentClearing::default(); RECENT_CLEARINGS],
     };
     let auction_state = Auction {
         version: beatex::state::PROTOCOL_VERSION,
@@ -1272,7 +1334,7 @@ fn queued_order_and_replacement_aware_fold_execute_inside_sbf() {
     let counter_state = SubmissionCounter {
         version: beatex::state::PROTOCOL_VERSION,
         auction,
-        accepted_order_count: 0,
+        accepted_order_count: 7,
         bump: 0,
     };
     let balance_state = EncryptedPrivateBalance {
@@ -1292,11 +1354,16 @@ fn queued_order_and_replacement_aware_fold_execute_inside_sbf() {
     put_anchor_account(&mut svm, auction, &auction_state);
     put_anchor_account(&mut svm, key_epoch, &key_epoch_state);
     put_anchor_account(&mut svm, order_vk, &order_vk_state);
-    put_anchor_account(&mut svm, counter, &counter_state);
+    put_submission_counter(&mut svm, counter, &counter_state, &[]);
     put_anchor_account(&mut svm, private_balance, &balance_state);
 
     let (order, _) = Pubkey::find_program_address(
-        &[b"queued-order", auction.as_ref(), &0_u64.to_le_bytes()],
+        &[
+            b"queued-order",
+            auction.as_ref(),
+            owner.pubkey().as_ref(),
+            &order_fixture.client_order_nonce.to_le_bytes(),
+        ],
         &beatex::ID,
     );
     let (active_order, _) = Pubkey::find_program_address(
@@ -1351,11 +1418,14 @@ fn queued_order_and_replacement_aware_fold_execute_inside_sbf() {
     let active: ActiveOrder = deserialize_account(&svm, &active_order);
     let balance: EncryptedPrivateBalance = deserialize_account(&svm, &private_balance);
     assert_eq!(submitted.state, QueuedOrderState::Accepted);
+    assert_eq!(submitted.sequence, 7);
     assert_eq!(active.latest_event, order);
     assert_eq!(balance.encrypted_base, order_fixture.new_base);
+    let submitted_counter: SubmissionCounter = deserialize_account(&svm, &counter);
+    assert_eq!(submitted_counter.accepted_order_count, 8);
     assert_eq!(
-        deserialize_account::<SubmissionCounter>(&svm, &counter).accepted_order_count,
-        1
+        pending_event(&svm.get_account(&counter).unwrap().data, 7).unwrap(),
+        order
     );
     eprintln!(
         "17-level queued-order submission consumed {} CU",
@@ -1377,6 +1447,15 @@ fn queued_order_and_replacement_aware_fold_execute_inside_sbf() {
     fold_auction_state.open_slot = 90;
     fold_auction_state.submission_end_slot = 150;
     fold_auction_state.aggregation_deadline_slot = 200;
+    let fold_pending_events: Vec<(u64, Pubkey)> = (0u64..)
+        .zip(&fold_fixture.order_keys[..3])
+        .map(|(offset, key)| {
+            (
+                fold_fixture.old_folded_count + offset,
+                Pubkey::new_from_array(*key),
+            )
+        })
+        .collect();
     let fold_counter_state = SubmissionCounter {
         version: beatex::state::PROTOCOL_VERSION,
         auction: fold_auction,
@@ -1406,7 +1485,12 @@ fn queued_order_and_replacement_aware_fold_execute_inside_sbf() {
     };
     put_anchor_account(&mut svm, fold_market, &fold_market_state);
     put_anchor_account(&mut svm, fold_auction, &fold_auction_state);
-    put_anchor_account(&mut svm, fold_counter, &fold_counter_state);
+    put_submission_counter(
+        &mut svm,
+        fold_counter,
+        &fold_counter_state,
+        &fold_pending_events,
+    );
     put_anchor_account(&mut svm, fold_accumulator, &fold_accumulator_state);
     put_anchor_account(&mut svm, fold_vk, &fold_vk_state);
     for (index, order_address) in fold_fixture.order_keys.iter().enumerate().take(3) {
@@ -1435,7 +1519,7 @@ fn queued_order_and_replacement_aware_fold_execute_inside_sbf() {
         AccountMeta::new_readonly(owner.pubkey(), true),
         AccountMeta::new_readonly(fold_market, false),
         AccountMeta::new_readonly(fold_auction, false),
-        AccountMeta::new_readonly(fold_counter, false),
+        AccountMeta::new(fold_counter, false),
         AccountMeta::new(fold_accumulator, false),
         AccountMeta::new_readonly(fold_vk, false),
     ];
@@ -1482,6 +1566,13 @@ fn queued_order_and_replacement_aware_fold_execute_inside_sbf() {
     for key in &fold_fixture.order_keys[..3] {
         let order: QueuedOrder = deserialize_account(&svm, &Pubkey::new_from_array(*key));
         assert_eq!(order.state, QueuedOrderState::Folded);
+    }
+    let fold_counter_after = svm.get_account(&fold_counter).unwrap().data;
+    for (sequence, _) in &fold_pending_events {
+        assert_eq!(
+            pending_event(&fold_counter_after, *sequence).unwrap(),
+            Pubkey::default()
+        );
     }
     eprintln!(
         "replacement-aware three-order fold consumed {} CU",
@@ -1544,6 +1635,7 @@ fn aggregate_publication_proof_executes_inside_sbf() {
         paused: false,
         vault_authority_bump: 0,
         bump: 0,
+        recent_clearings: [RecentClearing::default(); RECENT_CLEARINGS],
     };
     let auction_state = Auction {
         version: beatex::state::PROTOCOL_VERSION,
@@ -1555,7 +1647,8 @@ fn aggregate_publication_proof_executes_inside_sbf() {
         submission_end_slot: current_slot.saturating_sub(20),
         aggregation_deadline_slot: current_slot.saturating_sub(10),
         decryption_deadline_slot: current_slot + 100,
-        reference_price: 100,
+        // Large enough that 1 bps grid steps give distinct price levels.
+        reference_price: 1_000_000,
         reference_from_oracle: false,
         oracle_publish_time: 0,
         grid_step_bps: 1,
@@ -1570,7 +1663,7 @@ fn aggregate_publication_proof_executes_inside_sbf() {
         decrypted_supply: [0; 17],
         decrypted_entry_bitmap: 0,
         clearing_index: 8,
-        clearing_price: 100,
+        clearing_price: 1_000_000,
         clearing_volume: 0,
         base_residual: 0,
         quote_residual: 0,
@@ -1628,7 +1721,7 @@ fn aggregate_publication_proof_executes_inside_sbf() {
     put_anchor_account(&mut svm, market, &market_state);
     put_anchor_account(&mut svm, auction, &auction_state);
     put_anchor_account(&mut svm, key_epoch, &key_epoch_state);
-    put_anchor_account(&mut svm, counter, &counter_state);
+    put_submission_counter(&mut svm, counter, &counter_state, &[]);
     put_anchor_account(&mut svm, accumulator, &accumulator_state);
     put_anchor_account(&mut svm, verification_key, &vk_state);
 
@@ -1638,9 +1731,12 @@ fn aggregate_publication_proof_executes_inside_sbf() {
             AccountMeta::new(market, false),
             AccountMeta::new(auction, false),
             AccountMeta::new_readonly(key_epoch, false),
-            AccountMeta::new_readonly(counter, false),
-            AccountMeta::new_readonly(accumulator, false),
+            AccountMeta::new(counter, false),
+            AccountMeta::new(accumulator, false),
             AccountMeta::new_readonly(verification_key, false),
+            AccountMeta::new(payer.pubkey(), false),
+            AccountMeta::new_readonly(event_authority(), false),
+            AccountMeta::new_readonly(beatex::ID, false),
         ],
         data: beatex::instruction::PublishAndClear {
             args: PublishAggregateCurvesArgs {
@@ -1669,13 +1765,213 @@ fn aggregate_publication_proof_executes_inside_sbf() {
         svm.latest_blockhash(),
     );
     let metadata = svm.send_transaction(transaction).unwrap();
-    let published: Auction = deserialize_account(&svm, &auction);
+    let published: AuctionResult = deserialize_account(&svm, &auction);
     assert_eq!(published.state, AuctionState::Settled);
-    assert_eq!(published.decrypted_demand, fixture.demand);
-    assert_eq!(published.decrypted_supply, fixture.supply);
+    let clearing = usize::from(published.clearing_index);
+    assert_eq!(published.demand_at_clearing, fixture.demand[clearing]);
+    assert_eq!(published.supply_at_clearing, fixture.supply[clearing]);
     assert!(published.clearing_price > 0);
+    assert!(account_is_closed(&svm, &counter));
+    assert!(account_is_closed(&svm, &accumulator));
+    let market_after: Market = deserialize_account(&svm, &market);
+    assert_eq!(
+        market_after.recent_clearings[0].clearing_price,
+        published.clearing_price
+    );
+    let event = metadata.inner_instructions[1]
+        .iter()
+        .map(|inner| &inner.instruction.data)
+        .find(|data| data.starts_with(anchor_lang::event::EVENT_IX_TAG_LE))
+        .expect("publication emits an event");
+    let event = beatex::AuctionCleared::try_from_slice(&event[16..]).unwrap();
+    assert_eq!(event.clearing_price, published.clearing_price);
+    assert_eq!(event.demand, fixture.demand);
+    assert_eq!(event.supply, fixture.supply);
     eprintln!(
         "aggregate publication proof consumed {} CU",
         metadata.compute_units_consumed
     );
+}
+
+#[test]
+#[ignore = "requires an SBF v0 build"]
+fn order_events_close_once_the_auction_stops_folding() {
+    let mut svm = svm_with_program();
+    let payer = Keypair::new();
+    let owner = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 10_000_000_000).unwrap();
+    svm.airdrop(&owner.pubkey(), 1_000_000).unwrap();
+
+    let market = Pubkey::new_unique();
+    let auction = Pubkey::new_unique();
+    let (active_order, _) = Pubkey::find_program_address(
+        &[b"active-order", auction.as_ref(), owner.pubkey().as_ref()],
+        &beatex::ID,
+    );
+    let superseded = Pubkey::new_unique();
+    let latest = Pubkey::new_unique();
+    let foreign = Pubkey::new_unique();
+    let market_state = Market {
+        version: beatex::state::PROTOCOL_VERSION,
+        authority: payer.pubkey(),
+        base_mint: Pubkey::new_unique(),
+        quote_mint: Pubkey::new_unique(),
+        base_vault: Pubkey::new_unique(),
+        quote_vault: Pubkey::new_unique(),
+        base_unit_size: 100,
+        quote_unit_size: 1,
+        grid_step_bps: 10,
+        grid_radius: 8,
+        max_order_quantity: 15,
+        max_aggregate_quantity: 10_000,
+        current_key_epoch: Pubkey::new_unique(),
+        market_start_slot: 0,
+        last_clearing_price: 100,
+        last_clearing_volume: 0,
+        last_cleared_auction_sequence: 0,
+        minimum_reference_volume: 1,
+        oracle_price_account: Pubkey::new_unique(),
+        oracle_feed_id: [1; 32],
+        oracle_max_age_seconds: 90,
+        oracle_max_confidence_bps: 100,
+        oracle_exponent_adjustment: 0,
+        min_reference_price: 1,
+        max_reference_price: 10_000,
+        submission_duration_slots: 50,
+        aggregation_duration_slots: 50,
+        decryption_duration_slots: 50,
+        allocation_rule_version: 2,
+        order_circuit_version: 2,
+        claim_circuit_version: 2,
+        paused: false,
+        vault_authority_bump: 0,
+        bump: 0,
+        recent_clearings: [RecentClearing::default(); RECENT_CLEARINGS],
+    };
+    let mut auction_state = Auction {
+        version: beatex::state::PROTOCOL_VERSION,
+        market,
+        auction_id: 0,
+        key_epoch: market_state.current_key_epoch,
+        state: AuctionState::Pending,
+        open_slot: 0,
+        submission_end_slot: 50,
+        aggregation_deadline_slot: 100,
+        decryption_deadline_slot: 150,
+        reference_price: 100,
+        reference_from_oracle: false,
+        oracle_publish_time: 0,
+        grid_step_bps: 10,
+        grid_size: 17,
+        allocation_rule_version: 2,
+        order_circuit_version: 2,
+        claim_circuit_version: 2,
+        finalized_order_count: 0,
+        aggregate_buy: [[0; 64]; 17],
+        aggregate_sell: [[0; 64]; 17],
+        decrypted_demand: [0; 17],
+        decrypted_supply: [0; 17],
+        decrypted_entry_bitmap: 0,
+        clearing_index: 8,
+        clearing_price: 100,
+        clearing_volume: 0,
+        base_residual: 0,
+        quote_residual: 0,
+        bump: 0,
+    };
+    let event = |owner: Pubkey, previous_event: Pubkey| QueuedOrder {
+        version: beatex::state::PROTOCOL_VERSION,
+        market,
+        auction,
+        owner,
+        funder: owner,
+        client_order_nonce: 0,
+        sequence: 0,
+        state: QueuedOrderState::Folded,
+        withdrawal_state: WithdrawalState::Pending,
+        terminal_nullifier: [0; 32],
+        previous_event,
+        ciphertexts: queue_hash::order_bytes(&queue_hash::identity_order()),
+        ciphertext_digest: [0; 32],
+        order_commitment: [0; 32],
+        order_circuit_version: 2,
+        bump: 0,
+    };
+    let mut pointer = ActiveOrder {
+        version: beatex::state::PROTOCOL_VERSION,
+        market,
+        auction,
+        owner: owner.pubkey(),
+        latest_event: latest,
+        revision: 1,
+        active: true,
+        bump: 0,
+    };
+    put_anchor_account(&mut svm, market, &market_state);
+    put_anchor_account(&mut svm, auction, &auction_state);
+    put_anchor_account(
+        &mut svm,
+        superseded,
+        &event(owner.pubkey(), Pubkey::default()),
+    );
+    put_anchor_account(&mut svm, latest, &event(owner.pubkey(), superseded));
+    put_anchor_account(
+        &mut svm,
+        foreign,
+        &event(Pubkey::new_unique(), Pubkey::default()),
+    );
+    put_anchor_account(&mut svm, active_order, &pointer);
+
+    let close = |svm: &mut LiteSVM, events: &[Pubkey]| {
+        let mut accounts = vec![
+            AccountMeta::new(owner.pubkey(), false),
+            AccountMeta::new_readonly(market, false),
+            AccountMeta::new_readonly(auction, false),
+            AccountMeta::new(active_order, false),
+        ];
+        accounts.extend(events.iter().map(|event| AccountMeta::new(*event, false)));
+        svm.expire_blockhash();
+        svm.send_transaction(Transaction::new(
+            &[&payer],
+            Message::new(
+                &[Instruction {
+                    program_id: beatex::ID,
+                    accounts,
+                    data: beatex::instruction::CloseOrderEvents {}.data(),
+                }],
+                Some(&payer.pubkey()),
+            ),
+            svm.latest_blockhash(),
+        ))
+    };
+    let lamports = |svm: &LiteSVM, address: &Pubkey| svm.get_account(address).unwrap().lamports;
+
+    // Events stay while the auction can still fold them.
+    assert!(close(&mut svm, &[superseded]).is_err());
+
+    auction_state.state = AuctionState::Settled;
+    put_anchor_account(
+        &mut svm,
+        auction,
+        &AuctionResult::from_auction(&auction_state),
+    );
+    // Another trader's event, and an active order's latest event, are kept.
+    assert!(close(&mut svm, &[foreign]).is_err());
+    assert!(close(&mut svm, &[latest]).is_err());
+
+    // A superseded event closes even while the order is still active.
+    let before = lamports(&svm, &owner.pubkey());
+    close(&mut svm, &[superseded]).unwrap();
+    assert!(account_is_closed(&svm, &superseded));
+    assert!(!account_is_closed(&svm, &active_order));
+    assert_eq!(lamports(&svm, &owner.pubkey()), before + 1_000_000_000);
+
+    // Once the order is inactive (e.g. cancelled), the rest is reclaimed.
+    pointer.active = false;
+    put_anchor_account(&mut svm, active_order, &pointer);
+    let before = lamports(&svm, &owner.pubkey());
+    close(&mut svm, &[latest]).unwrap();
+    assert!(account_is_closed(&svm, &latest));
+    assert!(account_is_closed(&svm, &active_order));
+    assert_eq!(lamports(&svm, &owner.pubkey()), before + 2_000_000_000);
 }

@@ -24,7 +24,9 @@ use {
             OrderProofOutput as CoreOrderOutput, OrderProofRequest as CoreOrderRequest,
             OrderProver, PrivateBalanceOpening as CoreBalance,
         },
-        LEVELS,
+        BALANCE_DEPOSIT_CIRCUIT_VERSION, DEVNET_FAST_ORDER_CIRCUIT_VERSION, LEVELS,
+        ORDER_MODIFICATION_CIRCUIT_VERSION, ORDER_SUBMISSION_CIRCUIT_VERSION,
+        ROLLOVER_SETTLEMENT_CIRCUIT_VERSION,
     },
     rand::rngs::OsRng,
     serde::{Deserialize, Serialize},
@@ -33,7 +35,6 @@ use {
 };
 
 const API_VERSION: u32 = 2;
-const CIRCUIT_VERSION: u16 = 2;
 const BACKEND: &str = "beatex-arkworks-groth16-wasm-v2";
 
 type Bytes32 = [u8; 32];
@@ -322,6 +323,7 @@ pub struct TraderProver {
     order: Option<OrderProver>,
     release: Option<CollateralReleaseProver>,
     settlement: Option<RolloverProver>,
+    order_version: u16,
 }
 
 #[wasm_bindgen]
@@ -335,6 +337,16 @@ impl TraderProver {
     /// runs in the browser.
     #[wasm_bindgen(js_name = loadProvingKey)]
     pub fn load_proving_key(&mut self, circuit: &str, bytes: &[u8]) -> Result<(), JsValue> {
+        self.load_proving_key_for_version(circuit, ORDER_SUBMISSION_CIRCUIT_VERSION, bytes)
+    }
+
+    #[wasm_bindgen(js_name = loadProvingKeyForVersion)]
+    pub fn load_proving_key_for_version(
+        &mut self,
+        circuit: &str,
+        circuit_version: u16,
+        bytes: &[u8],
+    ) -> Result<(), JsValue> {
         match circuit {
             "balance" => {
                 self.deposit = Some(
@@ -343,10 +355,17 @@ impl TraderProver {
                 );
             }
             "order" => {
+                if !matches!(
+                    circuit_version,
+                    ORDER_SUBMISSION_CIRCUIT_VERSION | DEVNET_FAST_ORDER_CIRCUIT_VERSION
+                ) {
+                    return Err(JsValue::from_str("unsupported order circuit version"));
+                }
                 self.order = Some(
-                    OrderProver::from_trusted_uncompressed_bytes(bytes)
+                    OrderProver::from_trusted_uncompressed_bytes_for_version(bytes, circuit_version)
                         .map_err(|error| key_error("order", error))?,
                 );
+                self.order_version = circuit_version;
             }
             "release" => {
                 self.release = Some(
@@ -355,8 +374,14 @@ impl TraderProver {
                 );
             }
             "settlement" => {
+                if circuit_version != ROLLOVER_SETTLEMENT_CIRCUIT_VERSION {
+                    return Err(JsValue::from_str("unsupported settlement circuit version"));
+                }
                 self.settlement = Some(
-                    RolloverProver::from_trusted_uncompressed_bytes(bytes)
+                    RolloverProver::from_trusted_uncompressed_bytes_for_version(
+                        bytes,
+                        circuit_version,
+                    )
                         .map_err(|error| key_error("settlement", error))?,
                 );
             }
@@ -436,7 +461,11 @@ impl TraderProver {
             .ok_or_else(|| unloaded_key("order"))?
             .prove(order_request(request)?, &mut OsRng)
             .map_err(proof_error)?;
-        to_js(&order_output(output, elapsed_ms(started)))
+        to_js(&order_output(
+            output,
+            elapsed_ms(started),
+            self.order_version,
+        ))
     }
 
     #[wasm_bindgen(js_name = proveCancellation)]
@@ -497,9 +526,9 @@ impl TraderProver {
             .map_err(proof_error)?;
         let replacement_ms = elapsed_ms(replacement_started);
         to_js(&ReplacementOutput {
-            metadata: metadata(elapsed_ms(started)),
+            metadata: metadata(elapsed_ms(started), self.order_version),
             release: release_output(release, release_ms),
-            replacement: order_output(replacement, replacement_ms),
+            replacement: order_output(replacement, replacement_ms, self.order_version),
         })
     }
 
@@ -534,9 +563,9 @@ impl TraderProver {
             .map_err(proof_error)?;
         let next_order_ms = elapsed_ms(next_order_started);
         to_js(&RolloverOutput {
-            metadata: metadata(elapsed_ms(started)),
+            metadata: metadata(elapsed_ms(started), ROLLOVER_SETTLEMENT_CIRCUIT_VERSION),
             settlement: settlement_output(settlement, settlement_ms),
-            next_order: order_output(next_order, next_order_ms),
+            next_order: order_output(next_order, next_order_ms, self.order_version),
         })
     }
 }
@@ -640,17 +669,17 @@ fn proof(a: [u8; 64], b: [u8; 128], c: [u8; 64], input: [u8; 32]) -> ProofOutput
     }
 }
 
-fn metadata(proving_time_ms: f64) -> ProofMetadata {
+fn metadata(proving_time_ms: f64, circuit_version: u16) -> ProofMetadata {
     ProofMetadata {
         backend: BACKEND,
         proving_time_ms,
-        circuit_version: CIRCUIT_VERSION,
+        circuit_version,
     }
 }
 
 fn deposit_output(value: CoreDepositOutput, proving_time_ms: f64) -> DepositOutput {
     DepositOutput {
-        metadata: metadata(proving_time_ms),
+        metadata: metadata(proving_time_ms, BALANCE_DEPOSIT_CIRCUIT_VERSION),
         proof: proof(
             value.proof_a,
             value.proof_b,
@@ -665,7 +694,7 @@ fn deposit_output(value: CoreDepositOutput, proving_time_ms: f64) -> DepositOutp
 
 fn withdrawal_output(value: CoreWithdrawalOutput, proving_time_ms: f64) -> WithdrawalOutput {
     WithdrawalOutput {
-        metadata: metadata(proving_time_ms),
+        metadata: metadata(proving_time_ms, BALANCE_DEPOSIT_CIRCUIT_VERSION),
         proof: proof(
             value.proof_a,
             value.proof_b,
@@ -678,9 +707,9 @@ fn withdrawal_output(value: CoreWithdrawalOutput, proving_time_ms: f64) -> Withd
     }
 }
 
-fn order_output(value: CoreOrderOutput, proving_time_ms: f64) -> OrderOutput {
+fn order_output(value: CoreOrderOutput, proving_time_ms: f64, circuit_version: u16) -> OrderOutput {
     OrderOutput {
-        metadata: metadata(proving_time_ms),
+        metadata: metadata(proving_time_ms, circuit_version),
         proof: proof(
             value.proof_a,
             value.proof_b,
@@ -704,7 +733,7 @@ fn order_output(value: CoreOrderOutput, proving_time_ms: f64) -> OrderOutput {
 
 fn release_output(value: CoreReleaseOutput, proving_time_ms: f64) -> ReleaseOutput {
     ReleaseOutput {
-        metadata: metadata(proving_time_ms),
+        metadata: metadata(proving_time_ms, ORDER_MODIFICATION_CIRCUIT_VERSION),
         proof: proof(
             value.proof_a,
             value.proof_b,
@@ -719,7 +748,7 @@ fn release_output(value: CoreReleaseOutput, proving_time_ms: f64) -> ReleaseOutp
 
 fn settlement_output(value: CoreSettlementOutput, proving_time_ms: f64) -> SettlementOutput {
     SettlementOutput {
-        metadata: metadata(proving_time_ms),
+        metadata: metadata(proving_time_ms, ROLLOVER_SETTLEMENT_CIRCUIT_VERSION),
         proof: proof(
             value.proof_a,
             value.proof_b,
@@ -794,9 +823,9 @@ mod tests {
 
     #[test]
     fn output_metadata_is_versioned() {
-        let value = metadata(12.5);
+        let value = metadata(12.5, DEVNET_FAST_ORDER_CIRCUIT_VERSION);
         assert_eq!(value.backend, BACKEND);
-        assert_eq!(value.circuit_version, 2);
+        assert_eq!(value.circuit_version, DEVNET_FAST_ORDER_CIRCUIT_VERSION);
         assert_eq!(value.proving_time_ms, 12.5);
     }
 }

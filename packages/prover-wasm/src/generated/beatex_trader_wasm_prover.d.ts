@@ -8,7 +8,7 @@ export function traderProverApiVersion(): number;
  * One in-memory runtime for every proof needed by a trader frontend.
  *
  * Key bytes must be SHA-256-authenticated Arkworks canonical-uncompressed
- * `ProvingKey<Bn254>` artifacts for circuit version 1. Each artifact is
+ * `ProvingKey<Bn254>` artifacts for circuit version 2. Each artifact is
  * decoded exactly once. The official TypeScript loader performs the required
  * digest and byte-length checks before calling this lower-level API.
  */
@@ -20,6 +20,7 @@ export class TraderProver {
    * runs in the browser.
    */
   loadProvingKey(circuit: string, bytes: Uint8Array): void;
+  loadProvingKeyForVersion(circuit: string, circuit_version: number, bytes: Uint8Array): void;
   isProvingKeyLoaded(circuit: string): boolean;
   proveDeposit(request: any): any;
   proveWithdrawal(request: any): any;
@@ -37,6 +38,7 @@ export interface InitOutput {
   readonly __wbg_traderprover_free: (a: number, b: number) => void;
   readonly traderprover_new: () => number;
   readonly traderprover_loadProvingKey: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
+  readonly traderprover_loadProvingKeyForVersion: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
   readonly traderprover_isProvingKeyLoaded: (a: number, b: number, c: number) => number;
   readonly traderprover_proveDeposit: (a: number, b: number, c: number) => void;
   readonly traderprover_proveWithdrawal: (a: number, b: number, c: number) => void;
@@ -71,4 +73,4 @@ export function initSync(module: { module: SyncInitInput } | SyncInitInput): Ini
 *
 * @returns {Promise<InitOutput>}
 */
-export default function __wbg_init (module_or_path?: { module_or_path: InitInput | Promise<InitInput> } | InitInput | Promise<InitInput>): Promise<InitOutput>;
+export default function __wbg_init (module_or_path: { module_or_path: InitInput | Promise<InitInput> } | InitInput | Promise<InitInput>): Promise<InitOutput>;

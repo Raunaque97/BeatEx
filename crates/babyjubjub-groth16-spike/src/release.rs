@@ -401,6 +401,13 @@ impl ReplacementProver {
         })
     }
 
+    pub fn deterministic_devnet_fast() -> Result<Self, Box<dyn std::error::Error>> {
+        Ok(Self {
+            release: CollateralReleaseProver::deterministic_devnet()?,
+            order: OrderProver::deterministic_devnet_fast()?,
+        })
+    }
+
     /// Prove the atomic release-and-relock transition. The replacement's old
     /// balance is overwritten with the exact opening produced by the release,
     /// preventing a caller from accidentally creating two unrelated proofs.

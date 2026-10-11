@@ -44,6 +44,10 @@ export interface ReleaseOrderCollateralArgs {
   proof: WireGroth16Proof;
 }
 
+export interface CancelActiveOrderArgs extends ReleaseOrderCollateralArgs {
+  clientOrderNonce: bigint;
+}
+
 export interface ReplaceQueuedOrderArgs {
   release: ReleaseOrderCollateralArgs;
   replacement: SubmitQueuedOrderArgs;
@@ -78,6 +82,7 @@ export const INSTRUCTION_DISCRIMINATORS = {
   bindRolloverOrder: Uint8Array.of(32, 121, 37, 107, 128, 137, 144, 204),
   prepareRollover: Uint8Array.of(54, 228, 107, 138, 13, 136, 207, 109),
   rolloverOrder: Uint8Array.of(84, 248, 154, 20, 227, 55, 48, 237),
+  closeOrderEvents: Uint8Array.of(244, 0, 216, 45, 166, 209, 29, 38),
 } as const;
 
 type InstructionName = keyof typeof INSTRUCTION_DISCRIMINATORS;
@@ -191,8 +196,8 @@ export function encodeReplaceQueuedOrder(args: ReplaceQueuedOrderArgs): Uint8Arr
   return instruction("replaceQueuedOrder", writer);
 }
 
-export function encodeCancelActiveOrder(args: ReleaseOrderCollateralArgs): Uint8Array {
-  const writer = new BorshWriter();
+export function encodeCancelActiveOrder(args: CancelActiveOrderArgs): Uint8Array {
+  const writer = new BorshWriter().u64(args.clientOrderNonce);
   writeRelease(writer, args);
   return instruction("cancelActiveOrder", writer);
 }
@@ -227,6 +232,10 @@ export function encodeBindRolloverSettlement(args: {
 
 export function encodeSettleOrderToBalance(): Uint8Array {
   return instruction("settleOrderToBalance");
+}
+
+export function encodeCloseOrderEvents(): Uint8Array {
+  return instruction("closeOrderEvents");
 }
 
 export function encodeBindRolloverOrder(args: {

@@ -52,6 +52,18 @@ export interface ReplaceOrderParams extends MarketRequest {
 
 export interface CancelOrderParams extends MarketRequest {}
 
+export interface CloseOrderEventsParams {
+  readonly market: Address;
+  readonly auction: Address;
+  /**
+   * This owner's queued-order events in `auction` to close: events superseded
+   * by a replacement, or the events of a cancelled order. Settlement, refund
+   * and rollover already close the latest event. The auction must be settled
+   * or cancelled.
+   */
+  readonly events: readonly Address[];
+}
+
 export interface SettleToBalanceParams extends MarketRequest {
   readonly auctionId: bigint;
 }

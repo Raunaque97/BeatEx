@@ -2,6 +2,7 @@
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$script_dir/load-rpc-env.sh"
 project_root="$(cd "$script_dir/../.." && pwd)"
 user_cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin"
 if [[ -d "$user_cargo_bin" ]]; then
@@ -126,6 +127,11 @@ if [[ "$program_keypair" != /* ]]; then
   program_keypair="$project_root/$program_keypair"
 fi
 
+beatex_load_rpc_env "$state_dir"
+if [[ "$cluster" == devnet ]]; then
+  rpc_url="${BEATEX_RPC_SESSION_URL:-${BEATEX_RPC_URL:-$rpc_url}}"
+fi
+
 "$script_dir/check-toolchain.sh"
 
 if [[ ! -f "$program_keypair" ]]; then
@@ -135,7 +141,7 @@ fi
 program_id="$(solana-keygen pubkey "$program_keypair")"
 program_is_deployed=0
 program_status=''
-if program_status="$(solana program show "$program_id" --url "$rpc_url" 2>&1)"; then
+if program_status="$(solana program show "$program_id" --url "$rpc_url" --keypair "$wallet" 2>&1)"; then
   program_is_deployed=1
   printf '\nFound existing BeatEx deployment on %s:\n' "$cluster"
   printf '%s\n' "$program_status"
@@ -189,7 +195,8 @@ if (( ! skip_idl )); then
     printf '\nGenerating the current Anchor IDL.\n'
     (
       cd "$project_root"
-      anchor idl build
+      mkdir -p "$(dirname "$idl_file")"
+      anchor idl build --out "$idl_file"
     )
   fi
   if [[ ! -f "$idl_file" ]]; then
@@ -200,6 +207,7 @@ if (( ! skip_idl )); then
     --program-id "$program_id"
     --idl "$idl_file"
     --wallet "$wallet"
+    --state-dir "$state_dir"
     --rpc-url "$rpc_url"
   )
   if (( allow_idl_update )); then

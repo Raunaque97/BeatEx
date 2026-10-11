@@ -21,6 +21,8 @@ let runtime: TraderWasmRuntime | undefined;
 scope.addEventListener("message", (event: MessageEvent<MainToWorkerMessage>) => {
   void handle(event.data);
 });
+// Announce readiness only once the listener exists; the main thread queues until then.
+scope.postMessage({ type: "ready" });
 
 async function handle(message: MainToWorkerMessage): Promise<void> {
   if (message.type === "cancel") {
@@ -51,7 +53,7 @@ async function handle(message: MainToWorkerMessage): Promise<void> {
     }
     if (runtime === undefined) throw new Error("Trader prover runtime is not initialized");
     if (message.type === "load") {
-      runtime.loadProvingKey(message.circuit, message.provingKey);
+      runtime.loadProvingKey(message.circuit, message.circuitVersion, message.provingKey);
       throwIfCancelled(message.id);
       loaded.set(message.circuit, {
         backend: message.backend,

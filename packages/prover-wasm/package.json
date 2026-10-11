@@ -3,7 +3,9 @@
   "version": "0.1.0",
   "description": "Web Worker hosted WASM prover for BeatEx trader proofs",
   "type": "module",
-  "sideEffects": false,
+  "sideEffects": [
+    "./dist/worker.js"
+  ],
   "files": [
     "dist",
     "README.md"

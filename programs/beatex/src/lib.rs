@@ -21,12 +21,22 @@ pub use groth16::Groth16ProofInput;
 pub use queue::{
     ActiveOrder, AggregateAccumulator, EncryptedPrivateBalance, QueueCircuitKind,
     QueueVerificationKey, QueuedOrder, QueuedOrderState, SubmissionCounter, WithdrawalKind,
-    WithdrawalState,
+    WithdrawalState, ELGAMAL_CIPHERTEXT_BYTES,
 };
-pub use state::{Auction, AuctionState, Market, Order, OrderState};
+pub use state::{
+    Auction, AuctionHeader, AuctionOutcome, AuctionResult, AuctionState, Market, Order, OrderState,
+    RecentClearing, RECENT_CLEARINGS,
+};
 pub use threshold::{DecryptionShareInput, DleqProofInput, VerifyThresholdDecryptionArgs};
 
 declare_id!("2P37xv7CzDv7pSet6LaXJDq4m1auW3pZ8PzPLtErfsVd");
+
+// Auction N+1 is centered on auction N-1's clearing price; N-1 settles while N
+// collects orders. Once N-1 has cleared, N+1 may be initialized early so traders
+// can prepare against its grid. Until then only a last-moment oracle fallback is
+// accepted, so a permissionless caller cannot lock in the oracle price early.
+pub const AUCTION_PREINITIALIZATION_SLOTS: u64 = 12;
+pub const AUCTION_FALLBACK_INITIALIZATION_SLOTS: u64 = 2;
 
 pub const COMMITTEE_SIZE: usize = 7;
 pub const THRESHOLD: u8 = 3;
@@ -51,7 +61,7 @@ pub mod beatex {
         );
         require!(
             args.allocation_rule_version == allocation::ALLOCATION_RULE_VERSION
-                && args.order_circuit_version == queue::ORDER_SUBMISSION_CIRCUIT_VERSION
+                && queue::valid_order_circuit_version(args.order_circuit_version)
                 && args.claim_circuit_version == queue::PRIVATE_CLAIM_CIRCUIT_VERSION,
             BeatExError::InvalidMarketParameters
         );
@@ -136,6 +146,7 @@ pub mod beatex {
         market.market_start_slot = args.market_start_slot;
         market.last_clearing_price = 0;
         market.last_clearing_volume = 0;
+        market.recent_clearings = [RecentClearing::default(); RECENT_CLEARINGS];
         market.last_cleared_auction_sequence = 0;
         market.minimum_reference_volume = args.minimum_reference_volume;
         market.oracle_price_account = ctx.accounts.oracle_price.key();
@@ -265,7 +276,31 @@ pub mod beatex {
         );
         let clock = Clock::get()?;
         let expected_id = current_auction_id(market, clock.slot)?;
-        require!(auction_id == expected_id, BeatExError::AuctionId);
+        let current_end_slot = market
+            .market_start_slot
+            .checked_add(
+                expected_id
+                    .checked_add(1)
+                    .and_then(|id| id.checked_mul(market.submission_duration_slots))
+                    .ok_or_else(|| error!(BeatExError::ArithmeticOverflow))?,
+            )
+            .ok_or_else(|| error!(BeatExError::ArithmeticOverflow))?;
+        let next_id = expected_id
+            .checked_add(1)
+            .ok_or_else(|| error!(BeatExError::ArithmeticOverflow))?;
+        let previous_reference_ready =
+            previous_clearing_is_recent(market.last_cleared_auction_sequence, auction_id);
+        let initialization_lead = if previous_reference_ready {
+            AUCTION_PREINITIALIZATION_SLOTS
+        } else {
+            AUCTION_FALLBACK_INITIALIZATION_SLOTS
+        };
+        let next_is_timely = auction_id == next_id
+            && clock.slot.saturating_add(initialization_lead) >= current_end_slot;
+        require!(
+            auction_id == expected_id || next_is_timely,
+            BeatExError::AuctionId
+        );
         let open_slot = market
             .market_start_slot
             .checked_add(
@@ -284,8 +319,7 @@ pub mod beatex {
             .checked_add(market.decryption_duration_slots)
             .ok_or_else(|| error!(BeatExError::ArithmeticOverflow))?;
 
-        let use_previous_clearing = auction_id > 0
-            && market.last_cleared_auction_sequence == auction_id
+        let use_previous_clearing = previous_reference_ready
             && market.last_clearing_volume >= market.minimum_reference_volume;
         let (reference_price, reference_from_oracle, oracle_publish_time) = if use_previous_clearing
         {
@@ -371,7 +405,12 @@ pub mod beatex {
         args: InitializeQueueVerificationKeyArgs,
     ) -> Result<()> {
         require!(
-            args.circuit_version == queue::circuit_version(args.circuit_kind),
+            match args.circuit_kind {
+                QueueCircuitKind::OrderSubmission => {
+                    queue::valid_order_circuit_version(args.circuit_version)
+                }
+                _ => args.circuit_version == queue::circuit_version(args.circuit_kind),
+            },
             BeatExError::InvalidCircuitVersion
         );
         let key = &mut ctx.accounts.verification_key;
@@ -592,6 +631,7 @@ pub mod beatex {
             auction.state == AuctionState::Pending,
             BeatExError::AuctionState
         );
+        require!(slot >= auction.open_slot, BeatExError::AuctionState);
         let deadlines = queue_deadlines(auction);
         let (sequence, next_count) = queue::accept_order(
             slot,
@@ -666,10 +706,13 @@ pub mod beatex {
             .revision
             .checked_add(1)
             .ok_or_else(|| error!(BeatExError::ArithmeticOverflow))?;
-        ctx.accounts
-            .queue_accounts
-            .submission_counter
-            .accepted_order_count = next_count;
+        let counter = &mut ctx.accounts.queue_accounts.submission_counter;
+        record_pending_event(
+            &counter.to_account_info(),
+            sequence,
+            ctx.accounts.order.key(),
+        )?;
+        counter.accepted_order_count = next_count;
         Ok(())
     }
 
@@ -698,6 +741,7 @@ pub mod beatex {
             auction.state == AuctionState::Pending,
             BeatExError::AuctionState
         );
+        require!(slot >= auction.open_slot, BeatExError::AuctionState);
         let (sequence, next_count) = queue::accept_order(
             slot,
             queue_deadlines(auction),
@@ -796,7 +840,13 @@ pub mod beatex {
             .revision
             .checked_add(1)
             .ok_or_else(|| error!(BeatExError::ArithmeticOverflow))?;
-        ctx.accounts.state.submission_counter.accepted_order_count = next_count;
+        let counter = &mut ctx.accounts.state.submission_counter;
+        record_pending_event(
+            &counter.to_account_info(),
+            sequence,
+            ctx.accounts.event.key(),
+        )?;
+        counter.accepted_order_count = next_count;
         Ok(())
     }
 
@@ -860,7 +910,7 @@ pub mod beatex {
         event.auction = auction.key();
         event.owner = ctx.accounts.identity.owner.key();
         event.funder = ctx.accounts.identity.owner.key();
-        event.client_order_nonce = ctx.accounts.state.previous_event.client_order_nonce;
+        event.client_order_nonce = args.client_order_nonce;
         event.sequence = sequence;
         event.state = QueuedOrderState::Accepted;
         event.withdrawal_state = WithdrawalState::Refunded;
@@ -892,18 +942,25 @@ pub mod beatex {
             .revision
             .checked_add(1)
             .ok_or_else(|| error!(BeatExError::ArithmeticOverflow))?;
-        ctx.accounts.state.submission_counter.accepted_order_count = next_count;
+        let counter = &mut ctx.accounts.state.submission_counter;
+        record_pending_event(
+            &counter.to_account_info(),
+            sequence,
+            ctx.accounts.event.key(),
+        )?;
+        counter.accepted_order_count = next_count;
         Ok(())
     }
 
     /// Allocate rollover output accounts in a small instruction immediately
     /// before the proof-heavy rollover instruction. The instruction-sysvar
     /// check makes the pair atomic and prevents a standalone preparation from
-    /// occupying the next global queue-sequence PDA.
+    /// occupying the trader's next queued-order PDA.
     pub fn prepare_rollover(ctx: Context<PrepareRollover>) -> Result<()> {
         let slot = Clock::get()?.slot;
         require!(
             ctx.accounts.next_auction.state == AuctionState::Pending
+                && slot >= ctx.accounts.next_auction.open_slot
                 && queue_deadlines(&ctx.accounts.next_auction).collection_is_open(slot),
             BeatExError::AuctionState
         );
@@ -1005,13 +1062,14 @@ pub mod beatex {
         ctx: Context<VerifyRolloverProof>,
         args: VerifyRolloverProofArgs,
     ) -> Result<()> {
+        let expected_version = match args.circuit_kind {
+            QueueCircuitKind::RolloverSettlement => queue::ROLLOVER_SETTLEMENT_CIRCUIT_VERSION,
+            QueueCircuitKind::OrderSubmission => ctx.accounts.market.order_circuit_version,
+            _ => return err!(BeatExError::InvalidCircuitVersion),
+        };
         require!(
-            matches!(
-                args.circuit_kind,
-                QueueCircuitKind::RolloverSettlement | QueueCircuitKind::OrderSubmission
-            ) && ctx.accounts.verification_key.circuit_kind == args.circuit_kind
-                && ctx.accounts.verification_key.circuit_version
-                    == queue::circuit_version(args.circuit_kind),
+            ctx.accounts.verification_key.circuit_kind == args.circuit_kind
+                && ctx.accounts.verification_key.circuit_version == expected_version,
             BeatExError::InvalidCircuitVersion
         );
         groth16::verify_queue_proof(
@@ -1052,8 +1110,8 @@ pub mod beatex {
                 order_commitment: ctx.accounts.old_order.order_commitment,
                 clearing_index: auction.clearing_index,
                 clearing_price: auction.clearing_price,
-                demand_at_clearing: auction.decrypted_demand[clearing_index],
-                supply_at_clearing: auction.decrypted_supply[clearing_index],
+                demand_at_clearing: auction.demand_at_clearing,
+                supply_at_clearing: auction.supply_at_clearing,
                 clearing_volume: auction.clearing_volume,
                 terminal_nullifier: args.settlement.terminal_nullifier,
                 balance_revision: ctx.accounts.private_balance.revision,
@@ -1121,7 +1179,8 @@ pub mod beatex {
     pub fn settle_order_to_balance(ctx: Context<SettleOrderToBalance>) -> Result<()> {
         let binding =
             bound_settlement_arguments(&ctx.accounts.instructions.to_account_info(), ctx.accounts)?;
-        let next_state = queue::advance_withdrawal(
+        // Validates the withdrawal transition; the accounts are closed below.
+        queue::advance_withdrawal(
             ctx.accounts.order.state,
             ctx.accounts.order.withdrawal_state,
             WithdrawalKind::Claim,
@@ -1134,9 +1193,6 @@ pub mod beatex {
             BeatExError::OrderState
         );
 
-        ctx.accounts.order.withdrawal_state = next_state;
-        ctx.accounts.order.terminal_nullifier = binding.settlement.terminal_nullifier;
-        ctx.accounts.active_order.active = false;
         ctx.accounts.private_balance.encrypted_base = binding.settlement.credited_encrypted_base;
         ctx.accounts.private_balance.encrypted_quote = binding.settlement.credited_encrypted_quote;
         ctx.accounts.private_balance.balance_digest = binding.expected_public_input;
@@ -1146,6 +1202,11 @@ pub mod beatex {
             .revision
             .checked_add(1)
             .ok_or_else(|| error!(BeatExError::ArithmeticOverflow))?;
+        // The order is terminal: its rent returns to the owner, and the closed
+        // accounts cannot be settled again or recreated in a non-pending auction.
+        let owner = ctx.accounts.owner.to_account_info();
+        ctx.accounts.order.close(owner.clone())?;
+        ctx.accounts.active_order.close(owner)?;
         Ok(())
     }
 
@@ -1162,7 +1223,7 @@ pub mod beatex {
                 && ctx.accounts.active_order.latest_event == ctx.accounts.order.key(),
             BeatExError::OrderState
         );
-        let next_state = queue::advance_withdrawal(
+        queue::advance_withdrawal(
             ctx.accounts.order.state,
             ctx.accounts.order.withdrawal_state,
             WithdrawalKind::Refund,
@@ -1191,8 +1252,6 @@ pub mod beatex {
         )?;
         groth16::verify_queue_proof(&args.proof, &digest, &ctx.accounts.release_verification_key)?;
 
-        ctx.accounts.order.withdrawal_state = next_state;
-        ctx.accounts.active_order.active = false;
         ctx.accounts.private_balance.encrypted_base = args.released_encrypted_base;
         ctx.accounts.private_balance.encrypted_quote = args.released_encrypted_quote;
         ctx.accounts.private_balance.balance_digest = digest;
@@ -1202,6 +1261,9 @@ pub mod beatex {
             .revision
             .checked_add(1)
             .ok_or_else(|| error!(BeatExError::ArithmeticOverflow))?;
+        let owner = ctx.accounts.owner.to_account_info();
+        ctx.accounts.order.close(owner.clone())?;
+        ctx.accounts.active_order.close(owner)?;
         Ok(())
     }
 
@@ -1234,7 +1296,7 @@ pub mod beatex {
             ctx.accounts.state.old_active_order.active,
             BeatExError::NoActiveOrder
         );
-        let next_withdrawal_state = queue::advance_withdrawal(
+        queue::advance_withdrawal(
             ctx.accounts.state.old_order.state,
             ctx.accounts.state.old_order.withdrawal_state,
             WithdrawalKind::Claim,
@@ -1294,9 +1356,9 @@ pub mod beatex {
         next_active_order.revision = 0;
         next_active_order.active = true;
 
-        ctx.accounts.state.old_order.withdrawal_state = next_withdrawal_state;
-        ctx.accounts.state.old_order.terminal_nullifier = args.settlement.terminal_nullifier;
-        ctx.accounts.state.old_active_order.active = false;
+        let owner = ctx.accounts.identity.owner.to_account_info();
+        ctx.accounts.state.old_order.close(owner.clone())?;
+        ctx.accounts.state.old_active_order.close(owner)?;
         ctx.accounts.state.private_balance.encrypted_base = args.next_order.new_encrypted_base;
         ctx.accounts.state.private_balance.encrypted_quote = args.next_order.new_encrypted_quote;
         ctx.accounts.state.private_balance.balance_digest = order_binding.expected_public_input;
@@ -1307,16 +1369,20 @@ pub mod beatex {
             .revision
             .checked_add(1)
             .ok_or_else(|| error!(BeatExError::ArithmeticOverflow))?;
-        ctx.accounts
-            .state
-            .next_submission_counter
-            .accepted_order_count = next_count;
+        let counter = &mut ctx.accounts.state.next_submission_counter;
+        record_pending_event(
+            &counter.to_account_info(),
+            sequence,
+            ctx.accounts.next_order.key(),
+        )?;
+        counter.accepted_order_count = next_count;
         Ok(())
     }
 
-    /// Verify and apply a permissionless aggregate fold. The active queued
-    /// orders are supplied as 1..=4 writable remaining accounts in ascending
-    /// public-key order.
+    /// Verify and apply a permissionless aggregate fold. The queued events are
+    /// supplied as 1..=4 writable remaining accounts and must be exactly the
+    /// next entries of the submission counter's pending-event ring, in
+    /// acceptance order; the fold clears those ring slots.
     pub fn fold_queued_orders(
         ctx: Context<FoldQueuedOrders>,
         args: FoldQueuedOrdersArgs,
@@ -1339,13 +1405,9 @@ pub mod beatex {
         );
 
         let mut fold_orders = Vec::with_capacity(batch_size);
-        let mut previous = None;
         for info in ctx.remaining_accounts {
             require!(info.is_writable, BeatExError::InvalidFoldBatch);
             require_keys_eq!(*info.owner, crate::ID, BeatExError::InvalidFoldBatch);
-            if let Some(previous) = previous {
-                require!(previous < *info.key, BeatExError::InvalidFoldBatch);
-            }
             let order = queue::fold_order_metadata(&info.try_borrow_data()?)
                 .ok_or_else(|| error!(BeatExError::InvalidFoldBatch))?;
             require_keys_eq!(
@@ -1361,8 +1423,24 @@ pub mod beatex {
                 order: *info.key,
                 ciphertext_digest: order.ciphertext_digest,
             });
-            previous = Some(*info.key);
         }
+        // A fold takes exactly the next pending events in acceptance order,
+        // which also rules out duplicates within the batch.
+        let batch_events: Vec<Pubkey> = ctx
+            .remaining_accounts
+            .iter()
+            .map(|info| *info.key)
+            .collect();
+        queue::take_pending_events(
+            &mut ctx
+                .accounts
+                .submission_counter
+                .to_account_info()
+                .try_borrow_mut_data()?,
+            ctx.accounts.accumulator.folded_order_count,
+            &batch_events,
+        )
+        .map_err(|_| error!(BeatExError::InvalidFoldBatch))?;
 
         let (next_count, next_revision) = queue::advance_fold(
             Clock::get()?.slot,
@@ -1405,14 +1483,20 @@ pub mod beatex {
         ctx: Context<PublishAndClear>,
         args: PublishAggregateCurvesArgs,
     ) -> Result<()> {
-        let auction = &ctx.accounts.auction;
+        let (auction, bump) =
+            load_auction_header(&ctx.accounts.auction, &ctx.accounts.market.key())?;
+        require_keys_eq!(
+            auction.key_epoch,
+            ctx.accounts.key_epoch.key(),
+            BeatExError::InvalidKeyEpoch
+        );
         require!(
             auction.state == AuctionState::Pending,
             BeatExError::AuctionState
         );
         queue::authorize_settlement(
             Clock::get()?.slot,
-            queue_deadlines(auction),
+            header_deadlines(&auction),
             ctx.accounts.submission_counter.accepted_order_count,
             ctx.accounts.accumulator.folded_order_count,
         )
@@ -1480,11 +1564,7 @@ pub mod beatex {
             &ctx.accounts.publication_verification_key,
         )?;
 
-        let auction = &mut ctx.accounts.auction;
-        auction.decrypted_demand = args.demand;
-        auction.decrypted_supply = args.supply;
-        auction.decrypted_entry_bitmap = (1_u128 << queue::QUEUED_CIPHERTEXT_COUNT) - 1;
-        let grid_size = auction.active_grid_size();
+        let grid_size = auction.grid_size as usize;
         let grid = auction::PriceGrid {
             reference_price: auction.reference_price,
             grid_step_bps: auction.grid_step_bps,
@@ -1497,15 +1577,12 @@ pub mod beatex {
         };
         let result = auction::clear_auction_with_tiebreak(
             &grid,
-            &auction.decrypted_demand[..grid_size],
-            &auction.decrypted_supply[..grid_size],
+            &args.demand[..grid_size],
+            &args.supply[..grid_size],
             tie_break_price,
         )
         .map_err(|_| error!(BeatExError::InvalidCurves))?;
-        auction.clearing_index = result.index as u8;
-        auction.clearing_price = result.price;
-        auction.clearing_volume = result.executable_volume;
-        auction.state = AuctionState::Settled;
+        let clearing = usize::from(result.index);
 
         let sequence = auction
             .auction_id
@@ -1516,13 +1593,53 @@ pub mod beatex {
             ctx.accounts.market.last_clearing_price = result.price;
             ctx.accounts.market.last_clearing_volume = result.executable_volume;
         }
-        Ok(())
+        ctx.accounts.market.record_clearing(RecentClearing {
+            auction_id: auction.auction_id,
+            clearing_price: result.price,
+            clearing_volume: result.executable_volume,
+        });
+        emit_cpi!(AuctionCleared {
+            market: auction.market,
+            auction_id: auction.auction_id,
+            reference_price: auction.reference_price,
+            reference_from_oracle: auction.reference_from_oracle,
+            grid_step_bps: auction.grid_step_bps,
+            grid_size: auction.grid_size,
+            clearing_index: result.index as u8,
+            clearing_price: result.price,
+            clearing_volume: result.executable_volume,
+            accepted_order_count: ctx.accounts.submission_counter.accepted_order_count,
+            demand: args.demand,
+            supply: args.supply,
+            slot: Clock::get()?.slot,
+        });
+
+        // Settlement needs only the compact result; the queue accounts are done.
+        let rent_receiver = ctx.accounts.rent_receiver.to_account_info();
+        ctx.accounts
+            .submission_counter
+            .close(rent_receiver.clone())?;
+        ctx.accounts.accumulator.close(rent_receiver.clone())?;
+        let finished = AuctionResult::finished(
+            &auction,
+            bump,
+            AuctionOutcome {
+                state: AuctionState::Settled,
+                clearing_index: result.index as u8,
+                clearing_price: result.price,
+                clearing_volume: result.executable_volume,
+                demand_at_clearing: args.demand[clearing],
+                supply_at_clearing: args.supply[clearing],
+            },
+        );
+        compact_auction(&ctx.accounts.auction, &finished, &rent_receiver)
     }
 
     /// Cancel a pending auction once either aggregation is irrecoverably
     /// incomplete or the final publication deadline has elapsed.
     pub fn cancel_pending_auction(ctx: Context<CancelPendingAuction>) -> Result<()> {
-        let auction = &mut ctx.accounts.auction;
+        let (auction, bump) =
+            load_auction_header(&ctx.accounts.auction, &ctx.accounts.market.key())?;
         require!(
             auction.state == AuctionState::Pending,
             BeatExError::AuctionState
@@ -1536,7 +1653,99 @@ pub mod beatex {
             aggregation_stalled || publication_expired,
             BeatExError::DeadlineNotReached
         );
-        auction.state = AuctionState::Cancelled;
+        emit_cpi!(AuctionCancelled {
+            market: auction.market,
+            auction_id: auction.auction_id,
+            reference_price: auction.reference_price,
+            reference_from_oracle: auction.reference_from_oracle,
+            accepted_order_count: ctx.accounts.submission_counter.accepted_order_count,
+            slot,
+        });
+        // Refunds read only the compact result; the queue accounts are done.
+        let rent_receiver = ctx.accounts.rent_receiver.to_account_info();
+        ctx.accounts
+            .submission_counter
+            .close(rent_receiver.clone())?;
+        ctx.accounts.accumulator.close(rent_receiver.clone())?;
+        let finished = AuctionResult::finished(
+            &auction,
+            bump,
+            AuctionOutcome {
+                state: AuctionState::Cancelled,
+                clearing_index: auction.grid_size / 2,
+                clearing_price: auction.reference_price,
+                clearing_volume: 0,
+                demand_at_clearing: 0,
+                supply_at_clearing: 0,
+            },
+        );
+        compact_auction(&ctx.accounts.auction, &finished, &rent_receiver)
+    }
+
+    /// Reclaim the storage rent for an empty auction after its collection
+    /// window. This is permissionless, but the rent is always returned to the
+    /// market authority rather than to the caller.
+    pub fn close_empty_auction(ctx: Context<CloseEmptyAuction>) -> Result<()> {
+        require!(
+            ctx.accounts.auction.state == AuctionState::Pending,
+            BeatExError::AuctionState
+        );
+        require!(
+            Clock::get()?.slot >= ctx.accounts.auction.submission_end_slot,
+            BeatExError::DeadlineNotReached
+        );
+        require!(
+            ctx.accounts.submission_counter.accepted_order_count == 0
+                && ctx.accounts.accumulator.folded_order_count == 0,
+            BeatExError::AggregationIncomplete
+        );
+        emit_cpi!(EmptyAuctionClosed {
+            market: ctx.accounts.market.key(),
+            auction_id: ctx.accounts.auction.auction_id,
+            reference_price: ctx.accounts.auction.reference_price,
+            reference_from_oracle: ctx.accounts.auction.reference_from_oracle,
+            slot: Clock::get()?.slot,
+        });
+        Ok(())
+    }
+
+    /// Reclaim the rent of one owner's order events in an auction that has
+    /// stopped collecting and folding. Settlement, refund and rollover already
+    /// close the latest event; this covers events superseded by replacements
+    /// and orders the owner cancelled. Permissionless: the rent always returns
+    /// to the owner who funded the events, and an active order keeps its
+    /// latest event and pointer.
+    pub fn close_order_events(ctx: Context<CloseOrderEvents>) -> Result<()> {
+        require!(
+            ctx.accounts.auction.state != AuctionState::Pending,
+            BeatExError::AuctionState
+        );
+        let owner = ctx.accounts.owner.to_account_info();
+        let active_order = ctx.accounts.active_order.to_account_info();
+        let mut retained_event = None;
+        if !(active_order.owner == &anchor_lang::system_program::ID && active_order.data_is_empty())
+        {
+            require_keys_eq!(*active_order.owner, crate::ID, BeatExError::OrderState);
+            let pointer = ActiveOrder::try_deserialize(&mut &active_order.try_borrow_data()?[..])?;
+            if pointer.active {
+                retained_event = Some(pointer.latest_event);
+            } else {
+                close_program_account(&active_order, &owner)?;
+            }
+        }
+        for event_info in ctx.remaining_accounts {
+            require!(event_info.is_writable, BeatExError::OrderState);
+            require_keys_eq!(*event_info.owner, crate::ID, BeatExError::OrderState);
+            let event = QueuedOrder::try_deserialize(&mut &event_info.try_borrow_data()?[..])?;
+            require!(
+                event.auction == ctx.accounts.auction.key()
+                    && event.owner == owner.key()
+                    && event.funder == owner.key()
+                    && retained_event != Some(event_info.key()),
+                BeatExError::OrderState
+            );
+            close_program_account(event_info, &owner)?;
+        }
         Ok(())
     }
 
@@ -1980,6 +2189,7 @@ pub struct ReplaceQueuedOrderArgs {
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
 pub struct CancelActiveOrderArgs {
+    pub client_order_nonce: u64,
     pub release: ReleaseOrderCollateralArgs,
 }
 
@@ -2113,7 +2323,7 @@ pub struct InitializeAuction<'info> {
     #[account(
         init,
         payer = payer,
-        space = 8 + SubmissionCounter::INIT_SPACE,
+        space = queue::SUBMISSION_COUNTER_SPACE,
         seeds = [b"submission-counter", auction.key().as_ref()],
         bump,
     )]
@@ -2245,6 +2455,7 @@ pub struct WithdrawPublicBalance<'info> {
 }
 
 #[derive(Accounts)]
+#[instruction(args: SubmitQueuedOrderArgs)]
 pub struct SubmitQueuedOrder<'info> {
     #[account(mut)]
     pub owner: Signer<'info>,
@@ -2256,7 +2467,8 @@ pub struct SubmitQueuedOrder<'info> {
         seeds = [
             b"queued-order",
             queue_accounts.auction.key().as_ref(),
-            &queue_accounts.submission_counter.accepted_order_count.to_le_bytes(),
+            owner.key().as_ref(),
+            &args.client_order_nonce.to_le_bytes(),
         ],
         bump,
     )]
@@ -2295,6 +2507,7 @@ pub struct SubmitQueueAccounts<'info> {
 }
 
 #[derive(Accounts)]
+#[instruction(args: ReplaceQueuedOrderArgs)]
 pub struct ModifyActiveOrder<'info> {
     pub identity: ActiveOrderIdentity<'info>,
     pub state: ActiveOrderState<'info>,
@@ -2312,7 +2525,8 @@ pub struct ModifyActiveOrder<'info> {
         seeds = [
             b"queued-order",
             identity.auction.key().as_ref(),
-            &state.submission_counter.accepted_order_count.to_le_bytes(),
+            identity.owner.key().as_ref(),
+            &args.replacement.client_order_nonce.to_le_bytes(),
         ],
         bump,
     )]
@@ -2349,6 +2563,7 @@ pub struct ActiveOrderState<'info> {
 }
 
 #[derive(Accounts)]
+#[instruction(args: CancelActiveOrderArgs)]
 pub struct CancelQueuedOrder<'info> {
     pub identity: ActiveOrderIdentity<'info>,
     pub state: ActiveOrderState<'info>,
@@ -2359,7 +2574,8 @@ pub struct CancelQueuedOrder<'info> {
         seeds = [
             b"queued-order",
             identity.auction.key().as_ref(),
-            &state.submission_counter.accepted_order_count.to_le_bytes(),
+            identity.owner.key().as_ref(),
+            &args.client_order_nonce.to_le_bytes(),
         ],
         bump,
     )]
@@ -2388,9 +2604,9 @@ pub struct RolloverOrder<'info> {
     #[account(
         mut,
         seeds = [
-            b"queued-order",
+            b"rollover-order",
             identity.next_auction.key().as_ref(),
-            &state.next_submission_counter.accepted_order_count.to_le_bytes(),
+            identity.owner.key().as_ref(),
         ],
         bump = next_order.bump,
         constraint = next_order.version == 0
@@ -2439,7 +2655,7 @@ pub struct BindRolloverSettlement<'info> {
     pub owner: Signer<'info>,
     pub market: Box<Account<'info, Market>>,
     #[account(has_one = market, has_one = key_epoch)]
-    pub old_auction: Box<Account<'info, Auction>>,
+    pub old_auction: Box<Account<'info, AuctionResult>>,
     #[account(has_one = market)]
     pub key_epoch: Box<Account<'info, KeyEpoch>>,
     #[account(has_one = market, has_one = owner)]
@@ -2461,10 +2677,11 @@ pub struct BindRolloverSettlement<'info> {
 
 #[derive(Accounts)]
 pub struct SettleOrderToBalance<'info> {
+    #[account(mut)]
     pub owner: Signer<'info>,
     pub market: Box<Account<'info, Market>>,
     #[account(has_one = market, has_one = key_epoch)]
-    pub auction: Box<Account<'info, Auction>>,
+    pub auction: Box<Account<'info, AuctionResult>>,
     #[account(has_one = market)]
     pub key_epoch: Box<Account<'info, KeyEpoch>>,
     #[account(
@@ -2496,10 +2713,11 @@ pub struct SettleOrderToBalance<'info> {
 
 #[derive(Accounts)]
 pub struct RefundOrderToBalance<'info> {
+    #[account(mut)]
     pub owner: Signer<'info>,
     pub market: Box<Account<'info, Market>>,
     #[account(has_one = market, has_one = key_epoch)]
-    pub auction: Box<Account<'info, Auction>>,
+    pub auction: Box<Account<'info, AuctionResult>>,
     #[account(has_one = market)]
     pub key_epoch: Box<Account<'info, KeyEpoch>>,
     #[account(
@@ -2557,9 +2775,9 @@ pub struct PrepareRollover<'info> {
         payer = owner,
         space = 8 + QueuedOrder::INIT_SPACE,
         seeds = [
-            b"queued-order",
+            b"rollover-order",
             next_auction.key().as_ref(),
-            &next_submission_counter.accepted_order_count.to_le_bytes(),
+            owner.key().as_ref(),
         ],
         bump,
     )]
@@ -2588,7 +2806,7 @@ pub struct RolloverIdentity<'info> {
     pub owner: Signer<'info>,
     pub market: Box<Account<'info, Market>>,
     #[account(has_one = market, has_one = key_epoch)]
-    pub old_auction: Box<Account<'info, Auction>>,
+    pub old_auction: Box<Account<'info, AuctionResult>>,
     #[account(has_one = market, has_one = key_epoch)]
     pub next_auction: Box<Account<'info, Auction>>,
     #[account(has_one = market)]
@@ -2613,7 +2831,7 @@ pub struct FoldQueuedOrders<'info> {
     pub market: Box<Account<'info, Market>>,
     #[account(has_one = market)]
     pub auction: Box<Account<'info, Auction>>,
-    #[account(has_one = auction)]
+    #[account(mut, has_one = auction)]
     pub submission_counter: Box<Account<'info, SubmissionCounter>>,
     #[account(mut, has_one = auction)]
     pub accumulator: Box<Account<'info, AggregateAccumulator>>,
@@ -2624,29 +2842,84 @@ pub struct FoldQueuedOrders<'info> {
     pub fold_verification_key: Box<Account<'info, QueueVerificationKey>>,
 }
 
+#[event_cpi]
 #[derive(Accounts)]
 pub struct CancelPendingAuction<'info> {
     pub market: Box<Account<'info, Market>>,
-    #[account(mut, has_one = market)]
-    pub auction: Box<Account<'info, Auction>>,
-    #[account(has_one = auction)]
+    /// CHECK: a pending `Auction` of this market, loaded and validated in the
+    /// handler, which rewrites it as a smaller `AuctionResult`.
+    #[account(mut)]
+    pub auction: UncheckedAccount<'info>,
+    #[account(mut, has_one = auction)]
     pub submission_counter: Box<Account<'info, SubmissionCounter>>,
-    #[account(has_one = auction)]
+    #[account(mut, has_one = auction)]
     pub accumulator: Box<Account<'info, AggregateAccumulator>>,
+    /// Receives the rent released by the queue accounts and the compaction.
+    #[account(mut, address = market.authority)]
+    pub rent_receiver: SystemAccount<'info>,
 }
 
+#[derive(Accounts)]
+pub struct CloseOrderEvents<'info> {
+    /// Receives the rent; every event it funded is checked against it.
+    #[account(mut)]
+    pub owner: SystemAccount<'info>,
+    pub market: Box<Account<'info, Market>>,
+    #[account(has_one = market)]
+    pub auction: Box<Account<'info, AuctionResult>>,
+    /// CHECK: the owner's active-order PDA for this auction. It is empty once a
+    /// terminal settlement, refund or rollover has closed it; otherwise the
+    /// handler deserializes it and keeps an active order's latest event.
+    #[account(
+        mut,
+        seeds = [b"active-order", auction.key().as_ref(), owner.key().as_ref()],
+        bump,
+    )]
+    pub active_order: UncheckedAccount<'info>,
+}
+
+#[event_cpi]
+#[derive(Accounts)]
+pub struct CloseEmptyAuction<'info> {
+    pub market: Box<Account<'info, Market>>,
+    #[account(
+        mut,
+        has_one = market,
+        close = rent_receiver,
+    )]
+    pub auction: Box<Account<'info, Auction>>,
+    #[account(
+        mut,
+        has_one = auction,
+        close = rent_receiver,
+    )]
+    pub submission_counter: Box<Account<'info, SubmissionCounter>>,
+    #[account(
+        mut,
+        has_one = auction,
+        close = rent_receiver,
+    )]
+    pub accumulator: Box<Account<'info, AggregateAccumulator>>,
+    #[account(mut, address = market.authority)]
+    pub rent_receiver: SystemAccount<'info>,
+}
+
+#[event_cpi]
 #[derive(Accounts)]
 #[instruction(args: PublishAggregateCurvesArgs)]
 pub struct PublishAndClear<'info> {
     #[account(mut)]
     pub market: Box<Account<'info, Market>>,
-    #[account(mut, has_one = market, has_one = key_epoch)]
-    pub auction: Box<Account<'info, Auction>>,
+    /// CHECK: a pending `Auction` of this market, loaded and validated by
+    /// `load_pending_auction`. It is untyped because the handler rewrites it
+    /// as a smaller `AuctionResult`, which a typed account would serialize over.
+    #[account(mut)]
+    pub auction: UncheckedAccount<'info>,
     #[account(has_one = market)]
     pub key_epoch: Box<Account<'info, KeyEpoch>>,
-    #[account(has_one = auction)]
+    #[account(mut, has_one = auction)]
     pub submission_counter: Box<Account<'info, SubmissionCounter>>,
-    #[account(has_one = auction)]
+    #[account(mut, has_one = auction)]
     pub accumulator: Box<Account<'info, AggregateAccumulator>>,
     #[account(
         has_one = market,
@@ -2654,6 +2927,9 @@ pub struct PublishAndClear<'info> {
             == QueueCircuitKind::AggregatePublication,
     )]
     pub publication_verification_key: Box<Account<'info, QueueVerificationKey>>,
+    /// Receives the rent released by the queue accounts and the compaction.
+    #[account(mut, address = market.authority)]
+    pub rent_receiver: SystemAccount<'info>,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
@@ -2861,7 +3137,7 @@ pub struct SettleTestOrder<'info> {
 pub struct PrivateWithdrawal<'info> {
     pub market: Box<Account<'info, Market>>,
     #[account(has_one = market)]
-    pub auction: Box<Account<'info, Auction>>,
+    pub auction: Box<Account<'info, AuctionResult>>,
     #[account(
         constraint = key_epoch.key() == auction.key_epoch @ BeatExError::InvalidKeyEpoch,
         has_one = market,
@@ -3319,8 +3595,8 @@ fn execute_private_withdrawal(
             order_commitment: order.order_commitment,
             clearing_index: auction.clearing_index,
             clearing_price: auction.clearing_price,
-            demand_at_clearing: auction.decrypted_demand[clearing_index],
-            supply_at_clearing: auction.decrypted_supply[clearing_index],
+            demand_at_clearing: auction.demand_at_clearing,
+            supply_at_clearing: auction.supply_at_clearing,
             clearing_volume: auction.clearing_volume,
             terminal_nullifier: args.terminal_nullifier,
             base_mint: &base.mint.key(),
@@ -3749,6 +4025,82 @@ fn validate_rollover_context(
     Ok(())
 }
 
+/// Whether auction `auction_id - 2` (or a later auction) has cleared, making the
+/// market's last clearing price eligible as `auction_id`'s reference.
+/// `last_cleared_auction_sequence` stores the cleared auction's id plus one.
+pub fn previous_clearing_is_recent(last_cleared_auction_sequence: u64, auction_id: u64) -> bool {
+    auction_id > 0
+        && last_cleared_auction_sequence > 0
+        && last_cleared_auction_sequence.saturating_add(1) >= auction_id
+}
+
+/// Read a pending auction's fixed-size header and trailing bump from an
+/// untyped account, checking it is an `Auction` of `market`.
+fn load_auction_header(info: &AccountInfo, market: &Pubkey) -> Result<(AuctionHeader, u8)> {
+    require_keys_eq!(*info.owner, crate::ID, BeatExError::AuctionState);
+    let data = info.try_borrow_data()?;
+    require!(
+        data.len() == 8 + Auction::INIT_SPACE && data[..8] == *Auction::DISCRIMINATOR,
+        BeatExError::AuctionState
+    );
+    let header = AuctionHeader::deserialize(&mut &data[8..])?;
+    require_keys_eq!(header.market, *market, BeatExError::AuctionState);
+    Ok((header, data[data.len() - 1]))
+}
+
+fn header_deadlines(auction: &AuctionHeader) -> queue::QueueDeadlines {
+    queue::QueueDeadlines {
+        collection_end_slot: auction.submission_end_slot,
+        aggregation_deadline_slot: auction.aggregation_deadline_slot,
+    }
+}
+
+/// Rewrite a finished auction in place as its compact `AuctionResult` and
+/// return the rent the smaller account no longer needs to `rent_receiver`.
+fn compact_auction(
+    info: &AccountInfo,
+    result: &AuctionResult,
+    rent_receiver: &AccountInfo,
+) -> Result<()> {
+    let mut data = Vec::with_capacity(8 + AuctionResult::INIT_SPACE);
+    result.try_serialize(&mut data)?;
+    info.resize(data.len())?;
+    info.try_borrow_mut_data()?.copy_from_slice(&data);
+    let released = info
+        .lamports()
+        .saturating_sub(Rent::get()?.minimum_balance(data.len()));
+    **info.try_borrow_mut_lamports()? -= released;
+    **rent_receiver.try_borrow_mut_lamports()? = rent_receiver
+        .lamports()
+        .checked_add(released)
+        .ok_or_else(|| error!(BeatExError::ArithmeticOverflow))?;
+    Ok(())
+}
+
+/// Index an accepted event for fold bots; fails while the pending ring is full.
+fn record_pending_event(counter: &AccountInfo, sequence: u64, event: Pubkey) -> Result<()> {
+    queue::record_pending_event(&mut counter.try_borrow_mut_data()?, sequence, event).map_err(
+        |error| match error {
+            queue::QueueInvariantError::PendingQueueFull => error!(BeatExError::PendingQueueFull),
+            _ => error!(BeatExError::QueueInvariant),
+        },
+    )
+}
+
+/// Close a program-owned account that is not a typed field of the context,
+/// returning its rent to `destination`. Mirrors Anchor's `close` constraint.
+fn close_program_account(account: &AccountInfo, destination: &AccountInfo) -> Result<()> {
+    let lamports = account.lamports();
+    **destination.try_borrow_mut_lamports()? = destination
+        .lamports()
+        .checked_add(lamports)
+        .ok_or_else(|| error!(BeatExError::ArithmeticOverflow))?;
+    **account.try_borrow_mut_lamports()? = 0;
+    account.assign(&anchor_lang::system_program::ID);
+    account.resize(0)?;
+    Ok(())
+}
+
 fn current_auction_id(market: &Market, slot: u64) -> Result<u64> {
     let elapsed = slot
         .checked_sub(market.market_start_slot)
@@ -3793,6 +4145,47 @@ fn validate_reference_price(market: &Market, reference_price: u64) -> Result<()>
     .validate()
     .map_err(|_| error!(BeatExError::InvalidOraclePrice))?;
     Ok(())
+}
+
+/// A published auction's outcome, for off-chain indexers and price history.
+/// It carries the full decrypted curves, which the compacted on-chain
+/// `AuctionResult` no longer keeps.
+#[event]
+pub struct AuctionCleared {
+    pub market: Pubkey,
+    pub auction_id: u64,
+    pub reference_price: u64,
+    pub reference_from_oracle: bool,
+    pub grid_step_bps: u16,
+    pub grid_size: u8,
+    pub clearing_index: u8,
+    pub clearing_price: u64,
+    pub clearing_volume: u64,
+    pub accepted_order_count: u64,
+    pub demand: [u64; queue::QUEUE_PRICE_LEVELS],
+    pub supply: [u64; queue::QUEUE_PRICE_LEVELS],
+    pub slot: u64,
+}
+
+/// An auction that could not aggregate or publish in time.
+#[event]
+pub struct AuctionCancelled {
+    pub market: Pubkey,
+    pub auction_id: u64,
+    pub reference_price: u64,
+    pub reference_from_oracle: bool,
+    pub accepted_order_count: u64,
+    pub slot: u64,
+}
+
+/// An auction that received no orders and whose accounts were reclaimed.
+#[event]
+pub struct EmptyAuctionClosed {
+    pub market: Pubkey,
+    pub auction_id: u64,
+    pub reference_price: u64,
+    pub reference_from_oracle: bool,
+    pub slot: u64,
 }
 
 #[error_code]
@@ -3903,6 +4296,8 @@ pub enum BeatExError {
     Groth16PublicInputMismatch,
     #[msg("the aggregate fold batch must contain one to four unique accepted orders")]
     InvalidFoldBatch,
+    #[msg("too many accepted orders are waiting to be folded; retry shortly")]
+    PendingQueueFull,
     #[msg("a private balance must start at the canonical encrypted zero")]
     InvalidInitialBalance,
     #[msg("the deposit must credit at least one asset")]
@@ -3919,7 +4314,18 @@ pub enum BeatExError {
 
 #[cfg(test)]
 mod temporal_lifecycle_tests {
-    use super::normalize_oracle_price;
+    use super::{normalize_oracle_price, previous_clearing_is_recent};
+
+    #[test]
+    fn reference_price_comes_from_two_auctions_back_or_later() {
+        // Sequence 5 means auction 4 cleared: eligible for auctions up to 6.
+        assert!(previous_clearing_is_recent(5, 5));
+        assert!(previous_clearing_is_recent(5, 6));
+        assert!(!previous_clearing_is_recent(5, 7));
+        // Nothing has cleared yet, and auction 0 has no predecessor.
+        assert!(!previous_clearing_is_recent(0, 1));
+        assert!(!previous_clearing_is_recent(1, 0));
+    }
 
     #[test]
     fn oracle_price_scales_and_rounds_to_the_nearest_quote_unit() {

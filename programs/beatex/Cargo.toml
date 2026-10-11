@@ -24,7 +24,7 @@ no-log-ix-name = []
 sbf-test-fixtures = []
 
 [dependencies]
-anchor-lang = "=1.1.2"
+anchor-lang = { version = "=1.1.2", features = ["event-cpi"] }
 pyth-solana-receiver-sdk = "=2.0.0"
 solana-bn254 = "=2.2.2"
 solana-curve25519 = "=3.1.10"
