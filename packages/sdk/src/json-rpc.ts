@@ -16,6 +16,32 @@ export interface JsonRpcBeatExOptions {
   readonly fetch?: typeof globalThis.fetch;
   readonly confirmationPollMs?: number;
   readonly confirmationTimeoutMs?: number;
+  /** Retries for rate-limited (429), unavailable (5xx), or unreachable RPC calls. */
+  readonly retries?: number;
+  readonly retryBaseMs?: number;
+}
+
+/**
+ * A transaction whose outcome is known: it executed and failed, or its
+ * blockhash expired without it landing. Either way it can never apply.
+ */
+export class TransactionOutcomeError extends Error {
+  constructor(
+    message: string,
+    readonly outcome: "failed" | "expired",
+    options?: { readonly cause?: unknown },
+  ) {
+    super(message, options);
+    this.name = "TransactionOutcomeError";
+  }
+}
+
+const RETRYABLE_HTTP_STATUS = new Set([429, 500, 502, 503, 504]);
+/** Check block height (for expiry) at most this often while confirming. */
+const EXPIRY_CHECK_MS = 5_000;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => globalThis.setTimeout(resolve, ms));
 }
 
 interface JsonRpcEnvelope<T> {
@@ -76,6 +102,8 @@ export class JsonRpcBeatExRpc implements BeatExRpc {
   readonly #fetch: typeof globalThis.fetch;
   readonly #pollMs: number;
   readonly #timeoutMs: number;
+  readonly #retries: number;
+  readonly #retryBaseMs: number;
   #requestId = 0;
 
   constructor(endpoint: string, options: JsonRpcBeatExOptions = {}) {
@@ -85,16 +113,41 @@ export class JsonRpcBeatExRpc implements BeatExRpc {
     }
     this.endpoint = parsed.toString();
     this.#fetch = options.fetch ?? globalThis.fetch.bind(globalThis);
-    this.#pollMs = options.confirmationPollMs ?? 600;
-    this.#timeoutMs = options.confirmationTimeoutMs ?? 60_000;
+    this.#pollMs = options.confirmationPollMs ?? 1_000;
+    this.#timeoutMs = options.confirmationTimeoutMs ?? 90_000;
+    this.#retries = options.retries ?? 3;
+    this.#retryBaseMs = options.retryBaseMs ?? 500;
+  }
+
+  /** Exponential backoff, or the server's Retry-After when it sends one (capped). */
+  #retryDelay(attempt: number, response?: Response): number {
+    const retryAfter = Number(response?.headers.get("retry-after"));
+    if (Number.isFinite(retryAfter) && retryAfter > 0) return Math.min(retryAfter * 1_000, 5_000);
+    return this.#retryBaseMs * 2 ** attempt;
   }
 
   async #call<T>(method: string, params: readonly unknown[]): Promise<T> {
-    const response = await this.#fetch(this.endpoint, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ jsonrpc: "2.0", id: ++this.#requestId, method, params }),
-    });
+    // Every BeatEx RPC call is safe to repeat: reads, simulations, and
+    // re-sending identical signed bytes (deduplicated by signature).
+    let response: Response;
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        response = await this.#fetch(this.endpoint, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ jsonrpc: "2.0", id: ++this.#requestId, method, params }),
+        });
+      } catch (error) {
+        if (attempt >= this.#retries) throw error;
+        await sleep(this.#retryDelay(attempt));
+        continue;
+      }
+      if (RETRYABLE_HTTP_STATUS.has(response.status) && attempt < this.#retries) {
+        await sleep(this.#retryDelay(attempt, response));
+        continue;
+      }
+      break;
+    }
     if (!response.ok) throw new Error(`Solana RPC ${method} returned HTTP ${response.status}`);
     const envelope = (await response.json()) as JsonRpcEnvelope<T>;
     if (envelope.error !== undefined) {
@@ -151,7 +204,10 @@ export class JsonRpcBeatExRpc implements BeatExRpc {
         readonly unitsConsumed?: number;
         readonly returnData?: { readonly data: readonly [string, "base64"] } | null;
       };
-    }>("simulateTransaction", [bytesToBase64(transaction), { encoding: "base64", sigVerify: false }]);
+    }>("simulateTransaction", [
+      bytesToBase64(transaction),
+      { encoding: "base64", sigVerify: false, commitment: "confirmed" },
+    ]);
     return {
       err: response.value.err,
       logs: response.value.logs ?? [],
@@ -185,40 +241,65 @@ export class JsonRpcBeatExRpc implements BeatExRpc {
   ): Promise<ConfirmedTransaction> {
     const commitment = options.commitment ?? "confirmed";
     const deadline = Date.now() + this.#timeoutMs;
+    let nextExpiryCheck = 0;
+    let lastError: unknown;
     while (Date.now() < deadline) {
-      const response = await this.#call<{
-        readonly value: readonly ({
-          readonly err: unknown | null;
-          readonly slot: number;
-          readonly confirmationStatus?: "processed" | "confirmed" | "finalized";
-        } | null)[];
-      }>("getSignatureStatuses", [[signature], { searchTransactionHistory: true }]);
-      const status = response.value[0];
-      if (status !== null && status !== undefined) {
-        if (status.err !== null) {
-          throw Object.assign(new Error(`transaction ${signature} failed`), { cause: status.err });
+      try {
+        const status = await this.#signatureStatus(signature);
+        if (status !== null) {
+          if (status.err !== null) {
+            throw new TransactionOutcomeError(`transaction ${signature} failed`, "failed", {
+              cause: status.err,
+            });
+          }
+          const observed = status.confirmationStatus;
+          if (observed === "finalized" || (commitment === "confirmed" && observed === "confirmed")) {
+            return {
+              signature,
+              slot: integerToBigInt(status.slot, "confirmation slot"),
+              confirmationStatus: observed,
+            };
+          }
+        } else if (options.lastValidBlockHeight !== undefined && Date.now() >= nextExpiryCheck) {
+          nextExpiryCheck = Date.now() + EXPIRY_CHECK_MS;
+          const blockHeight = integerToBigInt(
+            await this.#call<number>("getBlockHeight", [{ commitment }]),
+            "block height",
+          );
+          if (blockHeight > options.lastValidBlockHeight) {
+            // It may have landed between the two calls; look once more.
+            if ((await this.#signatureStatus(signature)) === null) {
+              throw new TransactionOutcomeError(
+                `transaction ${signature} expired before confirmation`,
+                "expired",
+              );
+            }
+            // It landed after all; the next poll reads its status.
+          }
         }
-        const observed = status.confirmationStatus;
-        if (observed === "finalized" || (commitment === "confirmed" && observed === "confirmed")) {
-          return {
-            signature,
-            slot: integerToBigInt(status.slot, "confirmation slot"),
-            confirmationStatus: observed,
-          };
-        }
+      } catch (error) {
+        if (error instanceof TransactionOutcomeError) throw error;
+        // A transient RPC failure says nothing about the transaction; keep waiting.
+        lastError = error;
       }
-      if (options.lastValidBlockHeight !== undefined) {
-        const blockHeight = integerToBigInt(
-          await this.#call<number>("getBlockHeight", [{ commitment }]),
-          "block height",
-        );
-        if (blockHeight > options.lastValidBlockHeight) {
-          throw new Error(`transaction ${signature} expired before confirmation`);
-        }
-      }
-      await new Promise<void>((resolve) => globalThis.setTimeout(resolve, this.#pollMs));
+      await sleep(this.#pollMs);
     }
-    throw new Error(`timed out confirming transaction ${signature}`);
+    throw new Error(`timed out confirming transaction ${signature}`, { cause: lastError });
+  }
+
+  async #signatureStatus(signature: TransactionSignature): Promise<{
+    readonly err: unknown | null;
+    readonly slot: number;
+    readonly confirmationStatus?: "processed" | "confirmed" | "finalized";
+  } | null> {
+    const response = await this.#call<{
+      readonly value: readonly ({
+        readonly err: unknown | null;
+        readonly slot: number;
+        readonly confirmationStatus?: "processed" | "confirmed" | "finalized";
+      } | null)[];
+    }>("getSignatureStatuses", [[signature], { searchTransactionHistory: true }]);
+    return response.value[0] ?? null;
   }
 }
 

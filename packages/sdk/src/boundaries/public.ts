@@ -86,6 +86,30 @@ export interface WithdrawParams extends MarketRequest {
   readonly quoteAmount: bigint;
 }
 
+/**
+ * Move one token between two markets' private balances in a single
+ * transaction: a public withdrawal from `from` straight into a public deposit
+ * to `to`. Both amounts are visible on-chain, so callers should not size a
+ * move to a pending order.
+ */
+export interface MoveBetweenMarketsParams {
+  readonly from: Address;
+  readonly to: Address;
+  /** A token both markets trade, as base or quote. */
+  readonly mint: Address;
+  /** Token atoms. */
+  readonly amount: bigint;
+  readonly proofOptions?: ProofExecutionOptions;
+}
+
+export interface MoveBetweenMarketsResult {
+  readonly transaction: ConfirmedTransaction;
+  readonly fromPrivateState: PrivateStateRecord;
+  readonly toPrivateState: PrivateStateRecord;
+  /** Present when `to` had no private balance and one was opened first. */
+  readonly initializationTransaction?: ConfirmedTransaction;
+}
+
 export interface TransactionResult {
   readonly transaction: ConfirmedTransaction;
   readonly privateState: PrivateStateRecord;

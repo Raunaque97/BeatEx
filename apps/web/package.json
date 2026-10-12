@@ -20,7 +20,6 @@
     "@beatex/prover-wasm": "workspace:*",
     "@beatex/sdk": "workspace:*",
     "@solana/kit": "8.4.0",
-    "@solana/kit-plugin-wallet": "0.21.0",
     "@solana/react": "8.4.0",
     "@tanstack/react-query": "5.104.1",
     "next": "16.4.0",

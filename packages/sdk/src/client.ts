@@ -1,4 +1,9 @@
-import { getAddressEncoder, type Address as KitAddress } from "@solana/kit";
+import {
+  getAddressEncoder,
+  getSignatureFromTransaction,
+  getTransactionDecoder,
+  type Address as KitAddress,
+} from "@solana/kit";
 import {
   BeatExError,
   type BeatExClientConfig,
@@ -23,8 +28,11 @@ import {
   type StoredActiveOrder,
   type TraderPrivateState,
   type TransactionResult,
+  type TransactionMessageConfig,
   type WithdrawParams,
   type WithdrawResult,
+  type MoveBetweenMarketsParams,
+  type MoveBetweenMarketsResult,
   asFixedBytes,
   asU64,
 } from "./boundaries/index.js";
@@ -56,6 +64,8 @@ import {
   deriveAggregateAccumulatorPda,
   deriveAuctionPda,
   derivePrivateBalancePda,
+  deriveAssociatedToken2022Address,
+  ASSOCIATED_TOKEN_PROGRAM_ADDRESS,
   deriveQueuedOrderPda,
   deriveRolloverOrderPda,
   deriveSubmissionCounterPda,
@@ -87,11 +97,24 @@ import {
   type QueuedOrderAccount,
   type SubmissionCounterAccount,
 } from "./protocol/index.js";
+import { TransactionOutcomeError } from "./json-rpc.js";
 import { createKitTransactionCompiler } from "./kit-compiler.js";
 import { auctionIdAtSlot, deriveAuctionPhase, hasOracle, type AuctionPhase } from "./schedule.js";
 
 const addressEncoder = getAddressEncoder();
-const DEFAULT_TRANSACTION_CONFIG = {
+
+/** A signed transaction staged this long ago can no longer land (its blockhash expired). */
+const UNSIGNED_TRANSITION_EXPIRY_MS = 3 * 60_000;
+
+/** The fee payer's signature, which identifies the transaction, or null if undecodable. */
+function transactionSignature(signed: Uint8Array): string | null {
+  try {
+    return getSignatureFromTransaction(getTransactionDecoder().decode(signed));
+  } catch {
+    return null;
+  }
+}
+const V1_TRANSACTION_CONFIG = {
   version: 1 as const,
   maxTransactionBytes: 4096 as const,
   computeUnitLimit: 1_400_000,
@@ -99,6 +122,26 @@ const DEFAULT_TRANSACTION_CONFIG = {
   heapSize: 256 * 1024,
   priorityFeeLamports: 0n,
 };
+
+const LEGACY_TRANSACTION_CONFIG = {
+  ...V1_TRANSACTION_CONFIG,
+  version: "legacy" as const,
+  maxTransactionBytes: 1232 as const,
+};
+
+function transactionConfig(
+  version: TransactionMessageConfig["version"],
+  overrides: BeatExClientConfig["transactionConfig"],
+): TransactionMessageConfig {
+  const envelope = version === "legacy" ? LEGACY_TRANSACTION_CONFIG : V1_TRANSACTION_CONFIG;
+  return {
+    ...envelope,
+    ...overrides,
+    // The selected wire envelope and its protocol limit cannot be overridden.
+    version: envelope.version,
+    maxTransactionBytes: envelope.maxTransactionBytes,
+  };
+}
 
 export interface QueueProgress {
   readonly acceptedOrderCount: bigint;
@@ -411,28 +454,42 @@ export class BeatExClient {
     }
   }
 
-  async #send(instructions: readonly SolanaInstruction[]): Promise<ConfirmedTransaction> {
-    const recentBlockhash = await this.#config.rpc.getLatestBlockhash("confirmed");
-    const transaction = await this.#config.transactionCompiler.compileTransaction({
-      feePayer: this.owner,
-      recentBlockhash,
-      instructions,
-      config: { ...DEFAULT_TRANSACTION_CONFIG, ...this.#config.transactionConfig },
-    });
-    const signed = await this.#config.signer.signTransaction(transaction);
-    if (signed.length > DEFAULT_TRANSACTION_CONFIG.maxTransactionBytes) {
-      throw new BeatExError(
-        "TRANSACTION_TOO_LARGE",
-        `signed BeatEx transaction is ${signed.length} bytes; maximum is 4096`,
-      );
-    }
-    const simulation = await this.#config.rpc.simulateTransaction(signed);
+  async #simulate(transaction: Uint8Array): Promise<void> {
+    const simulation = await this.#config.rpc.simulateTransaction(transaction);
     if (simulation.err !== null) {
-      throw new BeatExError("SIMULATION_FAILED", "BeatEx transaction simulation failed", {
+      const programError = simulation.logs.find((line) =>
+        line.includes("Error Message:") || line.includes("Program log: Error:"),
+      ) ?? [...simulation.logs].reverse().find((line) => line.includes("failed:"));
+      const detail = programError ?? JSON.stringify(simulation.err);
+      throw new BeatExError("SIMULATION_FAILED", `BeatEx transaction simulation failed: ${detail}`, {
         cause: simulation.err,
         context: { logs: simulation.logs, unitsConsumed: simulation.unitsConsumed?.toString() },
       });
     }
+  }
+
+  async #send(instructions: readonly SolanaInstruction[]): Promise<ConfirmedTransaction> {
+    const recentBlockhash = await this.#config.rpc.getLatestBlockhash("confirmed");
+    const config = transactionConfig(1, this.#config.transactionConfig);
+    const transaction = await this.#config.transactionCompiler.compileTransaction({
+      feePayer: this.owner,
+      recentBlockhash,
+      instructions,
+      config,
+    });
+    // The RPC adapter disables signature verification, so execution errors can
+    // be surfaced before asking the wallet to decode or sign the transaction.
+    await this.#simulate(transaction);
+    const signed = await this.#config.signer.signTransaction(transaction);
+    if (signed.length > config.maxTransactionBytes) {
+      throw new BeatExError(
+        "TRANSACTION_TOO_LARGE",
+        `signed BeatEx transaction is ${signed.length} bytes; maximum is ${config.maxTransactionBytes}`,
+      );
+    }
+    // Modifying wallet signers may change the message; validate their returned
+    // bytes as well before broadcasting.
+    await this.#simulate(signed);
     const signature = await this.#config.rpc.sendRawTransaction(signed, {
       preflightCommitment: "confirmed",
       maxRetries: 3,
@@ -450,67 +507,141 @@ export class BeatExClient {
     currentRecord: PrivateStateRecord | null,
     next: TraderPrivateState,
     instructions: readonly SolanaInstruction[],
+    transactionVersion: TransactionMessageConfig["version"] = 1,
   ): Promise<{ transaction: ConfirmedTransaction; privateState: PrivateStateRecord }> {
+    const result = await this.#transitions(
+      [{ market, operation, currentRecord, next }],
+      instructions,
+      transactionVersion,
+    );
+    return { transaction: result.transaction, privateState: result.privateStates[0]! };
+  }
+
+  /**
+   * One transaction that changes one or more markets' private balances. Each
+   * market's next state is staged under the same transaction signature, so the
+   * journal commits or rolls back all of them together, and recovery resolves
+   * each market from that one signature.
+   */
+  async #transitions(
+    entries: readonly {
+      readonly market: string;
+      readonly operation: PrivateStateOperation;
+      readonly currentRecord: PrivateStateRecord | null;
+      readonly next: TraderPrivateState;
+    }[],
+    instructions: readonly SolanaInstruction[],
+    transactionVersion: TransactionMessageConfig["version"] = 1,
+  ): Promise<{ transaction: ConfirmedTransaction; privateStates: PrivateStateRecord[] }> {
     const recentBlockhash = await this.#config.rpc.getLatestBlockhash("confirmed");
+    const config = transactionConfig(transactionVersion, this.#config.transactionConfig);
     const transaction = await this.#config.transactionCompiler.compileTransaction({
       feePayer: this.owner,
       recentBlockhash,
       instructions,
-      config: { ...DEFAULT_TRANSACTION_CONFIG, ...this.#config.transactionConfig },
+      config,
     });
+    await this.#simulate(transaction);
     const signed = await this.#config.signer.signTransaction(transaction);
-    if (signed.length > DEFAULT_TRANSACTION_CONFIG.maxTransactionBytes) {
+    if (signed.length > config.maxTransactionBytes) {
       throw new BeatExError(
         "TRANSACTION_TOO_LARGE",
-        `signed BeatEx transaction is ${signed.length} bytes; maximum is 4096`,
+        `signed BeatEx transaction is ${signed.length} bytes; maximum is ${config.maxTransactionBytes}`,
       );
     }
-    const simulation = await this.#config.rpc.simulateTransaction(signed);
-    if (simulation.err !== null) {
-      throw new BeatExError("SIMULATION_FAILED", "BeatEx transaction simulation failed", {
-        cause: simulation.err,
-        context: { logs: simulation.logs, unitsConsumed: simulation.unitsConsumed?.toString() },
-      });
+    await this.#simulate(signed);
+
+    const staged: { key: PrivateStateKey; transitionId: string }[] = [];
+    try {
+      for (const entry of entries) {
+        const key = this.#stateKey(entry.market);
+        const transitionId = randomTransitionId();
+        await this.#config.storage.stage(key, {
+          id: transitionId,
+          operation: entry.operation,
+          expectedStorageRevision: entry.currentRecord?.storageRevision ?? null,
+          nextState: entry.next,
+        });
+        staged.push({ key, transitionId });
+      }
+    } catch (error) {
+      // Nothing was sent; release whatever was staged before the failure.
+      for (const { key, transitionId } of staged) {
+        await this.#config.storage.abort(key, transitionId);
+      }
+      throw error;
     }
-    const key = this.#stateKey(market);
-    const transitionId = randomTransitionId();
-    await this.#config.storage.stage(key, {
-      id: transitionId,
-      operation,
-      expectedStorageRevision: currentRecord?.storageRevision ?? null,
-      nextState: next,
-    });
+    const transitionIds = staged.map(({ transitionId }) => transitionId);
+    const markBroadcast = async (signature: string) => {
+      for (const { key, transitionId } of staged) {
+        await this.#config.storage.markBroadcast(
+          key,
+          transitionId,
+          signature,
+          recentBlockhash.blockhash,
+          recentBlockhash.lastValidBlockHeight,
+        );
+      }
+    };
+
+    // Record the signature before sending, so an interrupted send or
+    // confirmation can always be resolved later by looking the signature up.
+    const localSignature = transactionSignature(signed);
+    if (localSignature !== null) await markBroadcast(localSignature);
     try {
       const signature = await this.#config.rpc.sendRawTransaction(signed, {
         preflightCommitment: "confirmed",
         maxRetries: 3,
       });
-      await this.#config.storage.markBroadcast(
-        key,
-        transitionId,
-        signature,
-        recentBlockhash.blockhash,
-        recentBlockhash.lastValidBlockHeight,
-      );
+      if (localSignature === null) await markBroadcast(signature);
       const confirmation = await this.#config.rpc.confirmTransaction(signature, {
         commitment: "confirmed",
         blockhash: recentBlockhash.blockhash,
         lastValidBlockHeight: recentBlockhash.lastValidBlockHeight,
       });
-      const privateState = await this.#config.storage.commitConfirmed(key, transitionId, confirmation);
-      return { transaction: confirmation, privateState };
+      const privateStates: PrivateStateRecord[] = [];
+      for (const { key, transitionId } of staged) {
+        privateStates.push(await this.#config.storage.commitConfirmed(key, transitionId, confirmation));
+      }
+      return { transaction: confirmation, privateStates };
     } catch (cause) {
+      if (cause instanceof TransactionOutcomeError) {
+        // It can never apply, so every current state is still correct.
+        for (const { key, transitionId } of staged) {
+          await this.#config.storage.abort(key, transitionId);
+        }
+        throw new BeatExError(
+          "TRANSACTION_FAILED",
+          cause.outcome === "failed"
+            ? "the transaction failed on-chain; your balance is unchanged"
+            : "the transaction expired before it landed; your balance is unchanged",
+          { cause, retryable: true, context: { transitionIds } },
+        );
+      }
       throw new BeatExError(
         "TRANSACTION_FAILED",
         "transaction outcome is unresolved; the staged private transition was retained",
-        { cause, retryable: true, context: { transitionId } },
+        { cause, retryable: true, context: { transitionIds } },
       );
     }
+  }
+
+  /** Whether the on-chain private balance already holds exactly `state`'s ciphertexts. */
+  async #onchainMatches(market: string, state: TraderPrivateState): Promise<boolean> {
+    const onchain = await this.getPrivateBalance(market);
+    return (
+      onchain !== null &&
+      onchain.revision === state.balanceRevision &&
+      onchain.keyEpoch === state.keyEpoch &&
+      bytesEqual(onchain.encryptedBase, state.encryptedBase) &&
+      bytesEqual(onchain.encryptedQuote, state.encryptedQuote)
+    );
   }
 
   async #ensurePrivateBalance(
     market: string,
     marketState: MarketAccount,
+    transactionVersion: TransactionMessageConfig["version"] = 1,
   ): Promise<{ record: PrivateStateRecord; initializationTransaction?: ConfirmedTransaction }> {
     const existing = await this.#config.storage.load(this.#stateKey(market));
     if (existing.pending !== null) {
@@ -536,18 +667,25 @@ export class BeatExClient {
       );
     }
     const state = initialState(marketState.currentKeyEpoch);
-    const result = await this.#transition(market, "initialize", null, state, [
-      this.#instruction(
-        [
-          meta(this.owner, true, true),
-          meta(market),
-          meta(marketState.currentKeyEpoch),
-          meta(privateBalance, true),
-          meta(SYSTEM_PROGRAM_ADDRESS),
-        ],
-        encodeInitializePrivateBalance(state.encryptedBase, state.encryptedQuote),
-      ),
-    ]);
+    const result = await this.#transition(
+      market,
+      "initialize",
+      null,
+      state,
+      [
+        this.#instruction(
+          [
+            meta(this.owner, true, true),
+            meta(market),
+            meta(marketState.currentKeyEpoch),
+            meta(privateBalance, true),
+            meta(SYSTEM_PROGRAM_ADDRESS),
+          ],
+          encodeInitializePrivateBalance(state.encryptedBase, state.encryptedQuote),
+        ),
+      ],
+      transactionVersion,
+    );
     return { record: result.privateState, initializationTransaction: result.transaction };
   }
 
@@ -590,7 +728,7 @@ export class BeatExClient {
       throw new BeatExError("INVALID_ARGUMENT", "deposit amount cannot be zero for both assets");
     }
     const marketState = await this.getMarket(params.market);
-    const initialized = await this.#ensurePrivateBalance(params.market, marketState);
+    const initialized = await this.#ensurePrivateBalance(params.market, marketState, "legacy");
     const current = initialized.record.state;
     const keyEpoch = await this.#required<KeyEpochAccount>(
       marketState.currentKeyEpoch,
@@ -631,32 +769,39 @@ export class BeatExClient {
       encryptedQuote: output.newEncryptedQuote,
       activeOrder: current.activeOrder,
     });
-    const result = await this.#transition(params.market, "deposit", initialized.record, next, [
-      this.#instruction(
-        [
-          meta(this.owner, true, true),
-          meta(params.market),
-          meta(marketState.currentKeyEpoch),
-          meta(depositKey),
-          meta(privateBalance, true),
-          meta(marketState.baseMint),
-          meta(marketState.quoteMint),
-          meta(params.baseSource, true),
-          meta(params.quoteSource, true),
-          meta(marketState.baseVault, true),
-          meta(marketState.quoteVault, true),
-          meta(vaultAuthority),
-          meta(TOKEN_2022_PROGRAM_ADDRESS),
-        ],
-        encodeDepositCollateral({
-          baseAmount: params.baseAmount,
-          quoteAmount: params.quoteAmount,
-          newEncryptedBase: output.newEncryptedBase,
-          newEncryptedQuote: output.newEncryptedQuote,
-          proof: output.proof,
-        }),
-      ),
-    ]);
+    const result = await this.#transition(
+      params.market,
+      "deposit",
+      initialized.record,
+      next,
+      [
+        this.#instruction(
+          [
+            meta(this.owner, true, true),
+            meta(params.market),
+            meta(marketState.currentKeyEpoch),
+            meta(depositKey),
+            meta(privateBalance, true),
+            meta(marketState.baseMint),
+            meta(marketState.quoteMint),
+            meta(params.baseSource, true),
+            meta(params.quoteSource, true),
+            meta(marketState.baseVault, true),
+            meta(marketState.quoteVault, true),
+            meta(vaultAuthority),
+            meta(TOKEN_2022_PROGRAM_ADDRESS),
+          ],
+          encodeDepositCollateral({
+            baseAmount: params.baseAmount,
+            quoteAmount: params.quoteAmount,
+            newEncryptedBase: output.newEncryptedBase,
+            newEncryptedQuote: output.newEncryptedQuote,
+            proof: output.proof,
+          }),
+        ),
+      ],
+      "legacy",
+    );
     return {
       ...result,
       privateBalance,
@@ -1364,32 +1509,39 @@ export class BeatExClient {
       encryptedQuote: output.remainingEncryptedQuote,
       activeOrder: record.state.activeOrder,
     });
-    const result = await this.#transition(params.market, "withdraw", record, next, [
-      this.#instruction(
-        [
-          meta(this.owner, true, true),
-          meta(params.market),
-          meta(marketState.currentKeyEpoch),
-          meta(depositKey),
-          meta(privateBalance, true),
-          meta(marketState.baseMint),
-          meta(marketState.quoteMint),
-          meta(marketState.baseVault, true),
-          meta(marketState.quoteVault, true),
-          meta(params.baseDestination, true),
-          meta(params.quoteDestination, true),
-          meta(vaultAuthority),
-          meta(TOKEN_2022_PROGRAM_ADDRESS),
-        ],
-        encodeWithdrawPublicBalance({
-          baseAmount: params.baseAmount,
-          quoteAmount: params.quoteAmount,
-          remainingEncryptedBase: output.remainingEncryptedBase,
-          remainingEncryptedQuote: output.remainingEncryptedQuote,
-          proof: output.proof,
-        }),
-      ),
-    ]);
+    const result = await this.#transition(
+      params.market,
+      "withdraw",
+      record,
+      next,
+      [
+        this.#instruction(
+          [
+            meta(this.owner, true, true),
+            meta(params.market),
+            meta(marketState.currentKeyEpoch),
+            meta(depositKey),
+            meta(privateBalance, true),
+            meta(marketState.baseMint),
+            meta(marketState.quoteMint),
+            meta(marketState.baseVault, true),
+            meta(marketState.quoteVault, true),
+            meta(params.baseDestination, true),
+            meta(params.quoteDestination, true),
+            meta(vaultAuthority),
+            meta(TOKEN_2022_PROGRAM_ADDRESS),
+          ],
+          encodeWithdrawPublicBalance({
+            baseAmount: params.baseAmount,
+            quoteAmount: params.quoteAmount,
+            remainingEncryptedBase: output.remainingEncryptedBase,
+            remainingEncryptedQuote: output.remainingEncryptedQuote,
+            proof: output.proof,
+          }),
+        ),
+      ],
+      "legacy",
+    );
     return {
       ...result,
       baseAmount: params.baseAmount,
@@ -1398,32 +1550,262 @@ export class BeatExClient {
     };
   }
 
+  /**
+   * Move `amount` of one token from one market's private balance to another's
+   * in a single transaction: a public withdrawal from `from` into the owner's
+   * token account, then a public deposit from it into `to`. Opens `to`'s
+   * private balance first (a separate transaction) when it has none. Both
+   * markets' private states commit or roll back together.
+   */
+  async moveBetweenMarkets(params: MoveBetweenMarketsParams): Promise<MoveBetweenMarketsResult> {
+    asU64(params.amount, "amount");
+    if (params.amount === 0n) {
+      throw new BeatExError("INVALID_ARGUMENT", "move amount cannot be zero");
+    }
+    if (params.from === params.to) {
+      throw new BeatExError("INVALID_ARGUMENT", "cannot move funds within one market");
+    }
+    const [fromMarket, toMarket] = await Promise.all([
+      this.getMarket(params.from),
+      this.getMarket(params.to),
+    ]);
+    const side = (market: MarketAccount, label: string): "base" | "quote" => {
+      if (market.baseMint === params.mint) return "base";
+      if (market.quoteMint === params.mint) return "quote";
+      throw new BeatExError("INVALID_ARGUMENT", `${label} market does not trade this token`);
+    };
+    const fromSide = side(fromMarket, "source");
+    const toSide = side(toMarket, "destination");
+
+    const fromRecord = await this.getPrivateState(params.from);
+    if (fromRecord === null) {
+      throw new BeatExError("PRIVATE_STATE_MISSING", "source market has no private balance");
+    }
+    if (fromRecord.state.keyEpoch !== fromMarket.currentKeyEpoch) {
+      throw new BeatExError("PRIVATE_STATE_CONFLICT", "source balance belongs to a different key epoch");
+    }
+    const available =
+      fromSide === "base" ? fromRecord.state.balance.baseValue : fromRecord.state.balance.quoteValue;
+    if (params.amount > available) {
+      throw new BeatExError("INVALID_ARGUMENT", "move amount exceeds the source market's free balance");
+    }
+    const initialized = await this.#ensurePrivateBalance(params.to, toMarket, "legacy");
+    const toRecord = initialized.record;
+
+    const [fromEpoch, toEpoch] = await Promise.all([
+      this.#required<KeyEpochAccount>(fromMarket.currentKeyEpoch, decodeKeyEpoch, "key epoch"),
+      this.#required<KeyEpochAccount>(toMarket.currentKeyEpoch, decodeKeyEpoch, "key epoch"),
+    ]);
+    const amounts = (target: "base" | "quote") => ({
+      baseAmount: target === "base" ? params.amount : 0n,
+      quoteAmount: target === "quote" ? params.amount : 0n,
+    });
+    const out = amounts(fromSide);
+    const into = amounts(toSide);
+
+    // Proofs run one after the other on the single prover worker.
+    const withdrawal = await this.#config.prover.proveWithdrawal(
+      {
+        market: addressBytes(params.from),
+        owner: addressBytes(this.owner),
+        keyEpoch: addressBytes(fromMarket.currentKeyEpoch),
+        committeeKey: asFixedBytes(fromEpoch.babyjubEncryptionPubkey, 32),
+        currentRevision: fromRecord.state.balanceRevision,
+        ...out,
+        currentBalance: fromRecord.state.balance,
+      },
+      params.proofOptions,
+    );
+    const deposit = await this.#config.prover.proveDeposit(
+      {
+        market: addressBytes(params.to),
+        owner: addressBytes(this.owner),
+        keyEpoch: addressBytes(toMarket.currentKeyEpoch),
+        committeeKey: asFixedBytes(toEpoch.babyjubEncryptionPubkey, 32),
+        oldRevision: toRecord.state.balanceRevision,
+        ...into,
+        oldBalance: toRecord.state.balance,
+      },
+      params.proofOptions,
+    );
+
+    const owner = this.owner as KitAddress;
+    const program = this.programId as KitAddress;
+    const tokenAccount = async (mint: string) =>
+      (await deriveAssociatedToken2022Address(owner, mint as KitAddress, TOKEN_2022_PROGRAM_ADDRESS))[0];
+    const [
+      [fromBalance],
+      [toBalance],
+      [fromDepositKey],
+      [toDepositKey],
+      [fromVaultAuthority],
+      [toVaultAuthority],
+      fromBaseAccount,
+      fromQuoteAccount,
+      toBaseAccount,
+      toQuoteAccount,
+    ] = await Promise.all([
+      derivePrivateBalancePda(params.from as KitAddress, owner, program),
+      derivePrivateBalancePda(params.to as KitAddress, owner, program),
+      deriveVerificationKeyPda(params.from as KitAddress, QueueCircuitKind.BalanceDeposit, circuitVersion(QueueCircuitKind.BalanceDeposit), program),
+      deriveVerificationKeyPda(params.to as KitAddress, QueueCircuitKind.BalanceDeposit, circuitVersion(QueueCircuitKind.BalanceDeposit), program),
+      deriveVaultAuthorityPda(params.from as KitAddress, program),
+      deriveVaultAuthorityPda(params.to as KitAddress, program),
+      tokenAccount(fromMarket.baseMint),
+      tokenAccount(fromMarket.quoteMint),
+      tokenAccount(toMarket.baseMint),
+      tokenAccount(toMarket.quoteMint),
+    ]);
+
+    // The program validates every token account, even for a zero amount, so
+    // make sure the owner has one for each token either market touches.
+    const tokenAccounts = new Map<string, string>([
+      [fromBaseAccount, fromMarket.baseMint],
+      [fromQuoteAccount, fromMarket.quoteMint],
+      [toBaseAccount, toMarket.baseMint],
+      [toQuoteAccount, toMarket.quoteMint],
+    ]);
+    const createAccounts = [...tokenAccounts].map(([account, mint]) => ({
+      programId: ASSOCIATED_TOKEN_PROGRAM_ADDRESS,
+      accounts: [
+        meta(this.owner, true, true),
+        meta(account, true),
+        meta(this.owner),
+        meta(mint),
+        meta(SYSTEM_PROGRAM_ADDRESS),
+        meta(TOKEN_2022_PROGRAM_ADDRESS),
+      ],
+      // CreateIdempotent: a no-op when the account already exists.
+      data: Uint8Array.of(1),
+    }));
+
+    const fromNext = nextState(fromRecord.state, {
+      balance: withdrawal.remainingBalance,
+      encryptedBase: withdrawal.remainingEncryptedBase,
+      encryptedQuote: withdrawal.remainingEncryptedQuote,
+      activeOrder: fromRecord.state.activeOrder,
+    });
+    const toNext = nextState(toRecord.state, {
+      balance: deposit.newBalance,
+      encryptedBase: deposit.newEncryptedBase,
+      encryptedQuote: deposit.newEncryptedQuote,
+      activeOrder: toRecord.state.activeOrder,
+    });
+
+    const result = await this.#transitions(
+      [
+        { market: params.from, operation: "withdraw", currentRecord: fromRecord, next: fromNext },
+        { market: params.to, operation: "deposit", currentRecord: toRecord, next: toNext },
+      ],
+      [
+        ...createAccounts,
+        this.#instruction(
+          [
+            meta(this.owner, true, true),
+            meta(params.from),
+            meta(fromMarket.currentKeyEpoch),
+            meta(fromDepositKey),
+            meta(fromBalance, true),
+            meta(fromMarket.baseMint),
+            meta(fromMarket.quoteMint),
+            meta(fromMarket.baseVault, true),
+            meta(fromMarket.quoteVault, true),
+            meta(fromBaseAccount, true),
+            meta(fromQuoteAccount, true),
+            meta(fromVaultAuthority),
+            meta(TOKEN_2022_PROGRAM_ADDRESS),
+          ],
+          encodeWithdrawPublicBalance({
+            ...out,
+            remainingEncryptedBase: withdrawal.remainingEncryptedBase,
+            remainingEncryptedQuote: withdrawal.remainingEncryptedQuote,
+            proof: withdrawal.proof,
+          }),
+        ),
+        this.#instruction(
+          [
+            meta(this.owner, true, true),
+            meta(params.to),
+            meta(toMarket.currentKeyEpoch),
+            meta(toDepositKey),
+            meta(toBalance, true),
+            meta(toMarket.baseMint),
+            meta(toMarket.quoteMint),
+            meta(toBaseAccount, true),
+            meta(toQuoteAccount, true),
+            meta(toMarket.baseVault, true),
+            meta(toMarket.quoteVault, true),
+            meta(toVaultAuthority),
+            meta(TOKEN_2022_PROGRAM_ADDRESS),
+          ],
+          encodeDepositCollateral({
+            ...into,
+            newEncryptedBase: deposit.newEncryptedBase,
+            newEncryptedQuote: deposit.newEncryptedQuote,
+            proof: deposit.proof,
+          }),
+        ),
+      ],
+      // Two proofs and two markets' accounts exceed the legacy size limit.
+      1,
+    );
+    return {
+      transaction: result.transaction,
+      fromPrivateState: result.privateStates[0]!,
+      toPrivateState: result.privateStates[1]!,
+      ...(initialized.initializationTransaction === undefined
+        ? {}
+        : { initializationTransaction: initialized.initializationTransaction }),
+    };
+  }
+
   /** Complete a confirmation that survived a browser reload after broadcast. */
-  async recoverPendingTransition(market: string): Promise<PrivateStateRecord> {
+  /**
+   * Resolve an interrupted transition: commit it if its transaction confirmed,
+   * drop it if the transaction failed or expired. Returns the resulting record,
+   * or null when nothing was ever committed (a first deposit that never landed).
+   */
+  async recoverPendingTransition(market: string): Promise<PrivateStateRecord | null> {
     const key = this.#stateKey(market);
     const snapshot = await this.#config.storage.load(key);
     const pending = snapshot.pending;
-    if (pending === null) {
-      if (snapshot.record === null) throw new BeatExError("PRIVATE_STATE_MISSING", "no private state exists");
-      return snapshot.record;
-    }
+    if (pending === null) return snapshot.record;
     if (
       pending.transactionSignature === undefined ||
       pending.blockhash === undefined ||
       pending.lastValidBlockHeight === undefined
     ) {
-      throw new BeatExError(
-        "PRIVATE_STATE_TRANSITION_PENDING",
-        "the transition was staged but has no recorded transaction signature; manual reconciliation is required",
-        { context: { transitionId: pending.id } },
-      );
+      // Staged without a signature (older SDK versions recorded it only after
+      // sending). The chain is the only witness of whether it applied.
+      if (await this.#onchainMatches(market, pending.nextState)) {
+        return this.#config.storage.commitConfirmed(key, pending.id, {
+          signature: "reconciled-from-chain",
+          slot: 0n,
+          confirmationStatus: "confirmed",
+        });
+      }
+      if (Date.now() - pending.createdAtMs < UNSIGNED_TRANSITION_EXPIRY_MS) {
+        throw new BeatExError(
+          "PRIVATE_STATE_TRANSITION_PENDING",
+          "the interrupted transaction may still land; try again in a few minutes",
+          { retryable: true, context: { transitionId: pending.id } },
+        );
+      }
+      await this.#config.storage.abort(key, pending.id);
+      return snapshot.record;
     }
-    const confirmation = await this.#config.rpc.confirmTransaction(pending.transactionSignature, {
-      commitment: "confirmed",
-      blockhash: pending.blockhash,
-      lastValidBlockHeight: pending.lastValidBlockHeight,
-    });
-    return this.#config.storage.commitConfirmed(key, pending.id, confirmation);
+    try {
+      const confirmation = await this.#config.rpc.confirmTransaction(pending.transactionSignature, {
+        commitment: "confirmed",
+        blockhash: pending.blockhash,
+        lastValidBlockHeight: pending.lastValidBlockHeight,
+      });
+      return await this.#config.storage.commitConfirmed(key, pending.id, confirmation);
+    } catch (error) {
+      if (!(error instanceof TransactionOutcomeError)) throw error;
+      await this.#config.storage.abort(key, pending.id);
+      return snapshot.record;
+    }
   }
 
   /** Abort only a transition known never to have been broadcast. */

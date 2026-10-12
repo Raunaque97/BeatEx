@@ -1,17 +1,23 @@
 import type { Metadata } from "next";
+import { notFound } from "next/navigation";
 
 import { TradingWorkspace } from "@/features/trading/components/trading-workspace";
-
-export const metadata: Metadata = {
-  title: "Trade",
-};
+import { findMarket } from "@/lib/config/markets";
 
 type TradePageProps = {
   readonly params: Promise<{ market: string }>;
 };
 
-export default async function TradePage({ params }: TradePageProps) {
-  const { market } = await params;
+export async function generateMetadata({
+  params,
+}: TradePageProps): Promise<Metadata> {
+  const market = findMarket((await params).market);
+  return { title: market?.label ?? "Trade" };
+}
 
-  return <TradingWorkspace marketSlug={market} />;
+export default async function TradePage({ params }: TradePageProps) {
+  const market = findMarket((await params).market);
+  if (market === undefined) notFound();
+
+  return <TradingWorkspace market={market} />;
 }

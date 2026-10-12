@@ -2,6 +2,10 @@ import assert from "node:assert/strict";
 import { existsSync, readFileSync } from "node:fs";
 import test from "node:test";
 import {
+  getCompiledTransactionMessageDecoder,
+  getTransactionDecoder,
+} from "@solana/kit";
+import {
   ACCOUNT_DISCRIMINATORS,
   BEATEX_PROGRAM_ADDRESS,
   INSTRUCTION_DISCRIMINATORS,
@@ -9,6 +13,10 @@ import {
   GENERATED_DEPLOYMENT,
   InMemoryPrivateStateStorage,
   QueueCircuitKind,
+  SYSTEM_PROGRAM_ADDRESS,
+  TOKEN_2022_PROGRAM_ADDRESS,
+  createBeatExClient,
+  createBeatExRpc,
   createKitTransactionCompiler,
   deriveAuctionPda,
   deriveActiveOrderPda,
@@ -23,12 +31,14 @@ import {
   encodeBindRolloverSettlement,
   encodeDepositCollateral,
   encodeInitializeAuction,
+  encodeInitializePrivateBalance,
   encodeBindRolloverOrder,
   encodeCancelActiveOrder,
   encodePrepareRollover,
   encodeRolloverOrder,
   encodeSubmitQueuedOrder,
   encodeVerifyRolloverProof,
+  encodeWithdrawPublicBalance,
   baseTokensToUnits,
   baseUnitsToTokens,
   buildAuctionGrid,
@@ -185,6 +195,60 @@ test("private-state journal records broadcast before atomic confirmation", async
   assert.equal((await storage.load(key)).pending, null);
 });
 
+test("failed pre-sign simulation never requests a wallet signature or stages state", async () => {
+  const storage = new InMemoryPrivateStateStorage();
+  const calls = [];
+  const client = createBeatExClient({
+    cluster: "devnet",
+    storage,
+    prover: {},
+    rpc: {
+      getAccount: async () => null,
+      getLatestBlockhash: async () => ({
+        blockhash: "11111111111111111111111111111111",
+        lastValidBlockHeight: 99n,
+      }),
+      simulateTransaction: async () => {
+        calls.push("simulate");
+        return {
+          err: { InstructionError: [0, { Custom: 6001 }] },
+          logs: ["Program log: Error: insufficient funds"],
+        };
+      },
+      sendRawTransaction: async () => { calls.push("send"); },
+    },
+    signer: {
+      address: OWNER,
+      signTransaction: async (bytes) => { calls.push("sign"); return bytes; },
+    },
+  });
+  client.getMarket = async () => ({ currentKeyEpoch: "AoJ755HzDcFx8VZB3rpotAWRszxv7dCVZYX9WSRe3abe" });
+  await assert.rejects(client.deposit({
+    market: MARKET,
+    baseSource: OWNER,
+    quoteSource: OWNER,
+    baseAmount: 1n,
+    quoteAmount: 0n,
+  }), (error) => error.code === "SIMULATION_FAILED" && error.message.includes("insufficient funds"));
+  assert.deepEqual(calls, ["simulate"]);
+  const snapshot = await storage.load({ cluster: "devnet", programId: BEATEX_PROGRAM_ADDRESS, market: MARKET, owner: OWNER });
+  assert.equal(snapshot.record, null);
+  assert.equal(snapshot.pending, null);
+});
+
+test("RPC simulation uses the same commitment as SDK blockhash acquisition", async () => {
+  const rpc = createBeatExRpc("https://api.devnet.solana.com", {
+    fetch: async (_url, options) => {
+      const request = JSON.parse(options.body);
+      assert.equal(request.method, "simulateTransaction");
+      assert.equal(request.params[1].sigVerify, false);
+      assert.equal(request.params[1].commitment, "confirmed");
+      return new Response(JSON.stringify({ result: { value: { err: null, logs: [] } } }));
+    },
+  });
+  assert.equal((await rpc.simulateTransaction(Uint8Array.of(1, 2, 3))).err, null);
+});
+
 test("Kit compiler emits an extended v1 transaction below the configured cap", async () => {
   const compiler = createKitTransactionCompiler();
   const bytes = await compiler.compileTransaction({
@@ -210,6 +274,118 @@ test("Kit compiler emits an extended v1 transaction below the configured cap", a
     },
   });
   assert.ok(bytes.length > 0 && bytes.length < 4096);
+});
+
+test("private-balance initialization, deposit, and withdrawal fit legacy transactions", async () => {
+  const compiler = createKitTransactionCompiler();
+  const keyEpoch = "GUmGUhaqt7oAt1YkyrAT45CbApGHPxbJTdL73yL6mrED";
+  const verificationKey = "6RYzpuCsjK9S8gjdvFvNu5nn1FUMzSe8K1f2Cbq2GqqH";
+  const privateBalance = "HszvZYc6jdgTUSjknGM7GWA6a3YVb9NdZcLx1kyNQ4zq";
+  const baseSource = "AELxK7o5px97XjhMYuEBQunMBXTCQUebqbyzeqEvcnoJ";
+  const quoteSource = "8fRxn1rXBtJoBSVNT5CiVXQZzBdib5CAbBJ1da2gH6Up";
+  const baseVault = "66hcLz9vzMcnb98yjiUa1aiJWZUnyDCg9jjbxAXerxTU";
+  const quoteVault = "BukhQVo4ebbCbdPaithQvAT8yqhYLHh2wmvxfVbr21j2";
+  const vaultAuthority = "GX352jffG1zdZ3juFr2HVyoCc5vJ5LWQJWmtDcBM9np7";
+  const account = (address, writable = false, signer = false) => ({
+    address,
+    writable,
+    signer,
+  });
+  const common = [
+    account(OWNER, true, true),
+    account(MARKET),
+    account(keyEpoch),
+    account(verificationKey),
+    account(privateBalance, true),
+    account(TBTC),
+    account(TUSD),
+  ];
+  const cases = [
+    {
+      name: "private-balance initialization",
+      accounts: [
+        account(OWNER, true, true),
+        account(MARKET),
+        account(keyEpoch),
+        account(privateBalance, true),
+        account(SYSTEM_PROGRAM_ADDRESS),
+      ],
+      data: encodeInitializePrivateBalance(fixed(64), fixed(64)),
+      expectedSize: 495,
+    },
+    {
+      name: "deposit",
+      accounts: [
+        ...common,
+        account(baseSource, true),
+        account(quoteSource, true),
+        account(baseVault, true),
+        account(quoteVault, true),
+        account(vaultAuthority),
+        account(TOKEN_2022_PROGRAM_ADDRESS),
+      ],
+      data: encodeDepositCollateral({
+        baseAmount: 1n,
+        quoteAmount: 1n,
+        newEncryptedBase: fixed(64),
+        newEncryptedQuote: fixed(64),
+        proof,
+      }),
+      expectedSize: 1063,
+    },
+    {
+      name: "withdrawal",
+      accounts: [
+        ...common,
+        account(baseVault, true),
+        account(quoteVault, true),
+        account(baseSource, true),
+        account(quoteSource, true),
+        account(vaultAuthority),
+        account(TOKEN_2022_PROGRAM_ADDRESS),
+      ],
+      data: encodeWithdrawPublicBalance({
+        baseAmount: 1n,
+        quoteAmount: 1n,
+        remainingEncryptedBase: fixed(64),
+        remainingEncryptedQuote: fixed(64),
+        proof,
+      }),
+      expectedSize: 1063,
+    },
+  ];
+
+  for (const item of cases) {
+    const bytes = await compiler.compileTransaction({
+      feePayer: OWNER,
+      recentBlockhash: {
+        blockhash: "11111111111111111111111111111111",
+        lastValidBlockHeight: 1n,
+      },
+      instructions: [
+        {
+          programId: BEATEX_PROGRAM_ADDRESS,
+          accounts: item.accounts,
+          data: item.data,
+        },
+      ],
+      config: {
+        version: "legacy",
+        maxTransactionBytes: 1232,
+        computeUnitLimit: 1_400_000,
+        loadedAccountsDataSizeLimit: 2 * 1024 * 1024,
+        heapSize: 256 * 1024,
+        priorityFeeLamports: 0n,
+      },
+    });
+    const decoded = getTransactionDecoder().decode(bytes);
+    const message = getCompiledTransactionMessageDecoder().decode(
+      decoded.messageBytes,
+    );
+    assert.equal(message.version, "legacy", `${item.name} must use the legacy wire format`);
+    assert.equal(bytes.length, item.expectedSize, `${item.name} legacy wire size changed`);
+    assert.ok(bytes.length <= 1232);
+  }
 });
 
 test("the frozen six-instruction rollover remains exactly 4,093 bytes", async () => {

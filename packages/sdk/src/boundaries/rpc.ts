@@ -51,9 +51,12 @@ export interface SolanaInstruction {
 }
 
 export interface TransactionMessageConfig {
-  /** BeatEx uses Solana's extended v1 transaction format. */
-  readonly version: 1;
-  readonly maxTransactionBytes: 4096;
+  /**
+   * Orders and settlements need Solana's extended v1 format (4,096 bytes). Balance
+   * operations fit a legacy transaction (1,232 bytes), which every wallet can sign.
+   */
+  readonly version: 1 | "legacy";
+  readonly maxTransactionBytes: 4096 | 1232;
   readonly computeUnitLimit?: number;
   readonly loadedAccountsDataSizeLimit?: number;
   readonly heapSize?: number;
@@ -85,6 +88,7 @@ export interface BeatExRpc {
   ): Promise<readonly (AccountInfo | null)[]>;
   getSlot(commitment?: Commitment): Promise<bigint>;
   getLatestBlockhash(commitment?: Commitment): Promise<LatestBlockhash>;
+  /** Accept unsigned transactions: simulation must disable signature verification. */
   simulateTransaction(transaction: Uint8Array): Promise<SimulationResult>;
   sendRawTransaction(
     signedTransaction: Uint8Array,

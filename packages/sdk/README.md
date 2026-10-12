@@ -3,7 +3,7 @@
 Browser-compatible TypeScript SDK for the BeatEx Solana program.
 
 The SDK owns protocol account decoding, PDA derivation, Anchor-compatible
-instruction encoding, Solana v1 transaction construction, proof orchestration,
+instruction encoding, Solana legacy and extended-v1 transaction construction, proof orchestration,
 and crash-safe private-state transitions. Frontends should use this package
 instead of constructing BeatEx instructions directly.
 
@@ -69,7 +69,9 @@ return the exact proof, ciphertext transition, and next private opening.
 
 The SDK validates the result's fixed-width wire shape, reconstructs the
 program instruction, simulates it, and asks the wallet to sign the resulting
-Solana v1 transaction.
+transaction. Private-balance initialization, deposits, and withdrawals use the
+widely supported legacy envelope. Orders and settlements retain Solana's
+extended v1 envelope because their payloads exceed the legacy size limit.
 
 ## Private state
 
@@ -77,7 +79,8 @@ Private balance openings, order quantities, randomness, and order salts cannot
 be recovered from Solana. A frontend must back up its `PrivateStateStorage`.
 The provided storage implementations use a two-phase journal:
 
-1. Compile, sign, and simulate the transaction.
+1. Compile and simulate before requesting a wallet signature; simulate the
+   returned transaction again because a wallet may modify its message.
 2. Persist the next private opening as pending.
 3. Broadcast and record the transaction signature.
 4. Commit the opening only after confirmation.

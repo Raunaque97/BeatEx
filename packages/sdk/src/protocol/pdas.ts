@@ -183,3 +183,23 @@ export async function deriveAuctionPdas(
   ]);
   return { auctionId, auction, submissionCounter, accumulator };
 }
+
+/** The SPL Associated Token Account program. */
+export const ASSOCIATED_TOKEN_PROGRAM_ADDRESS =
+  "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL" as Address;
+
+/** The owner's associated Token-2022 account for `mint`. */
+export function deriveAssociatedToken2022Address(
+  owner: Address,
+  mint: Address,
+  tokenProgram: Address,
+): Promise<ProgramDerivedAddress> {
+  return getProgramDerivedAddress({
+    programAddress: ASSOCIATED_TOKEN_PROGRAM_ADDRESS,
+    seeds: [
+      addressEncoder.encode(owner),
+      addressEncoder.encode(tokenProgram),
+      addressEncoder.encode(mint),
+    ],
+  });
+}
