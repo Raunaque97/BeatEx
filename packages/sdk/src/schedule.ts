@@ -74,10 +74,13 @@ export function previewReferencePrice(
     | "lastClearingPrice"
     | "minimumReferenceVolume"
     | "oracleExponentAdjustment"
+    | "oraclePriceAccount"
   >,
   auctionId: bigint,
   oracle: Pick<PythPriceUpdate, "price" | "exponent"> | null,
 ): ReferencePricePreview | null {
+  // An oracle-free market always continues from its last clearing price.
+  if (!hasOracle(market)) return { referencePrice: market.lastClearingPrice, fromOracle: false };
   // The sequence stores the cleared auction's id plus one; auction N+1 may use N-1's price.
   const usePrevious =
     auctionId > 0n &&
@@ -90,4 +93,11 @@ export function previewReferencePrice(
     referencePrice: normalizeOraclePrice(oracle.price, oracle.exponent, market.oracleExponentAdjustment),
     fromOracle: true,
   };
+}
+
+const NO_ORACLE = "11111111111111111111111111111111";
+
+/** Whether the market prices its reference from an oracle (false for oracle-free markets). */
+export function hasOracle(market: Pick<MarketAccount, "oraclePriceAccount">): boolean {
+  return market.oraclePriceAccount !== NO_ORACLE;
 }

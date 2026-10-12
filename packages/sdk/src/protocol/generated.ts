@@ -45,5 +45,5 @@ export const GENERATED_DEPLOYMENT = {
       "CANCELLATION_REFUND": 3
     }
   },
-  "idlSha256": "0def851424c173f1421cf4e886902027d2587b31cb9ff8c873aaa8dfe4556600"
+  "idlSha256": "dc075d99e838206f8e66071a2bc79a61c85a7591094006bd136d2d01fe08fdcf"
 } as const;

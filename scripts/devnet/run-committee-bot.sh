@@ -27,6 +27,8 @@ cluster='devnet'
 wallet=''
 state_dir=''
 rpc_url=''
+base_symbol='tBTC'
+quote_symbol='tUSD'
 
 usage() {
   cat <<'EOF'
@@ -38,6 +40,8 @@ Options:
   --cluster localnet|devnet   Target cluster (default: devnet)
   --state-dir <DIRECTORY>     Setup state (default: .devnet/<cluster>)
   --rpc-url <URL>             Primary Solana RPC URL
+  --base-symbol <SYMBOL>      Base token row in addresses.tsv (default: tBTC)
+  --quote-symbol <SYMBOL>     Quote token row in addresses.tsv (default: tUSD)
   -h, --help                  Show this help
 
 The launcher builds and execs one long-running Rust process. RPC fallbacks are
@@ -51,6 +55,8 @@ while (( $# > 0 )); do
     --cluster) cluster="${2:?--cluster requires a value}"; shift 2 ;;
     --state-dir) state_dir="${2:?--state-dir requires a value}"; shift 2 ;;
     --rpc-url) rpc_url="${2:?--rpc-url requires a value}"; shift 2 ;;
+    --base-symbol) base_symbol="${2:?--base-symbol requires a value}"; shift 2 ;;
+    --quote-symbol) quote_symbol="${2:?--quote-symbol requires a value}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) printf '[%s] Unknown argument: %s\n' "$(timestamp)" "$1" >&2; usage >&2; exit 2 ;;
   esac
@@ -83,10 +89,10 @@ if [[ ! -f "$addresses_file" ]]; then
   printf '[%s] Missing token manifest: %s\n' "$(timestamp)" "$addresses_file" >&2
   exit 1
 fi
-base_mint="$(awk -F '\t' '$1 == "tBTC" { print $2 }' "$addresses_file")"
-quote_mint="$(awk -F '\t' '$1 == "tUSD" { print $2 }' "$addresses_file")"
+base_mint="$(awk -F '\t' -v symbol="$base_symbol" '$1 == symbol { print $2 }' "$addresses_file")"
+quote_mint="$(awk -F '\t' -v symbol="$quote_symbol" '$1 == symbol { print $2 }' "$addresses_file")"
 if [[ -z "$base_mint" || -z "$quote_mint" ]]; then
-  printf '[%s] Could not read tBTC/tUSD from %s\n' "$(timestamp)" "$addresses_file" >&2
+  printf '[%s] Could not read %s/%s from %s\n' "$(timestamp)" "$base_symbol" "$quote_symbol" "$addresses_file" >&2
   exit 1
 fi
 

@@ -27,7 +27,8 @@ use {
 
 const LEVELS: usize = 17;
 const BPS_DENOMINATOR: u128 = 10_000;
-const BASE_TOKEN_DECIMALS: u32 = 8;
+const DEFAULT_BASE_TOKEN_DECIMALS: u32 = 8;
+const DEFAULT_QUOTE_TOKEN_DECIMALS: u32 = 6;
 const EXPECTED_BASE_UNIT_SIZE: u64 = 100;
 const EXPECTED_QUOTE_UNIT_SIZE: u64 = 1;
 const CIRCUIT_QUANTITY_MAX: u64 = (1 << 28) - 1;
@@ -39,21 +40,40 @@ const DEFAULT_RPC_URL: &str = "https://api.devnet.solana.com";
 const MIN_ORDER_START_REMAINING_SLOTS: u64 = 12;
 const NEXT_AUCTION_PREPARE_REMAINING_SLOTS: u64 = 12;
 const ORDER_OPEN_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// Longer than a blockhash lifetime (150 blocks), after which an unconfirmed
+/// transaction can no longer land.
+const UNCERTAIN_ORDER_SETTLE_WAIT: Duration = Duration::from_secs(90);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PriceSource {
     Pyth,
     Binance,
+    /// No external feed: an exponential moving average of the market's own
+    /// clearing prices, for markets without an oracle.
+    Ema,
 }
 
 #[derive(Clone, Debug)]
 struct Config {
     source: PriceSource,
+    /// Whether this maker buys in even auctions (and sells in odd ones). Two
+    /// makers must use opposite parities so their orders cross.
+    buy_on_even: bool,
     rpc_urls: Vec<String>,
     market: Pubkey,
     base_quantity: String,
     slope_quantity: String,
     max_quantity: String,
+    /// Working private tBTC balance; the tUSD target is its value at the
+    /// expected price, so both sides hold roughly equal value.
+    target_base: String,
+    /// Base-token decimals and display symbols, so one binary serves any market.
+    base_decimals: u32,
+    base_symbol: String,
+    quote_decimals: u32,
+    quote_symbol: String,
+    /// Weight of the newest clearing price in the `ema` source.
+    ema_alpha: f64,
     interval: Duration,
     state_dir: Option<String>,
     wallet: Option<String>,
@@ -86,6 +106,8 @@ struct OrderJob {
     auction_id: u64,
     operation: &'static str,
     side: Side,
+    target_base: u64,
+    target_quote: u64,
     max_tusd: String,
     max_tbtc: String,
     intent: OrderIntent,
@@ -173,13 +195,15 @@ fn usage() {
          [--rpc-url URL] [--base-quantity TBTC] [--slope-quantity TBTC] \
          [--max-quantity TBTC] [--interval-ms N] \
          [--state-dir DIR] [--wallet KEYPAIR] [--balance-every-auctions N] \
-         [--budget-bps N] [--once]\n\n\
+         [--budget-bps N] [--target-tbtc TBTC] [--buy-on even|odd] [--once]\n\n\
          Quantities are human tBTC decimal strings. The bot reads the current Market and \
          Auction before every order and uses the auction's reference price, basis-point \
          grid step, and grid size. Orders are submitted directly through the native Rust \
          client and the call returns only after the transaction is confirmed. When state-dir and \
          wallet are supplied, the bot prints the encrypted ledger balance every N auctions. \
-         Each order is capped at budget-bps of the private balance (default 1000 = 10%)."
+         Each order is capped at budget-bps of the private balance (default 1000 = 10%). \
+         The private balance is kept near target-tbtc (default 0.25) plus the same value \
+         in tUSD, topping both up from the wallet when either falls below half."
     );
 }
 
@@ -206,7 +230,15 @@ fn parse_config() -> Result<Config, Box<dyn Error>> {
     let source = match value("--source")?.as_str() {
         "pyth" => PriceSource::Pyth,
         "binance" => PriceSource::Binance,
+        "ema" => PriceSource::Ema,
         other => return Err(format!("unsupported price source {other}").into()),
+    };
+    let buy_on_even = match optional("--buy-on").as_deref() {
+        Some("even") => true,
+        Some("odd") => false,
+        Some(other) => return Err(format!("--buy-on must be even or odd, not {other}").into()),
+        // Historical pairing: the Pyth maker buys in even auctions.
+        None => source == PriceSource::Pyth,
     };
     let rpc_url = optional("--rpc-url")
         .or_else(|| env::var("BEATEX_RPC_URL").ok())
@@ -233,11 +265,22 @@ fn parse_config() -> Result<Config, Box<dyn Error>> {
     };
     Ok(Config {
         source,
+        buy_on_even,
         rpc_urls,
         market: Pubkey::from_str(&value("--market")?)?,
-        base_quantity: optional("--base-quantity").unwrap_or_else(|| "0.0005".to_owned()),
-        slope_quantity: optional("--slope-quantity").unwrap_or_else(|| "0.0001".to_owned()),
-        max_quantity: optional("--max-quantity").unwrap_or_else(|| "0.001".to_owned()),
+        base_quantity: optional("--base-quantity").unwrap_or_else(|| "0.005".to_owned()),
+        slope_quantity: optional("--slope-quantity").unwrap_or_else(|| "0.001".to_owned()),
+        max_quantity: optional("--max-quantity").unwrap_or_else(|| "0.01".to_owned()),
+        target_base: optional("--target-base")
+            .or_else(|| optional("--target-tbtc"))
+            .unwrap_or_else(|| "0.25".to_owned()),
+        base_decimals: optional("--base-decimals")
+            .map_or(Ok(DEFAULT_BASE_TOKEN_DECIMALS), |value| value.parse())?,
+        base_symbol: optional("--base-symbol").unwrap_or_else(|| "tBTC".to_owned()),
+        quote_decimals: optional("--quote-decimals")
+            .map_or(Ok(DEFAULT_QUOTE_TOKEN_DECIMALS), |value| value.parse())?,
+        quote_symbol: optional("--quote-symbol").unwrap_or_else(|| "tUSD".to_owned()),
+        ema_alpha: optional("--ema-alpha").map_or(Ok(0.2), |value| value.parse())?,
         interval: match optional("--interval-ms") {
             Some(milliseconds) => Duration::from_millis(milliseconds.parse()?),
             None => match optional("--interval-seconds") {
@@ -303,10 +346,12 @@ fn report_balance(config: &Config, auction_id: u64) {
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
     println!(
-        "[{}] auction {auction_id} private balance: tBTC {} | tUSD {} (ledger revision {revision})",
+        "[{}] auction {auction_id} private balance: {} {} | {} {} (ledger revision {revision})",
         timestamp(),
-        format_units(u128::from(base), BASE_TOKEN_DECIMALS),
-        format_units(u128::from(quote), 6),
+        config.base_symbol,
+        format_units(u128::from(base), config.base_decimals),
+        config.quote_symbol,
+        format_units(u128::from(quote), config.quote_decimals),
     );
 }
 
@@ -389,6 +434,56 @@ fn private_balance(config: &Config) -> Option<(u64, u64)> {
     ))
 }
 
+/// Confirm that an order whose confirmation was lost never landed: its
+/// signature is unknown even in transaction history, and the on-chain private
+/// balance revision still equals the local one.
+fn verify_unconfirmed_order(config: &Config, error: &str) -> Result<(), String> {
+    let signature = error
+        .split_whitespace()
+        .skip_while(|word| *word != "for")
+        .nth(1)
+        .ok_or_else(|| format!("no signature in {error:?}"))?;
+    let statuses: serde_json::Value = rpc_request(
+        &config.rpc_urls,
+        "getSignatureStatuses",
+        serde_json::json!([[signature], {"searchTransactionHistory": true}]),
+    )
+    .map_err(|error| error.to_string())?;
+    if !statuses
+        .pointer("/value/0")
+        .is_none_or(serde_json::Value::is_null)
+    {
+        return Err(format!("transaction {signature} landed"));
+    }
+    let (Some(state_dir), Some(owner)) = (&config.state_dir, config.wallet_owner) else {
+        return Err("no local private state to compare".to_owned());
+    };
+    let local = Path::new(state_dir)
+        .join("traders")
+        .join(config.market.to_string())
+        .join(format!("{owner}.json"));
+    let local_revision = fs::read(&local)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|value| value.get("revision").and_then(serde_json::Value::as_u64))
+        .ok_or_else(|| format!("cannot read {}", local.display()))?;
+    let (balance, _) = Pubkey::find_program_address(
+        &[b"private-balance", config.market.as_ref(), owner.as_ref()],
+        &beatex::ID,
+    );
+    let onchain =
+        fetch_anchor_account::<beatex::EncryptedPrivateBalance>(&config.rpc_urls, &balance)
+            .map_err(|error| error.to_string())?
+            .ok_or("private balance account is missing")?;
+    if onchain.revision != local_revision {
+        return Err(format!(
+            "on-chain revision {} differs from local revision {local_revision}",
+            onchain.revision
+        ));
+    }
+    Ok(())
+}
+
 fn cap_order_budget(
     config: &Config,
     market: &beatex::Market,
@@ -450,6 +545,7 @@ fn cap_order_budget(
 }
 
 fn order_maxima(
+    config: &Config,
     auction: &beatex::Auction,
     intent: &OrderIntent,
 ) -> Result<(String, String), Box<dyn Error>> {
@@ -468,8 +564,8 @@ fn order_maxima(
         .max()
         .unwrap_or_default();
     Ok((
-        format_units(max_quote_units, 6),
-        format_units(max_base_atoms, 8),
+        format_units(max_quote_units, config.quote_decimals),
+        format_units(max_base_atoms, config.base_decimals),
     ))
 }
 
@@ -749,8 +845,10 @@ fn report_wallet_identity(config: &Config, market: &beatex::Market) {
         .map(|(amount, decimals)| format_units(amount, decimals))
         .unwrap_or_else(|error| format!("error: {error}"));
     println!(
-        "[{}] wallet {owner} balances: SOL {sol} | tBTC {base} | tUSD {quote}",
-        timestamp()
+        "[{}] wallet {owner} balances: SOL {sol} | {} {base} | {} {quote}",
+        timestamp(),
+        config.base_symbol,
+        config.quote_symbol,
     );
 }
 
@@ -842,6 +940,7 @@ fn expected_price(
                 response.price,
             ))
         }
+        PriceSource::Ema => Err("the ema source is maintained by the quoting loop".into()),
     }
 }
 
@@ -882,6 +981,7 @@ fn grid_prices(auction: &beatex::Auction) -> Result<[u64; LEVELS], Box<dyn Error
 enum Side {
     Buy,
     Sell,
+    Both,
 }
 
 impl Side {
@@ -889,17 +989,19 @@ impl Side {
         match self {
             Side::Buy => "buy",
             Side::Sell => "sell",
+            Side::Both => "two-sided",
         }
     }
 }
 
 /// The two makers quote opposite sides and swap every auction so neither
-/// accumulates inventory: the Pyth maker buys in even auctions and sells in odd
-/// ones, and the Binance maker does the reverse.
-fn quoting_side(source: PriceSource, auction_id: u64) -> Side {
-    match (source, auction_id % 2 == 0) {
-        (PriceSource::Pyth, true) | (PriceSource::Binance, false) => Side::Buy,
-        _ => Side::Sell,
+/// accumulates inventory: one buys in even auctions and sells in odd ones, the
+/// other does the reverse.
+fn quoting_side(buy_on_even: bool, auction_id: u64) -> Side {
+    if (auction_id % 2 == 0) == buy_on_even {
+        Side::Buy
+    } else {
+        Side::Sell
     }
 }
 
@@ -938,6 +1040,7 @@ fn one_sided_curve(
         let favourable = match side {
             Side::Buy => price <= expected,
             Side::Sell => price >= expected,
+            Side::Both => return Err("one-sided curves take a single side".into()),
         };
         let shift = slope_quantity.saturating_mul(steps);
         let quantity = if favourable {
@@ -950,6 +1053,83 @@ fn one_sided_curve(
         match side {
             Side::Buy => buy[index] = quantity,
             Side::Sell => sell[index] = quantity,
+            Side::Both => unreachable!("one-sided curves take a single side"),
+        }
+    }
+    Ok((buy, sell))
+}
+
+/// Advance the running EMA once per auction with the market's latest
+/// clearing price and return it as an integer grid price. The program keeps
+/// `last_clearing_price` unchanged across zero-volume auctions, so those
+/// auctions repeat the last price; an oracle-free market starts at its initial
+/// price.
+fn update_ema(
+    config: &Config,
+    ema: &mut Option<(u64, f64)>,
+    auction_id: u64,
+) -> Result<u64, Box<dyn Error>> {
+    if let Some((seen, value)) = *ema {
+        if seen == auction_id {
+            return Ok(value.round() as u64);
+        }
+    }
+    let market = fetch_anchor_account::<beatex::Market>(&config.rpc_urls, &config.market)?
+        .ok_or("market account does not exist")?;
+    let price = market.last_clearing_price as f64;
+    if price <= 0.0 {
+        return Err("the market has no clearing price to average yet".into());
+    }
+    let value = match *ema {
+        Some((_, previous)) => config.ema_alpha * price + (1.0 - config.ema_alpha) * previous,
+        None => price,
+    };
+    *ema = Some((auction_id, value));
+    Ok(value.round() as u64)
+}
+
+/// A two-sided V around `expected` with one grid level of spread on each side:
+/// bids start at the nearest level below `expected` and asks at the nearest
+/// level above, each growing by `slope` per further level up to `max`. A level
+/// exactly at `expected` is left empty.
+fn two_sided_curve(
+    auction: &beatex::Auction,
+    expected: u64,
+    base_quantity: u64,
+    slope_quantity: u64,
+    max_quantity: u64,
+) -> Result<([u64; LEVELS], [u64; LEVELS]), Box<dyn Error>> {
+    let prices = grid_prices(auction)?;
+    let denominator = u128::from(auction.reference_price)
+        .checked_mul(u128::from(auction.grid_step_bps))
+        .ok_or("distance overflow")?;
+    if denominator == 0 {
+        return Err("grid distance denominator is zero".into());
+    }
+    let mut buy = [0u64; LEVELS];
+    let mut sell = [0u64; LEVELS];
+    for index in 0..usize::from(auction.grid_size) {
+        let price = prices[index];
+        if price == expected {
+            continue;
+        }
+        // Levels away from `expected`, rounded up so the nearest level on each
+        // side is level one.
+        let steps = u64::try_from(
+            u128::from(price.abs_diff(expected))
+                .checked_mul(BPS_DENOMINATOR)
+                .and_then(|value| value.checked_add(denominator - 1))
+                .ok_or("distance overflow")?
+                / denominator,
+        )?
+        .max(1);
+        let quantity = base_quantity
+            .saturating_add(slope_quantity.saturating_mul(steps - 1))
+            .min(max_quantity);
+        if price < expected {
+            buy[index] = quantity;
+        } else {
+            sell[index] = quantity;
         }
     }
     Ok((buy, sell))
@@ -989,6 +1169,8 @@ fn dispatch(config: &Config, job: &OrderJob) -> Result<(), Box<dyn Error>> {
             quote_source,
             deposit_base: 0,
             deposit_quote: 0,
+            target_base: job.target_base,
+            target_quote: job.target_quote,
         },
         beatex_devnet_client::NativeOrderIntent {
             auction_id: Some(job.auction_id),
@@ -1028,23 +1210,27 @@ fn dispatch(config: &Config, job: &OrderJob) -> Result<(), Box<dyn Error>> {
                 base_amount,
                 quote_amount,
             } if base_amount > 0 && quote_amount > 0 => println!(
-                "[{}] auction {} {} filled tBTC {} for tUSD {}",
+                "[{}] auction {} {} filled {} {} for {} {}",
                 timestamp(),
                 auction_id,
                 side,
-                format_units(u128::from(base_amount), 8),
-                format_units(u128::from(quote_amount), 6)
+                config.base_symbol,
+                format_units(u128::from(base_amount), config.base_decimals),
+                config.quote_symbol,
+                format_units(u128::from(quote_amount), config.quote_decimals)
             ),
             beatex_devnet_client::NativeOrderEvent::Refund {
                 auction_id,
                 base_amount,
                 quote_amount,
             } if base_amount > 0 || quote_amount > 0 => println!(
-                "[{}] auction {} refund completed (tBTC {}, tUSD {})",
+                "[{}] auction {} refund completed ({} {}, {} {})",
                 timestamp(),
                 auction_id,
-                format_units(u128::from(base_amount), 8),
-                format_units(u128::from(quote_amount), 6)
+                config.base_symbol,
+                format_units(u128::from(base_amount), config.base_decimals),
+                config.quote_symbol,
+                format_units(u128::from(quote_amount), config.quote_decimals)
             ),
             beatex_devnet_client::NativeOrderEvent::Fill { .. }
             | beatex_devnet_client::NativeOrderEvent::Refund { .. } => {}
@@ -1104,36 +1290,38 @@ fn spawn_order_worker(
                 continue;
             }
             let started = Instant::now();
-            let result = match dispatch(&config, &job) {
-                Ok(()) => {
-                    println!(
-                        "[{}] auction {} {} {} order completed in {:.2}s (max tUSD: {}, max tBTC: {})",
+            let result =
+                match dispatch(&config, &job) {
+                    Ok(()) => {
+                        println!(
+                        "[{}] auction {} {} {} order completed in {:.2}s (max {}: {}, max {}: {})",
                         timestamp(), job.auction_id, job.operation, job.side.label(),
-                        started.elapsed().as_secs_f64(), job.max_tusd, job.max_tbtc
+                        started.elapsed().as_secs_f64(), config.quote_symbol, job.max_tusd,
+                        config.base_symbol, job.max_tbtc
                     );
-                    OrderWorkerResult::Submitted(job.auction_id)
-                }
-                Err(error) => {
-                    eprintln!(
-                        "[{}] auction {} {} order failed after {:.2}s: {error}",
-                        timestamp(),
-                        job.auction_id,
-                        job.operation,
-                        started.elapsed().as_secs_f64()
-                    );
-                    if error
-                        .to_string()
-                        .contains("transaction confirmation outcome unknown")
-                        || error
-                            .to_string()
-                            .contains("transaction submission outcome unknown")
-                    {
-                        OrderWorkerResult::Uncertain(error.to_string())
-                    } else {
-                        OrderWorkerResult::Failed(job.auction_id)
+                        OrderWorkerResult::Submitted(job.auction_id)
                     }
-                }
-            };
+                    Err(error) => {
+                        eprintln!(
+                            "[{}] auction {} {} order failed after {:.2}s: {error}",
+                            timestamp(),
+                            job.auction_id,
+                            job.operation,
+                            started.elapsed().as_secs_f64()
+                        );
+                        if error
+                            .to_string()
+                            .contains("transaction confirmation outcome unknown")
+                            || error
+                                .to_string()
+                                .contains("transaction submission outcome unknown")
+                        {
+                            OrderWorkerResult::Uncertain(error.to_string())
+                        } else {
+                            OrderWorkerResult::Failed(job.auction_id)
+                        }
+                    }
+                };
             if result_sender.send(result).is_err() {
                 break;
             }
@@ -1187,6 +1375,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut last_balance_report = None;
     let mut last_submitted_auction = None;
     let mut in_flight_auction = None;
+    // Running EMA of the market's clearing price for the `ema` source, updated
+    // once per auction. A zero-volume auction repeats the last price.
+    let mut ema: Option<(u64, f64)> = None;
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_signal = Arc::clone(&shutdown);
     ctrlc::set_handler(move || shutdown_signal.store(true, Ordering::Release))?;
@@ -1213,10 +1404,27 @@ fn run() -> Result<(), Box<dyn Error>> {
                 }
             }
             Ok(OrderWorkerResult::Uncertain(error)) => {
-                return Err(format!(
-                    "stopping market maker because a submitted order may still settle: {error}"
-                )
-                .into());
+                // An RPC can lose a transaction without confirming it. Once its
+                // blockhash has expired it can no longer land, so the local
+                // private state is still current if it did not land and the
+                // on-chain balance revision still matches.
+                eprintln!(
+                    "[{}] order outcome unknown ({error}); verifying after the blockhash expires",
+                    timestamp()
+                );
+                thread::sleep(UNCERTAIN_ORDER_SETTLE_WAIT);
+                match verify_unconfirmed_order(&config, &error) {
+                    Ok(()) => {
+                        eprintln!("[{}] unconfirmed order did not land; resuming", timestamp());
+                        in_flight_auction = None;
+                    }
+                    Err(reason) => {
+                        return Err(format!(
+                            "stopping market maker because a submitted order may have settled: {reason}"
+                        )
+                        .into());
+                    }
+                }
             }
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => {
@@ -1288,19 +1496,22 @@ fn run() -> Result<(), Box<dyn Error>> {
         };
         let base_quantity = decimal_token_units(
             &config.base_quantity,
-            BASE_TOKEN_DECIMALS,
+            config.base_decimals,
             market.base_unit_size,
         )?;
         let slope_quantity = decimal_token_units(
             &config.slope_quantity,
-            BASE_TOKEN_DECIMALS,
+            config.base_decimals,
             market.base_unit_size,
         )?;
         let max_quantity = decimal_token_units(
             &config.max_quantity,
-            BASE_TOKEN_DECIMALS,
+            config.base_decimals,
             market.base_unit_size,
         )?;
+        // The private ledger counts tBTC in token atoms (satoshis), not in
+        // protocol base units, and tUSD in quote atoms.
+        let target_base = decimal_token_units(&config.target_base, config.base_decimals, 1)?;
         let configured_max = market.max_order_quantity.min(CIRCUIT_QUANTITY_MAX);
         if base_quantity > max_quantity || max_quantity > configured_max {
             return Err(format!(
@@ -1308,7 +1519,13 @@ fn run() -> Result<(), Box<dyn Error>> {
             )
             .into());
         }
-        let (expected, observed) = match expected_price(&config, &market) {
+        let expected_quote = if config.source == PriceSource::Ema {
+            update_ema(&config, &mut ema, auction.auction_id)
+                .map(|price| (price, format!("ema {price}")))
+        } else {
+            expected_price(&config, &market)
+        };
+        let (expected, observed) = match expected_quote {
             Ok(price) => price,
             Err(error) => {
                 eprintln!(
@@ -1319,21 +1536,42 @@ fn run() -> Result<(), Box<dyn Error>> {
                 continue;
             }
         };
-        let side = quoting_side(config.source, auction.auction_id);
-        let (mut buy, mut sell) = one_sided_curve(
-            &auction,
-            expected,
-            side,
-            base_quantity,
-            slope_quantity,
-            max_quantity,
-        )?;
+        // Quote atoms per protocol base unit times base units: equal value on both sides.
+        let target_quote = (target_base / market.base_unit_size).saturating_mul(expected);
+        // External feeds alternate one-sided quotes between two makers; the EMA
+        // maker is the only liquidity in its market and quotes both sides.
+        let (side, (mut buy, mut sell)) = if config.source == PriceSource::Ema {
+            (
+                Side::Both,
+                two_sided_curve(
+                    &auction,
+                    expected,
+                    base_quantity,
+                    slope_quantity,
+                    max_quantity,
+                )?,
+            )
+        } else {
+            let side = quoting_side(config.buy_on_even, auction.auction_id);
+            (
+                side,
+                one_sided_curve(
+                    &auction,
+                    expected,
+                    side,
+                    base_quantity,
+                    slope_quantity,
+                    max_quantity,
+                )?,
+            )
+        };
         cap_order_budget(&config, &market, &auction, &mut buy, &mut sell)?;
         let nonce = u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())?;
         let intent = OrderIntent {
             source: match config.source {
                 PriceSource::Pyth => "pyth",
                 PriceSource::Binance => "binance",
+                PriceSource::Ema => "ema",
             },
             observed_price: observed,
             expected_price: expected,
@@ -1347,7 +1585,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             sell,
         };
         let operation = order_operation(&config, auction.auction_id);
-        let (max_tusd, max_tbtc) = order_maxima(&auction, &intent)?;
+        let (max_tusd, max_tbtc) = order_maxima(&config, &auction, &intent)?;
         match current_submission_window(&config) {
             Ok((auction_id, remaining_slots))
                 if auction_id == auction.auction_id && order_start_is_safe(remaining_slots) => {}
@@ -1372,6 +1610,8 @@ fn run() -> Result<(), Box<dyn Error>> {
                 auction_id: auction.auction_id,
                 operation,
                 side,
+                target_base,
+                target_quote,
                 max_tusd,
                 max_tbtc,
                 intent,
@@ -1444,11 +1684,29 @@ mod tests {
     }
 
     #[test]
+    fn two_sided_curve_leaves_one_level_of_spread() {
+        let auction = auction(100_000, 25);
+        let prices = grid_prices(&auction).unwrap();
+        // EMA exactly on the centre level: that level stays empty.
+        let (buy, sell) = two_sided_curve(&auction, prices[8], 5, 1, 15).unwrap();
+        assert_eq!((buy[8], sell[8]), (0, 0));
+        assert_eq!((buy[7], buy[6], buy[0]), (5, 6, 12));
+        assert_eq!((sell[9], sell[10], sell[16]), (5, 6, 12));
+        assert!(buy[9..]
+            .iter()
+            .chain(&sell[..9])
+            .all(|quantity| *quantity == 0));
+        // EMA between two levels: the nearest level on each side starts the V.
+        let (buy, sell) = two_sided_curve(&auction, prices[8] + 1, 5, 1, 15).unwrap();
+        assert_eq!((buy[8], sell[9], sell[8]), (5, 5, 0));
+    }
+
+    #[test]
     fn makers_take_opposite_sides_and_alternate() {
-        assert_eq!(quoting_side(PriceSource::Pyth, 10), Side::Buy);
-        assert_eq!(quoting_side(PriceSource::Binance, 10), Side::Sell);
-        assert_eq!(quoting_side(PriceSource::Pyth, 11), Side::Sell);
-        assert_eq!(quoting_side(PriceSource::Binance, 11), Side::Buy);
+        assert_eq!(quoting_side(true, 10), Side::Buy);
+        assert_eq!(quoting_side(false, 10), Side::Sell);
+        assert_eq!(quoting_side(true, 11), Side::Sell);
+        assert_eq!(quoting_side(false, 11), Side::Buy);
     }
 
     #[test]

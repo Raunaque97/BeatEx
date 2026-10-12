@@ -144,12 +144,26 @@ pub mod beatex {
         market.max_aggregate_quantity = args.max_aggregate_quantity;
         market.current_key_epoch = Pubkey::default();
         market.market_start_slot = args.market_start_slot;
-        market.last_clearing_price = 0;
+        market.last_clearing_price = match &ctx.accounts.oracle_price {
+            Some(_) => 0,
+            None => {
+                require!(
+                    args.initial_reference_price >= args.min_reference_price
+                        && args.initial_reference_price <= args.max_reference_price,
+                    BeatExError::InvalidMarketParameters
+                );
+                args.initial_reference_price
+            }
+        };
         market.last_clearing_volume = 0;
         market.recent_clearings = [RecentClearing::default(); RECENT_CLEARINGS];
         market.last_cleared_auction_sequence = 0;
         market.minimum_reference_volume = args.minimum_reference_volume;
-        market.oracle_price_account = ctx.accounts.oracle_price.key();
+        market.oracle_price_account = ctx
+            .accounts
+            .oracle_price
+            .as_ref()
+            .map_or(Pubkey::default(), |oracle| oracle.key());
         market.oracle_feed_id = args.oracle_feed_id;
         market.oracle_max_age_seconds = args.oracle_max_age_seconds;
         market.oracle_max_confidence_bps = args.oracle_max_confidence_bps;
@@ -269,11 +283,6 @@ pub mod beatex {
             market.current_key_epoch != Pubkey::default(),
             BeatExError::NoActiveKeyEpoch
         );
-        require_keys_eq!(
-            ctx.accounts.oracle_price.key(),
-            market.oracle_price_account,
-            BeatExError::InvalidOraclePrice
-        );
         let clock = Clock::get()?;
         let expected_id = current_auction_id(market, clock.slot)?;
         let current_end_slot = market
@@ -319,8 +328,12 @@ pub mod beatex {
             .checked_add(market.decryption_duration_slots)
             .ok_or_else(|| error!(BeatExError::ArithmeticOverflow))?;
 
-        let use_previous_clearing = previous_reference_ready
-            && market.last_clearing_volume >= market.minimum_reference_volume;
+        // An oracle-free market always continues from its last clearing price,
+        // which starts at the market's initial reference price.
+        let oracle_free = market.oracle_price_account == Pubkey::default();
+        let use_previous_clearing = oracle_free
+            || (previous_reference_ready
+                && market.last_clearing_volume >= market.minimum_reference_volume);
         let (reference_price, reference_from_oracle, oracle_publish_time) = if use_previous_clearing
         {
             (market.last_clearing_price, false, 0)
@@ -328,6 +341,8 @@ pub mod beatex {
             let price = ctx
                 .accounts
                 .oracle_price
+                .as_ref()
+                .ok_or_else(|| error!(BeatExError::InvalidOraclePrice))?
                 .get_price_no_older_than(
                     &clock,
                     market.oracle_max_age_seconds,
@@ -2273,6 +2288,9 @@ pub struct InitializeMarketArgs {
     pub allocation_rule_version: u16,
     pub order_circuit_version: u16,
     pub claim_circuit_version: u16,
+    /// Starting reference price of an oracle-free market; ignored when an
+    /// oracle account is supplied.
+    pub initial_reference_price: u64,
 }
 
 #[derive(Accounts)]
@@ -2310,8 +2328,10 @@ pub struct InitializeAuction<'info> {
         has_one = market,
     )]
     pub key_epoch: Box<Account<'info, KeyEpoch>>,
+    /// The market's Pyth account; omitted for an oracle-free market and when
+    /// the reference comes from a recent clearing.
     #[account(address = market.oracle_price_account @ BeatExError::InvalidOraclePrice)]
-    pub oracle_price: Account<'info, PriceUpdateV2>,
+    pub oracle_price: Option<Account<'info, PriceUpdateV2>>,
     #[account(
         init,
         payer = payer,
@@ -2961,8 +2981,10 @@ pub struct InitializeMarket<'info> {
     pub base_vault: UncheckedAccount<'info>,
     /// CHECK: Typed Token-2022 validation is added with Phase 4.
     pub quote_vault: UncheckedAccount<'info>,
-    /// Canonical fully-verified Pyth price-feed account selected for this market.
-    pub oracle_price: Account<'info, PriceUpdateV2>,
+    /// Canonical fully-verified Pyth price-feed account selected for this
+    /// market. Omitted for an oracle-free market, whose reference price is
+    /// always its last clearing price, starting at `initial_reference_price`.
+    pub oracle_price: Option<Account<'info, PriceUpdateV2>>,
     /// CHECK: This PDA signs vault CPIs and stores no data.
     #[account(seeds = [b"vault-authority", market.key().as_ref()], bump)]
     pub vault_authority: UncheckedAccount<'info>,

@@ -1084,6 +1084,18 @@ logic, `Market.recent_clearings` keeps the eight most recent publications
 (auction id, clearing price and volume), sorted by auction id because
 publications can land out of order.
 
+### 14.5b Oracle-free markets
+
+`initialize_market` accepts an optional oracle account. Without one, the market
+stores a zero oracle address and sets `last_clearing_price` to the required
+`initial_reference_price`, which must lie within the market's reference bounds.
+`initialize_auction` then always takes the last clearing price as the reference
+and needs no oracle account; it keeps the same early-initialization gating, so
+auction N+1 still prefers auction N-1's clearing when it is published in time.
+Zero-volume publications keep `last_clearing_price` unchanged, so an
+oracle-free market's price moves only through trades. Oracle markets must still
+supply their oracle whenever the reference falls back to it.
+
 ### 14.6 Token vaults
 
 - One base and one quote Token-2022 account per market in the prototype.

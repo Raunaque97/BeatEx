@@ -88,7 +88,7 @@ import {
   type SubmissionCounterAccount,
 } from "./protocol/index.js";
 import { createKitTransactionCompiler } from "./kit-compiler.js";
-import { auctionIdAtSlot, deriveAuctionPhase, type AuctionPhase } from "./schedule.js";
+import { auctionIdAtSlot, deriveAuctionPhase, hasOracle, type AuctionPhase } from "./schedule.js";
 
 const addressEncoder = getAddressEncoder();
 const DEFAULT_TRANSACTION_CONFIG = {
@@ -570,7 +570,8 @@ export class BeatExClient {
           meta(this.owner, true, true),
           meta(market),
           meta(marketState.currentKeyEpoch),
-          meta(marketState.oraclePriceAccount),
+          // Anchor reads the program id as the omitted oracle of an oracle-free market.
+          meta(hasOracle(marketState) ? marketState.oraclePriceAccount : this.programId),
           meta(auction, true),
           meta(counter, true),
           meta(accumulator, true),

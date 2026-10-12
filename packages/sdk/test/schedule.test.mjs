@@ -23,6 +23,7 @@ const market = {
   lastClearingPrice: 85_500n,
   minimumReferenceVolume: 1n,
   oracleExponentAdjustment: 0,
+  oraclePriceAccount: "4cSM2e6rvbGQUFiJbqytoVMi5GgghSMr8LwVrT9VPSPo",
 };
 
 test("auction IDs and windows follow the market schedule", () => {
@@ -66,6 +67,20 @@ test("reference preview mirrors initialize_auction's choice", () => {
     fromOracle: true,
   });
   assert.equal(previewReferencePrice(market, 7n, null), null);
+});
+
+test("oracle-free markets always continue from the last clearing price", () => {
+  const oracleFree = {
+    ...market,
+    oraclePriceAccount: "11111111111111111111111111111111",
+    lastClearedAuctionSequence: 0n,
+    lastClearingVolume: 0n,
+    lastClearingPrice: 1_000_000n,
+  };
+  assert.deepEqual(previewReferencePrice(oracleFree, 42n, null), {
+    referencePrice: 1_000_000n,
+    fromOracle: false,
+  });
 });
 
 test("Pyth PriceUpdateV2 accounts decode for both verification levels", () => {

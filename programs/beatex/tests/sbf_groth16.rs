@@ -1975,3 +1975,126 @@ fn order_events_close_once_the_auction_stops_folding() {
     assert!(account_is_closed(&svm, &active_order));
     assert_eq!(lamports(&svm, &owner.pubkey()), before + 2_000_000_000);
 }
+
+#[test]
+#[ignore = "requires an SBF v0 build"]
+fn oracle_free_market_starts_from_its_initial_price() {
+    let mut svm = svm_with_program();
+    let relayer = Keypair::new();
+    svm.airdrop(&relayer.pubkey(), 10_000_000_000).unwrap();
+    let current_clock = svm.get_sysvar::<Clock>();
+    let market = Pubkey::new_unique();
+    let key_epoch = Pubkey::new_unique();
+    // 1 tUSD per BEAT: one 100-atom base unit is 1.00 BEAT, priced in micro-tUSD.
+    let initial_price = 1_000_000;
+    let mut market_state = Market {
+        version: beatex::state::PROTOCOL_VERSION,
+        authority: Pubkey::new_unique(),
+        base_mint: Pubkey::new_unique(),
+        quote_mint: Pubkey::new_unique(),
+        base_vault: Pubkey::new_unique(),
+        quote_vault: Pubkey::new_unique(),
+        base_unit_size: 100,
+        quote_unit_size: 1,
+        grid_step_bps: 10,
+        grid_radius: 8,
+        max_order_quantity: beatex::queue::MAX_PRIVATE_ORDER_QUANTITY,
+        max_aggregate_quantity: 10_000,
+        current_key_epoch: key_epoch,
+        market_start_slot: current_clock.slot,
+        last_clearing_price: initial_price,
+        last_clearing_volume: 0,
+        last_cleared_auction_sequence: 0,
+        minimum_reference_volume: 1,
+        oracle_price_account: Pubkey::default(),
+        oracle_feed_id: [0; 32],
+        oracle_max_age_seconds: 90,
+        oracle_max_confidence_bps: 100,
+        oracle_exponent_adjustment: 0,
+        min_reference_price: 10_000,
+        max_reference_price: 1_000_000_000_000,
+        submission_duration_slots: 10,
+        aggregation_duration_slots: 10,
+        decryption_duration_slots: 10,
+        allocation_rule_version: 2,
+        order_circuit_version: 2,
+        claim_circuit_version: 2,
+        paused: false,
+        vault_authority_bump: 0,
+        bump: 0,
+        recent_clearings: [RecentClearing::default(); RECENT_CLEARINGS],
+    };
+    let key_epoch_state = KeyEpoch {
+        authority: market_state.authority,
+        market,
+        epoch: 1,
+        encryption_pubkey: [1; 32],
+        babyjub_encryption_pubkey: [1; 32],
+        babyjub_participant_public_shares: [[1; 32]; COMMITTEE_SIZE],
+        coefficient_commitments: [[1; 32]; 3],
+        participant_public_shares: [[1; 32]; COMMITTEE_SIZE],
+        participant_authorities: [Pubkey::new_unique(); COMMITTEE_SIZE],
+        key_relation_proof: DleqProofInput {
+            commitment_1: [0; 32],
+            commitment_2: [0; 32],
+            response: [0; 32],
+        },
+        threshold: 3,
+        proof_transcript_version: 2,
+        activation_slot: current_clock.slot,
+        retired: false,
+        acknowledgement_bitmap: 0x7f,
+        bump: 0,
+    };
+    put_anchor_account(&mut svm, key_epoch, &key_epoch_state);
+    let initialize = |svm: &mut LiteSVM, auction_id: u64| {
+        let (auction, _) = Pubkey::find_program_address(
+            &[b"auction", market.as_ref(), &auction_id.to_le_bytes()],
+            &beatex::ID,
+        );
+        let (counter, _) =
+            Pubkey::find_program_address(&[b"submission-counter", auction.as_ref()], &beatex::ID);
+        let (accumulator, _) = Pubkey::find_program_address(
+            &[b"aggregate-accumulator", auction.as_ref()],
+            &beatex::ID,
+        );
+        svm.expire_blockhash();
+        let result = svm.send_transaction(Transaction::new(
+            &[&relayer],
+            Message::new(
+                &[Instruction {
+                    program_id: beatex::ID,
+                    accounts: vec![
+                        AccountMeta::new(relayer.pubkey(), true),
+                        AccountMeta::new_readonly(market, false),
+                        AccountMeta::new_readonly(key_epoch, false),
+                        // Anchor reads the program id as an omitted optional account.
+                        AccountMeta::new_readonly(beatex::ID, false),
+                        AccountMeta::new(auction, false),
+                        AccountMeta::new(counter, false),
+                        AccountMeta::new(accumulator, false),
+                        AccountMeta::new_readonly(anchor_lang::system_program::ID, false),
+                    ],
+                    data: beatex::instruction::InitializeAuction { auction_id }.data(),
+                }],
+                Some(&relayer.pubkey()),
+            ),
+            svm.latest_blockhash(),
+        ));
+        (result, auction)
+    };
+
+    put_anchor_account(&mut svm, market, &market_state);
+    let (result, auction) = initialize(&mut svm, 0);
+    result.unwrap();
+    let initialized: Auction = deserialize_account(&svm, &auction);
+    assert_eq!(initialized.reference_price, initial_price);
+    assert!(!initialized.reference_from_oracle);
+
+    // An oracle market without a recent clearing still needs its oracle.
+    market_state.oracle_price_account = Pubkey::new_unique();
+    market_state.market_start_slot = current_clock.slot.saturating_sub(10);
+    put_anchor_account(&mut svm, market, &market_state);
+    let (result, _) = initialize(&mut svm, 1);
+    assert!(result.is_err());
+}

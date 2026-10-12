@@ -86,6 +86,12 @@ means approximately 85,500 tUSD per tBTC. A stale update, wrong feed, excessive
 confidence interval, or arithmetic overflow makes initialization fail closed.
 The auction records the chosen reference price and its source.
 
+A market can also be created without an oracle (`initial_reference_price` in
+`initialize_market`, no oracle account). Its reference price is always its last
+clearing price, starting at the initial price; zero-volume auctions keep the
+last price, so the price moves only when trades clear. The devnet BEAT/tUSD
+market works this way, starting at 1 tUSD per BEAT.
+
 ### How are the 17 price levels defined?
 
 The market fixes `grid_radius = 8` and an immutable percentage step, defaulting

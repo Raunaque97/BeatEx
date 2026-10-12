@@ -121,6 +121,9 @@ struct InitializeConfig {
     quote_vault: Pubkey,
     rpc_url: String,
     market_start_slot: u64,
+    /// Starting price of an oracle-free market, in quote atoms per base unit.
+    /// `None` creates the oracle-priced BTC/USD market.
+    initial_price: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -543,6 +546,11 @@ pub struct NativeOrderConfig {
     pub quote_source: Pubkey,
     pub deposit_base: u64,
     pub deposit_quote: u64,
+    /// Working private balance to maintain, in base and quote token atoms.
+    /// When either side falls below half its target, both are topped back up.
+    /// Zero disables maintenance.
+    pub target_base: u64,
+    pub target_quote: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -554,6 +562,8 @@ struct OrderConfig {
     rpc_url: String,
     deposit_base: u64,
     deposit_quote: u64,
+    target_base: u64,
+    target_quote: u64,
 }
 
 #[derive(Debug)]
@@ -1656,7 +1666,14 @@ fn initialize_market(
         eprintln!("market {} already exists", addresses.market);
         return Ok(());
     }
-    let oracle = Pubkey::from_str(PYTH_BTC_USD_ACCOUNT)?;
+    // An oracle-free market omits the oracle account (Anchor reads the program
+    // id as an absent optional account) and starts from `initial_price`.
+    let (oracle, initial_reference_price, min_reference_price, max_reference_price) =
+        match config.initial_price {
+            None => (Pubkey::from_str(PYTH_BTC_USD_ACCOUNT)?, 0, 1_000, 1_000_000),
+            // 0.01 to 100 quote tokens per base token at 1.00-token base units.
+            Some(price) => (beatex::ID, price, 10_000, 100_000_000),
+        };
     let args = InitializeMarketArgs {
         market_nonce: MARKET_NONCE,
         base_unit_size: beatex::state::BASE_UNIT_SIZE,
@@ -1671,14 +1688,15 @@ fn initialize_market(
         oracle_max_age_seconds: DEVNET_ORACLE_MAX_AGE_SECONDS,
         oracle_max_confidence_bps: 200,
         oracle_exponent_adjustment: 0,
-        min_reference_price: 1_000,
-        max_reference_price: 1_000_000,
+        min_reference_price,
+        max_reference_price,
         submission_duration_slots: DEVNET_SUBMISSION_DURATION_SLOTS,
         aggregation_duration_slots: DEVNET_AGGREGATION_DURATION_SLOTS,
         decryption_duration_slots: DEVNET_DECRYPTION_DURATION_SLOTS,
         allocation_rule_version: allocation::ALLOCATION_RULE_VERSION,
         order_circuit_version: queue::DEVNET_FAST_ORDER_CIRCUIT_VERSION,
         claim_circuit_version: queue::PRIVATE_CLAIM_CIRCUIT_VERSION,
+        initial_reference_price,
     };
     send(
         &config.wallet,
@@ -2076,7 +2094,16 @@ fn submit_auction_initialization(
             AccountMeta::new(payer, true),
             AccountMeta::new_readonly(addresses.market, false),
             AccountMeta::new_readonly(key_epoch, false),
-            AccountMeta::new_readonly(oracle_price, false),
+            // An oracle-free market stores no oracle; Anchor reads the program
+            // id as the omitted optional account.
+            AccountMeta::new_readonly(
+                if oracle_price == Pubkey::default() {
+                    beatex::ID
+                } else {
+                    oracle_price
+                },
+                false,
+            ),
             AccountMeta::new(current.auction, false),
             AccountMeta::new(current.submission_counter, false),
             AccountMeta::new(current.accumulator, false),
@@ -3242,8 +3269,37 @@ fn top_up_private_balance_if_needed(
     intent: &NativeOrderIntent,
     state: &mut TraderPrivateState,
 ) -> Result<(), Box<dyn Error>> {
-    // A live order already has collateral reserved. Its replacement/rollover
-    // proof accounts for that order and must not receive an unrelated deposit.
+    // Maintain a configured working balance. A deposit only adds to the
+    // encrypted available balance and advances its revision; live orders keep
+    // their own reserved collateral and are settled against whatever balance
+    // is current, so this is safe while orders are outstanding.
+    if config.target_base > 0 || config.target_quote > 0 {
+        let low = state.balance.base_value < config.target_base / 2
+            || state.balance.quote_value < config.target_quote / 2;
+        if !low {
+            return Ok(());
+        }
+        let deposit_base = config.target_base.saturating_sub(state.balance.base_value);
+        let deposit_quote = config
+            .target_quote
+            .saturating_sub(state.balance.quote_value);
+        println!(
+            "private balance top-up to target: {deposit_base} base units and {deposit_quote} quote units"
+        );
+        return deposit_balance(
+            config,
+            addresses,
+            market,
+            key_epoch,
+            owner,
+            private_balance,
+            state,
+            deposit_base,
+            deposit_quote,
+        );
+    }
+    // Without a target, only cover the first order's reserves: a live order's
+    // replacement or rollover already accounts for its reserved collateral.
     if state.has_active_orders() {
         return Ok(());
     }
@@ -3573,6 +3629,8 @@ pub fn execute_native_order(
         rpc_url: config.rpc_url,
         deposit_base: config.deposit_base,
         deposit_quote: config.deposit_quote,
+        target_base: config.target_base,
+        target_quote: config.target_quote,
     };
     let previous_capture = NATIVE_ORDER_EVENTS
         .with(|capture| std::mem::replace(&mut *capture.borrow_mut(), Some(Vec::new())));
@@ -5505,6 +5563,8 @@ fn run() -> Result<(), Box<dyn Error>> {
             deposit_quote: optional(&args[1..], "--deposit-quote")
                 .unwrap_or_else(|| "1000000000".to_owned())
                 .parse()?,
+            target_base: 0,
+            target_quote: 0,
         }),
         "fold" => execute_fold(FoldConfig {
             common: common(&args[1..])?,
@@ -5602,6 +5662,9 @@ fn run() -> Result<(), Box<dyn Error>> {
                 rpc_url: optional(&args[1..], "--rpc-url")
                     .unwrap_or_else(|| DEFAULT_RPC_URL.to_owned()),
                 market_start_slot: value(&args[1..], "--market-start-slot")?.parse()?,
+                initial_price: optional(&args[1..], "--initial-price")
+                    .map(|price| price.parse())
+                    .transpose()?,
             })
         }
         command => Err(format!("unknown command {command}").into()),

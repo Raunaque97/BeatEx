@@ -301,6 +301,24 @@ binding, and the final state mutation. The preparation and binding handlers use
 the instructions sysvar to authenticate the complete atomic chain; no reusable
 proof receipt or partial rollover state is stored.
 
+`scripts/devnet/setup-beat-market.sh` creates the BEAT token (Token-2022,
+2 decimals, 1,000,000 supply minted once to the devnet wallet, no faucet), the
+`beat-maker` wallet funded with 100,000 BEAT and 100,000 tUSD, and the
+oracle-free BEAT/tUSD market starting at 1 tUSD per BEAT. Its state lives in
+`.devnet/devnet-beat`. Run its committee and market maker with:
+
+```bash
+scripts/devnet/run-committee-bot.sh --state-dir .devnet/devnet-beat --base-symbol BEAT
+scripts/devnet/run-market-maker.sh --source ema --maker beat-maker \
+  --state-dir .devnet/devnet-beat --base-symbol BEAT \
+  --base-quantity 100 --slope-quantity 100 --max-quantity 1000 --target-base 50000
+```
+
+The `ema` market maker quotes a two-sided V around an EMA of the market's own
+clearing prices (alpha 0.2, updated every auction, zero-volume auctions repeat
+the last price), bidding from one grid level below the EMA and asking from one
+level above. Users obtain BEAT only by buying it on the DEX with faucet tUSD.
+
 `scripts/devnet/run-indexer.sh` runs the auction-history indexer. It follows
 the program's event-authority PDA, decodes the auction outcome events, stores
 them under `.devnet/<cluster>/indexer`, and serves

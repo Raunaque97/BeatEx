@@ -16,6 +16,10 @@ TOKEN_2022_PROGRAM_ID='TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb'
 cluster='devnet'
 wallet=''
 state_dir=''
+base_symbol='tBTC'
+quote_symbol='tUSD'
+initial_price=''
+skip_artifacts=0
 
 usage() {
   cat <<'EOF'
@@ -26,6 +30,11 @@ Options:
   --cluster localnet|devnet       Target cluster (default: devnet)
   --wallet <KEYPAIR>              Market authority and fee payer
   --state-dir <DIRECTORY>         Existing token state (default: .devnet/<cluster>)
+  --base-symbol <SYMBOL>          Base token row in addresses.tsv (default: tBTC)
+  --quote-symbol <SYMBOL>         Quote token row in addresses.tsv (default: tUSD)
+  --initial-price <PRICE>         Create an oracle-free market starting at PRICE quote
+                                  atoms per base unit (default: the Pyth BTC/USD market)
+  --skip-artifacts                Do not regenerate the SDK/web deployment artifacts
   -h, --help                      Show this help
 
 The script creates two Token-2022 custody vault accounts under one retained
@@ -51,6 +60,10 @@ while (( $# > 0 )); do
       state_dir="${2:?--state-dir requires a value}"
       shift 2
       ;;
+    --base-symbol) base_symbol="${2:?--base-symbol requires a value}"; shift 2 ;;
+    --quote-symbol) quote_symbol="${2:?--quote-symbol requires a value}"; shift 2 ;;
+    --initial-price) initial_price="${2:?--initial-price requires a value}"; shift 2 ;;
+    --skip-artifacts) skip_artifacts=1; shift ;;
     -h|--help)
       usage
       exit 0
@@ -92,8 +105,8 @@ if [[ ! -f "$addresses_file" ]]; then
   printf 'Missing %s; run setup-test-tokens.sh first.\n' "$addresses_file" >&2
   exit 1
 fi
-tbtc_mint="$(awk -F '\t' '$1 == "tBTC" { print $2 }' "$addresses_file")"
-tusd_mint="$(awk -F '\t' '$1 == "tUSD" { print $2 }' "$addresses_file")"
+tbtc_mint="$(awk -F '\t' -v symbol="$base_symbol" '$1 == symbol { print $2 }' "$addresses_file")"
+tusd_mint="$(awk -F '\t' -v symbol="$quote_symbol" '$1 == symbol { print $2 }' "$addresses_file")"
 if [[ -z "$tbtc_mint" || -z "$tusd_mint" ]]; then
   printf 'Could not read tBTC/tUSD mints from %s.\n' "$addresses_file" >&2
   exit 1
@@ -211,14 +224,19 @@ market_start_slot="$((current_slot + 800))"
     --vault-owner "$vault_owner" \
     --state-dir "$state_dir" \
     --market-start-slot "$market_start_slot" \
-    --rpc-url "$rpc_url"
+    --rpc-url "$rpc_url" \
+    ${initial_price:+--initial-price "$initial_price"}
 )
 
-artifact_args=(--cluster "$cluster" --state-dir "$state_dir")
-if [[ -f "$project_root/target/idl/beatex.json" ]]; then
-  artifact_args+=(--idl "$project_root/target/idl/beatex.json")
+# The generated SDK artifacts describe the default (tBTC) market; additional
+# markets skip them so setting one up does not switch the web app's default.
+if (( ! skip_artifacts )); then
+  artifact_args=(--cluster "$cluster" --state-dir "$state_dir")
+  if [[ -f "$project_root/target/idl/beatex.json" ]]; then
+    artifact_args+=(--idl "$project_root/target/idl/beatex.json")
+  fi
+  node "$project_root/scripts/generate-protocol-artifacts.mjs" "${artifact_args[@]}"
 fi
-node "$project_root/scripts/generate-protocol-artifacts.mjs" "${artifact_args[@]}"
 
 printf '\nMarket setup complete.\nSubmission interval: 40 slots (approximately 10 seconds on Devnet).\nManifest: %s\n' \
   "$state_dir/market.tsv"
