@@ -324,8 +324,10 @@ the program's event-authority PDA, decodes the auction outcome events, stores
 them under `.devnet/<cluster>/indexer`, and serves
 `GET /v1/markets/<market>/auctions?limit=60` on `127.0.0.1:8787` by default.
 Settled and cancelled auction accounts are compacted on chain, so the web
-chart reads finished batches from this API (`NEXT_PUBLIC_BEATEX_INDEXER_URL`)
-and only in-flight batches from chain.
+chart reads finished batches through `/api/indexer/v1/markets/<market>/auctions`
+(the server-only `BEATEX_INDEXER_URL` configures its upstream origin), and only
+in-flight batches from chain. See [Vercel deployment](VERCEL_DEPLOYMENT.md) for
+the cached proxy and Cloudflare Tunnel setup.
 
 ## Legacy version-1 settlement checkpoint
 

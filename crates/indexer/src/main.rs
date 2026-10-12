@@ -12,6 +12,7 @@ use {
     axum::{
         extract::{Path, Query, State},
         http::{header, HeaderValue, StatusCode},
+        response::{IntoResponse, Response},
         routing::get,
         Json, Router,
     },
@@ -423,21 +424,25 @@ fn poll_once(rpc: &Rpc, store: &RwLock<Store>) -> Result<usize, Box<dyn Error>> 
 }
 
 fn run_poller(config: &Config, store: Arc<RwLock<Store>>) {
-    let rpc = Rpc {
-        client: reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(20))
-            .build()
-            .expect("HTTP client configuration is static"),
-        url: config.rpc_url.clone(),
-    };
+    let url = config.rpc_url.clone();
     let interval = config.poll_interval;
-    thread::spawn(move || loop {
-        match poll_once(&rpc, &store) {
-            Ok(0) => {}
-            Ok(count) => println!("indexed {count} auction event(s)"),
-            Err(error) => eprintln!("indexer poll failed: {error}"),
+    thread::spawn(move || {
+        // reqwest's blocking client must be constructed outside the Tokio runtime.
+        let rpc = Rpc {
+            client: reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(20))
+                .build()
+                .expect("HTTP client configuration is static"),
+            url,
+        };
+        loop {
+            match poll_once(&rpc, &store) {
+                Ok(0) => {}
+                Ok(count) => println!("indexed {count} auction event(s)"),
+                Err(error) => eprintln!("indexer poll failed: {error}"),
+            }
+            thread::sleep(interval);
         }
-        thread::sleep(interval);
     });
 }
 
@@ -451,12 +456,26 @@ async fn history(
     State(store): State<Arc<RwLock<Store>>>,
     Path(market): Path<String>,
     Query(query): Query<HistoryQuery>,
-) -> Result<Json<Vec<AuctionRecord>>, StatusCode> {
+) -> Result<Response, StatusCode> {
     let limit = query.limit.unwrap_or(60).clamp(1, MAX_HISTORY_RESPONSE);
     let store = store
         .read()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(store.history(&market, query.before, limit)))
+    let records = store.history(&market, query.before, limit);
+    drop(store);
+    // Share public history across viewers without retaining it in browsers.
+    // Older pages use the same bounded TTL: late indexing can fill their gaps.
+    Ok((
+        [
+            ("cache-control", "public, max-age=0"),
+            (
+                "vercel-cdn-cache-control",
+                "max-age=5, stale-while-revalidate=10",
+            ),
+        ],
+        Json(records),
+    )
+        .into_response())
 }
 
 async fn health(
@@ -493,6 +512,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .layer(SetResponseHeaderLayer::overriding(
             header::ACCESS_CONTROL_ALLOW_ORIGIN,
             HeaderValue::from_static("*"),
+        ))
+        // History explicitly opts in above; health and every error stay uncached.
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store"),
         ));
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     println!("serving auction history on http://{}", config.listen);

@@ -35,8 +35,8 @@ Options:
   --listen <ADDRESS>          HTTP listen address (default: 127.0.0.1:8787)
   -h, --help                  Show this help
 
-Indexed records are stored under <state-dir>/indexer. The web app reads
-GET /v1/markets/<market>/auctions from NEXT_PUBLIC_INDEXER_URL.
+Indexed records are stored under <state-dir>/indexer. The web app proxies
+GET /v1/markets/<market>/auctions through its server-only BEATEX_INDEXER_URL.
 EOF
 }
 

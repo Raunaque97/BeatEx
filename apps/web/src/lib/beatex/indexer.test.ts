@@ -43,8 +43,14 @@ describe("fetchAuctionHistory", () => {
       limit: 2,
       before: 421n,
     });
-    const url = new URL(String((fetchMock.mock.calls[0] as unknown[])[0]));
-    expect(url.pathname).toBe(`/v1/markets/${settled.market}/auctions`);
+    const [requestUrl, init] = fetchMock.mock.calls[0] as unknown[];
+    expect(String(requestUrl).startsWith("/api/indexer/")).toBe(true);
+    const url = new URL(String(requestUrl), "https://beatex.example");
+    expect(url.pathname).toBe(
+      `/api/indexer/v1/markets/${settled.market}/auctions`,
+    );
+    expect(init).toMatchObject({ credentials: "omit" });
+    expect(init).not.toHaveProperty("cache", "no-store");
     expect(url.searchParams.get("limit")).toBe("2");
     expect(url.searchParams.get("before")).toBe("421");
     expect(records[0]).toMatchObject({

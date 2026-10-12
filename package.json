@@ -12,6 +12,9 @@
     "build:protocol": "bash scripts/build-pipeline.sh --skip-wasm --skip-web",
     "build:all": "bash scripts/build-pipeline.sh",
     "build:web": "pnpm --filter @beatex/sdk build && pnpm --filter @beatex/prover-wasm build && pnpm --filter @beatex/web build",
+    "assets:web": "node scripts/fetch-web-prover-assets.mjs",
+    "build:vercel": "pnpm assets:web && pnpm build:web",
+    "test:assets": "node --test scripts/fetch-web-prover-assets.test.mjs",
     "check:web": "pnpm --filter @beatex/sdk check && pnpm --filter @beatex/prover-wasm check && pnpm --filter @beatex/web check",
     "test:web": "pnpm --filter @beatex/web test"
   }

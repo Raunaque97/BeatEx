@@ -2,7 +2,6 @@ import { AuctionState } from "@beatex/sdk";
 import { z } from "zod";
 
 import type { BatchSummary } from "@/features/auctions/model/batch-summary";
-import { publicEnv } from "@/lib/config/public-env";
 
 const integer = z
   .string()
@@ -40,15 +39,14 @@ export async function fetchAuctionHistory(
   options: { readonly limit?: number; readonly before?: bigint } = {},
   signal?: AbortSignal,
 ): Promise<readonly AuctionRecord[]> {
-  const url = new URL(
-    `/v1/markets/${encodeURIComponent(market)}/auctions`,
-    publicEnv.indexerUrl,
-  );
-  if (options.limit !== undefined)
-    url.searchParams.set("limit", String(options.limit));
+  const params = new URLSearchParams();
+  if (options.limit !== undefined) params.set("limit", String(options.limit));
   if (options.before !== undefined)
-    url.searchParams.set("before", options.before.toString());
-  const response = await fetch(url, { signal, cache: "no-store" });
+    params.set("before", options.before.toString());
+  const query = params.toString();
+  const url = `/api/indexer/v1/markets/${encodeURIComponent(market)}/auctions${query ? `?${query}` : ""}`;
+  // This public response is shared at the CDN; send no wallet/session cookies.
+  const response = await fetch(url, { signal, credentials: "omit" });
   if (!response.ok) {
     throw new Error(`Indexer returned HTTP ${response.status}`);
   }
