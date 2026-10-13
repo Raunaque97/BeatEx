@@ -89,6 +89,17 @@ export function useOrderIntent(
       }),
     [],
   );
+  /** Replace every level at once, e.g. from a preset shape. */
+  const setCustomLevels = useCallback(
+    (levels: readonly number[]) =>
+      setIntent((current) => ({
+        ...current,
+        customLevels: levels.map((percent) =>
+          Math.max(-100, Math.min(100, Math.round(percent))),
+        ),
+      })),
+    [],
+  );
   const setMaxBuy = useCallback(
     (maxBuy: string) => setIntent((current) => ({ ...current, maxBuy })),
     [],
@@ -115,6 +126,7 @@ export function useOrderIntent(
     setUnit,
     setLimitIndex,
     setCustomLevel,
+    setCustomLevels,
     setMaxBuy,
     setMaxSell,
   };

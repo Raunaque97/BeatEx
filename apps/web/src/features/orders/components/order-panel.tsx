@@ -18,6 +18,7 @@ import { customSizing, spendSizing } from "../hooks/balance-sizing";
 import type { OrderIntentState } from "../hooks/use-order-intent";
 import { estimateOutcome } from "../model/order-curve";
 import { CurveEditor, MaxField } from "./curve-editor";
+import { CurvePresets } from "./curve-presets";
 import {
   AmountField,
   BalanceLine,
@@ -178,7 +179,7 @@ export function OrderPanel({
       </div>
 
       {grid === null || marketAccount === undefined ? (
-        <div className="border-line text-muted flex h-[370px] items-center justify-center rounded-xl border border-dashed text-sm">
+        <div className="border-line text-muted flex h-[336px] items-center justify-center rounded-xl border border-dashed text-sm">
           Waiting for the auction price grid…
         </div>
       ) : (
@@ -189,9 +190,16 @@ export function OrderPanel({
         />
       )}
 
-      <p className="text-muted min-h-8 text-xs leading-snug">
-        {HINTS[intent.type]}
-      </p>
+      {/* Same height in every tab, so the order button never moves. */}
+      <div className="flex h-[72px] flex-col gap-2">
+        {isCustom ? (
+          <CurvePresets
+            levels={intent.customLevels}
+            onPick={order.setCustomLevels}
+          />
+        ) : null}
+        <p className="text-muted text-xs leading-snug">{HINTS[intent.type]}</p>
+      </div>
 
       <div
         className="text-muted flex justify-between gap-3 font-mono text-xs"
@@ -215,7 +223,9 @@ export function OrderPanel({
         </span>
       </div>
 
-      {action}
+      {/* Pinned to the bottom of the panel, so the order button is always in
+          view; anything that doesn't fit scrolls above it. */}
+      <div className="bg-bg sticky bottom-0 -mx-1 px-1 pt-2 pb-1">{action}</div>
     </section>
   );
 }

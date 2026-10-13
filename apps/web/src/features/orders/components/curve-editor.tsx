@@ -8,7 +8,7 @@ import { formatBase, formatBps, formatPrice, formatQuote } from "@/lib/format";
 
 import type { OrderIntentState } from "../hooks/use-order-intent";
 
-const ROW_PX = 20;
+const ROW_PX = 18;
 
 type CustomDisplay = "percent" | "amount";
 

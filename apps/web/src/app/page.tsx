@@ -1,7 +1,11 @@
-import { redirect } from "next/navigation";
+import type { Metadata } from "next";
 
-import { DEFAULT_MARKET_SLUG } from "@/lib/config/markets";
+import { HomePage } from "@/features/home/components/home-page";
 
-export default function HomePage() {
-  redirect(`/trade/${DEFAULT_MARKET_SLUG}`);
+export const metadata: Metadata = {
+  title: { absolute: "BeatEx · Private batch auctions on Solana" },
+};
+
+export default function Page() {
+  return <HomePage />;
 }

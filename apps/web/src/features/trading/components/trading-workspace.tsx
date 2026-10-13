@@ -1,6 +1,7 @@
 "use client";
 
 import { normalizeOraclePrice } from "@beatex/sdk";
+import Link from "next/link";
 import { useState } from "react";
 
 import { BatchClock } from "@/features/auctions/components/batch-clock";
@@ -164,12 +165,12 @@ export function TradingWorkspace({
       />
       <header className="border-line flex flex-wrap items-center justify-between gap-4 border-b px-5 py-2.5">
         <div className="flex flex-wrap items-center gap-7">
-          <div className="leading-tight">
+          <Link href="/" className="leading-tight">
             <div className="text-lg font-bold tracking-tight">
               Beat<span className="text-accent">Ex</span>
             </div>
             <div className="text-muted text-xs">Frequent batch auction</div>
-          </div>
+          </Link>
           <MarketSelector market={market} />
           <div>
             <div className="text-muted text-xs">
