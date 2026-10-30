@@ -11,7 +11,7 @@ anchor-lang = "=1.1.2"
 base64 = "0.22.1"
 beatex-devnet-client = { path = "../devnet-client", default-features = false }
 beatex-program = { path = "../../programs/beatex", features = ["no-entrypoint"] }
-ctrlc = "3.4.7"
+ctrlc = { version = "3.4.7", features = ["termination"] }
 pyth-solana-receiver-sdk = "=2.0.0"
 reqwest = { version = "=0.12.28", default-features = false, features = ["blocking", "rustls-tls"] }
 serde = { version = "1.0.228", features = ["derive"] }

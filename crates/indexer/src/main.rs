@@ -23,9 +23,11 @@ use {
         env,
         error::Error,
         fs::{self, File, OpenOptions},
-        io::{BufRead, BufReader, Write},
+        io::{self, BufRead, BufReader, Write},
         net::SocketAddr,
+        panic::{self, AssertUnwindSafe},
         path::PathBuf,
+        process,
         sync::{Arc, RwLock},
         thread,
         time::Duration,
@@ -435,14 +437,23 @@ fn run_poller(config: &Config, store: Arc<RwLock<Store>>) {
                 .expect("HTTP client configuration is static"),
             url,
         };
-        loop {
+        // Log with `writeln!` and ignore the result: `println!` panics when the
+        // log cannot be written (a full disk), which would kill this thread
+        // while the server kept serving stale history.
+        let _ = panic::catch_unwind(AssertUnwindSafe(|| loop {
             match poll_once(&rpc, &store) {
                 Ok(0) => {}
-                Ok(count) => println!("indexed {count} auction event(s)"),
-                Err(error) => eprintln!("indexer poll failed: {error}"),
+                Ok(count) => {
+                    let _ = writeln!(io::stdout(), "indexed {count} auction event(s)");
+                }
+                Err(error) => {
+                    let _ = writeln!(io::stderr(), "indexer poll failed: {error}");
+                }
             }
             thread::sleep(interval);
-        }
+        }));
+        // A dead poller must take the process down so the supervisor restarts it.
+        process::exit(1);
     });
 }
 

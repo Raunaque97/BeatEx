@@ -40,9 +40,6 @@ const DEFAULT_RPC_URL: &str = "https://api.devnet.solana.com";
 const MIN_ORDER_START_REMAINING_SLOTS: u64 = 12;
 const NEXT_AUCTION_PREPARE_REMAINING_SLOTS: u64 = 12;
 const ORDER_OPEN_POLL_INTERVAL: Duration = Duration::from_millis(50);
-/// Longer than a blockhash lifetime (150 blocks), after which an unconfirmed
-/// transaction can no longer land.
-const UNCERTAIN_ORDER_SETTLE_WAIT: Duration = Duration::from_secs(90);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PriceSource {
@@ -125,20 +122,6 @@ enum OrderWorkerResult {
 #[derive(Deserialize)]
 struct BinanceTicker {
     price: String,
-}
-
-#[derive(Deserialize)]
-struct RpcResponse<T> {
-    result: Option<T>,
-    error: Option<RpcError>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RpcError {
-    code: serde_json::Value,
-    message: String,
-    #[serde(default)]
-    data: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -285,7 +268,7 @@ fn parse_config() -> Result<Config, Box<dyn Error>> {
             Some(milliseconds) => Duration::from_millis(milliseconds.parse()?),
             None => match optional("--interval-seconds") {
                 Some(seconds) => Duration::from_secs(seconds.parse()?),
-                None => Duration::from_millis(200),
+                None => Duration::from_millis(1_000),
             },
         },
         state_dir: optional("--state-dir").or_else(|| env::var("BEATEX_STATE_DIR").ok()),
@@ -434,56 +417,6 @@ fn private_balance(config: &Config) -> Option<(u64, u64)> {
     ))
 }
 
-/// Confirm that an order whose confirmation was lost never landed: its
-/// signature is unknown even in transaction history, and the on-chain private
-/// balance revision still equals the local one.
-fn verify_unconfirmed_order(config: &Config, error: &str) -> Result<(), String> {
-    let signature = error
-        .split_whitespace()
-        .skip_while(|word| *word != "for")
-        .nth(1)
-        .ok_or_else(|| format!("no signature in {error:?}"))?;
-    let statuses: serde_json::Value = rpc_request(
-        &config.rpc_urls,
-        "getSignatureStatuses",
-        serde_json::json!([[signature], {"searchTransactionHistory": true}]),
-    )
-    .map_err(|error| error.to_string())?;
-    if !statuses
-        .pointer("/value/0")
-        .is_none_or(serde_json::Value::is_null)
-    {
-        return Err(format!("transaction {signature} landed"));
-    }
-    let (Some(state_dir), Some(owner)) = (&config.state_dir, config.wallet_owner) else {
-        return Err("no local private state to compare".to_owned());
-    };
-    let local = Path::new(state_dir)
-        .join("traders")
-        .join(config.market.to_string())
-        .join(format!("{owner}.json"));
-    let local_revision = fs::read(&local)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-        .and_then(|value| value.get("revision").and_then(serde_json::Value::as_u64))
-        .ok_or_else(|| format!("cannot read {}", local.display()))?;
-    let (balance, _) = Pubkey::find_program_address(
-        &[b"private-balance", config.market.as_ref(), owner.as_ref()],
-        &beatex::ID,
-    );
-    let onchain =
-        fetch_anchor_account::<beatex::EncryptedPrivateBalance>(&config.rpc_urls, &balance)
-            .map_err(|error| error.to_string())?
-            .ok_or("private balance account is missing")?;
-    if onchain.revision != local_revision {
-        return Err(format!(
-            "on-chain revision {} differs from local revision {local_revision}",
-            onchain.revision
-        ));
-    }
-    Ok(())
-}
-
 fn cap_order_budget(
     config: &Config,
     market: &beatex::Market,
@@ -590,74 +523,7 @@ fn rpc_request<T: for<'de> Deserialize<'de>>(
     method: &str,
     params: serde_json::Value,
 ) -> Result<T, Box<dyn Error>> {
-    let request = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": method,
-        "params": params,
-    })
-    .to_string();
-    static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
-    let client = CLIENT.get_or_init(reqwest::blocking::Client::new);
-    let mut last_error = "no RPC endpoints configured".to_owned();
-    if rpc_urls.is_empty() {
-        return Err(format!("all Solana RPC endpoints failed for {method}: {last_error}").into());
-    }
-    for index in 0..rpc_urls.len() {
-        let rpc_url = &rpc_urls[index];
-        let response = match client
-            .post(rpc_url)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .timeout(Duration::from_secs(10))
-            .body(request.clone())
-            .send()
-        {
-            Ok(response) => response,
-            Err(error) => {
-                last_error = format!("endpoint {} request failed: {error}", index + 1);
-                continue;
-            }
-        };
-        let status = response.status();
-        let body = match response.bytes() {
-            Ok(body) => body,
-            Err(error) => {
-                last_error = format!("endpoint {} response body failed: {error}", index + 1);
-                continue;
-            }
-        };
-        if !status.is_success() {
-            last_error = format!(
-                "endpoint {} returned HTTP {}: {}",
-                index + 1,
-                status,
-                String::from_utf8_lossy(&body).trim()
-            );
-            continue;
-        }
-        match serde_json::from_slice::<RpcResponse<T>>(&body) {
-            Ok(response) if response.error.is_none() => {
-                if let Some(result) = response.result {
-                    return Ok(result);
-                }
-                last_error = format!("endpoint {} returned no JSON-RPC result", index + 1);
-            }
-            Ok(response) => {
-                let error = response.error.expect("error is present");
-                last_error = format!(
-                    "endpoint {} returned JSON-RPC error code={} message={} data={:?}",
-                    index + 1,
-                    error.code,
-                    error.message,
-                    error.data
-                );
-            }
-            Err(error) => {
-                last_error = format!("endpoint {} returned invalid JSON-RPC: {error}", index + 1);
-            }
-        }
-    }
-    Err(format!("all Solana RPC endpoints failed for {method}: {last_error}").into())
+    beatex_devnet_client::native_rpc_request(rpc_urls, method, params).map_err(Into::into)
 }
 
 fn fetch_account_bytes(
@@ -1309,7 +1175,15 @@ fn spawn_order_worker(
                             job.operation,
                             started.elapsed().as_secs_f64()
                         );
-                        if error
+                        if match (&config.state_dir, &config.wallet) {
+                            (Some(state_dir), Some(wallet)) => {
+                                beatex_devnet_client::has_pending_native_transaction(
+                                    Path::new(state_dir),
+                                    Path::new(wallet),
+                                )
+                            }
+                            _ => false,
+                        } || error
                             .to_string()
                             .contains("transaction confirmation outcome unknown")
                             || error
@@ -1330,6 +1204,21 @@ fn spawn_order_worker(
     (job_sender, result_receiver, ready_receiver)
 }
 
+#[derive(Default)]
+struct RetryBackoff {
+    failures: u32,
+}
+impl RetryBackoff {
+    fn next_delay(&mut self) -> Duration {
+        let delay = Duration::from_secs(1u64 << self.failures.min(5));
+        self.failures = self.failures.saturating_add(1);
+        delay
+    }
+    fn reset(&mut self) {
+        self.failures = 0;
+    }
+}
+
 fn run() -> Result<(), Box<dyn Error>> {
     let mut config = parse_config()?;
     if config.balance_every_auctions == 0 {
@@ -1338,6 +1227,13 @@ fn run() -> Result<(), Box<dyn Error>> {
     if config.order_budget_bps == 0 || config.order_budget_bps > 10_000 {
         return Err("budget-bps must be between 1 and 10000".into());
     }
+    let _maker_lock = match (&config.state_dir, &config.wallet) {
+        (Some(state_dir), Some(wallet)) => Some(beatex_devnet_client::acquire_native_maker_lock(
+            Path::new(state_dir),
+            Path::new(wallet),
+        )?),
+        _ => None,
+    };
     let market = fetch_anchor_account::<beatex::Market>(&config.rpc_urls, &config.market)?
         .ok_or("market account does not exist")?;
     config.market_start_slot = market.market_start_slot;
@@ -1372,6 +1268,8 @@ fn run() -> Result<(), Box<dyn Error>> {
             return Err("market-maker prover worker stopped during initialization".into());
         }
     }
+    let mut retry = RetryBackoff::default();
+    let mut recovery_needed = config.wallet.is_some();
     let mut last_balance_report = None;
     let mut last_submitted_auction = None;
     let mut in_flight_auction = None;
@@ -1385,6 +1283,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     loop {
         match result_receiver.try_recv() {
             Ok(OrderWorkerResult::Submitted(auction_id)) => {
+                retry.reset();
                 in_flight_auction = None;
                 last_submitted_auction = Some(auction_id);
                 if auction_id % config.balance_every_auctions == 0
@@ -1404,31 +1303,59 @@ fn run() -> Result<(), Box<dyn Error>> {
                 }
             }
             Ok(OrderWorkerResult::Uncertain(error)) => {
-                // An RPC can lose a transaction without confirming it. Once its
-                // blockhash has expired it can no longer land, so the local
-                // private state is still current if it did not land and the
-                // on-chain balance revision still matches.
                 eprintln!(
-                    "[{}] order outcome unknown ({error}); verifying after the blockhash expires",
+                    "[{}] private transaction needs recovery ({error}); quoting paused",
                     timestamp()
                 );
-                thread::sleep(UNCERTAIN_ORDER_SETTLE_WAIT);
-                match verify_unconfirmed_order(&config, &error) {
-                    Ok(()) => {
-                        eprintln!("[{}] unconfirmed order did not land; resuming", timestamp());
-                        in_flight_auction = None;
-                    }
-                    Err(reason) => {
-                        return Err(format!(
-                            "stopping market maker because a submitted order may have settled: {reason}"
-                        )
-                        .into());
-                    }
-                }
+                in_flight_auction = None;
+                recovery_needed = true;
             }
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => {
                 return Err("market-maker order worker stopped unexpectedly".into());
+            }
+        }
+        if recovery_needed {
+            if let (Some(state_dir), Some(wallet), Some(rpc_url)) =
+                (&config.state_dir, &config.wallet, config.rpc_urls.first())
+            {
+                match beatex_devnet_client::recover_native_private_state(
+                    Path::new(state_dir),
+                    Path::new(wallet),
+                    rpc_url,
+                ) {
+                    Ok(beatex_devnet_client::NativeRecovery::Waiting) => {
+                        eprintln!("[{}] pending private transaction awaits finality or expiry; quoting paused", timestamp());
+                        if shutdown.load(Ordering::Acquire) {
+                            return Ok(());
+                        }
+                        thread::sleep(retry.next_delay());
+                        continue;
+                    }
+                    Ok(outcome) => {
+                        if outcome != beatex_devnet_client::NativeRecovery::Clean {
+                            eprintln!(
+                                "[{}] private transaction recovered: {outcome:?}; resuming",
+                                timestamp()
+                            );
+                        }
+                        recovery_needed = false;
+                        retry.reset();
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "[{}] private state recovery unavailable: {error}; quoting paused",
+                            timestamp()
+                        );
+                        if shutdown.load(Ordering::Acquire) {
+                            return Ok(());
+                        }
+                        thread::sleep(retry.next_delay());
+                        continue;
+                    }
+                }
+            } else {
+                recovery_needed = false;
             }
         }
         if shutdown.load(Ordering::Acquire) {
@@ -1456,7 +1383,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     "[{}] market maker iteration failed: {error}; retrying",
                     timestamp()
                 );
-                thread::sleep(config.interval);
+                thread::sleep(retry.next_delay());
                 continue;
             }
         };
@@ -1490,7 +1417,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     "[{}] market maker iteration failed: {error}; retrying",
                     timestamp()
                 );
-                thread::sleep(config.interval);
+                thread::sleep(retry.next_delay());
                 continue;
             }
         };
@@ -1532,7 +1459,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     "[{}] market maker iteration failed: {error}; retrying",
                     timestamp()
                 );
-                thread::sleep(config.interval);
+                thread::sleep(retry.next_delay());
                 continue;
             }
         };

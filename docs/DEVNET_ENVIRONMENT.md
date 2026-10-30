@@ -329,6 +329,39 @@ chart reads finished batches through `/api/indexer/v1/markets/<market>/auctions`
 in-flight batches from chain. See [Vercel deployment](VERCEL_DEPLOYMENT.md) for
 the cached proxy and Cloudflare Tunnel setup.
 
+### Running bots unattended
+
+Native market makers (local Solana keypairs) journal every private balance
+transition before signing and broadcasting it. The journal holds the previous
+and next balance openings, order salts, expected ciphertexts, transaction
+signature, and the blockhash's last valid block height. It is written
+atomically with mode `0600` next to the trader state:
+
+```text
+.devnet/<cluster>/traders/<market>/<owner>.transaction.json
+```
+
+A lost confirmation pauses quoting until the transaction resolves. A finalized
+transaction whose revision and ciphertexts match the journal is committed; a
+failed or expired one is discarded only while the on-chain revision still
+equals the previous state. Recovery reads finalized state with `minContextSlot`,
+so a lagging fallback RPC cannot justify a rollback. RPC failures keep the
+journal and retry after 1–32 seconds, and a restart runs the same recovery.
+Back the journals up with the trader state and wallets, and never delete one to
+force trading to resume. Browser-wallet CLI sessions keep their existing sender.
+
+Each wallet admits one maker process at a time, and short private-state locks
+stop the CLI and a running maker from modifying the same state. SIGINT and
+SIGTERM let the active operation finish or leave its journal for recovery, so a
+process supervisor can restart the bots safely.
+
+The primary RPC (`BEATEX_RPC_SESSION_URL`) is tried first, then
+`BEATEX_RPC_FALLBACK_URLS`. Rate-limited endpoints honor `Retry-After` (1–300
+seconds; 60 when absent), and transport failures get increasing cooldowns.
+Deterministic transaction errors are never replayed against fallbacks, and
+error messages omit credential URLs. Changing `rpc.env` requires restarting
+the affected bot.
+
 ## Legacy version-1 settlement checkpoint
 
 The transactions below document the superseded version-1 deployment. They are

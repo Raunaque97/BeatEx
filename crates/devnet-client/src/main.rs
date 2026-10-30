@@ -85,6 +85,14 @@ use {
 #[cfg(feature = "browser-wallet")]
 use std::process::{Command, Stdio};
 
+mod private_journal;
+mod rpc_health;
+use private_journal::send_private_transition;
+pub use private_journal::{
+    acquire_native_maker_lock, has_pending_native_transaction, recover_native_private_state,
+    NativeRecovery,
+};
+
 const DEFAULT_RPC_URL: &str = "https://api.devnet.solana.com";
 const PYTH_BTC_USD_ACCOUNT: &str = "4cSM2e6rvbGQUFiJbqytoVMi5GgghSMr8LwVrT9VPSPo";
 const PYTH_BTC_USD_FEED: &str = "e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43";
@@ -405,7 +413,7 @@ fn emit_order_event(event: NativeOrderEvent) {
     });
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 struct StoredBalance {
     base_value: u64,
     quote_value: u64,
@@ -435,7 +443,7 @@ impl From<PrivateBalanceOpening> for StoredBalance {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 struct StoredOrder {
     auction_id: u64,
     auction: String,
@@ -449,7 +457,7 @@ struct StoredOrder {
     quote_reserve: u64,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 struct TraderPrivateState {
     revision: u64,
     balance: StoredBalance,
@@ -882,19 +890,57 @@ fn rpc_request(
     request: &str,
     timeout_seconds: &str,
 ) -> Result<Vec<u8>, Box<dyn Error>> {
+    rpc_request_at_endpoints(&rpc_candidates(rpc_url), request, timeout_seconds)
+}
+
+pub fn native_rpc_request<T: for<'de> Deserialize<'de>>(
+    endpoints: &[String],
+    method: &str,
+    params: serde_json::Value,
+) -> Result<T, String> {
+    (|| {
+        let request =
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}).to_string();
+        let body = rpc_request_at_endpoints(endpoints, &request, "5")?;
+        let response: serde_json::Value = serde_json::from_slice(&body)?;
+        let result = response.get("result").ok_or("RPC result is missing")?;
+        Ok(serde_json::from_value(result.clone())?)
+    })()
+    .map_err(|error: Box<dyn Error>| error.to_string())
+}
+
+fn rpc_request_at_endpoints(
+    endpoints: &[String],
+    request: &str,
+    timeout_seconds: &str,
+) -> Result<Vec<u8>, Box<dyn Error>> {
     static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
     let client = CLIENT.get_or_init(reqwest::blocking::Client::new);
     let timeout = Duration::from_secs(timeout_seconds.parse()?);
-    let submission = is_transaction_submission(rpc_method(request).as_deref());
+    let method = rpc_method(request);
+    let submission = is_transaction_submission(method.as_deref());
+    let slot_read = method.as_deref() == Some("getSlot");
+    if slot_read {
+        if let Some(body) = rpc_health::cached_slot(endpoints, request) {
+            return Ok(body);
+        }
+    }
     let mut failures = Vec::new();
     // Stateful bot reads must remain on the same provider that accepted the
     // preceding transaction. Round-robin reads at `processed` commitment can
     // otherwise move backwards in time when providers observe the same slot
     // at different moments. Fallbacks are still tried when the primary is
     // unavailable or rate-limited.
-    for candidate in rpc_candidates(rpc_url) {
+    for candidate in endpoints {
+        if !rpc_health::ready(candidate) {
+            failures.push(format!(
+                "{} is cooling down after an RPC failure",
+                rpc_label(candidate)
+            ));
+            continue;
+        }
         let response = match client
-            .post(&candidate)
+            .post(candidate)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .timeout(timeout)
             .body(request.to_owned())
@@ -902,26 +948,44 @@ fn rpc_request(
         {
             Ok(response) => response,
             Err(error) => {
-                failures.push(format!("{} request failed: {error}", rpc_label(&candidate)));
+                rpc_health::failed(candidate, false, None);
+                failures.push(format!(
+                    "{} request failed: {}",
+                    rpc_label(candidate),
+                    error.without_url()
+                ));
                 continue;
             }
         };
         let status = response.status();
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|header| header.to_str().ok())
+            .and_then(|seconds| seconds.parse::<u64>().ok())
+            .map(Duration::from_secs);
         let body = match response.bytes() {
             Ok(body) => body,
             Err(error) => {
+                rpc_health::failed(candidate, false, None);
                 failures.push(format!(
-                    "{} response body failed: {error}",
-                    rpc_label(&candidate)
+                    "{} response body failed: {}",
+                    rpc_label(candidate),
+                    error.without_url()
                 ));
                 continue;
             }
         };
         if !status.is_success() {
+            rpc_health::failed(
+                candidate,
+                status == reqwest::StatusCode::TOO_MANY_REQUESTS,
+                retry_after,
+            );
             if submission && status != reqwest::StatusCode::TOO_MANY_REQUESTS {
                 return Err(format!(
                     "{} returned HTTP {}: {}",
-                    rpc_label(&candidate),
+                    rpc_label(candidate),
                     status,
                     String::from_utf8_lossy(&body).trim()
                 )
@@ -929,14 +993,24 @@ fn rpc_request(
             }
             failures.push(format!(
                 "{} returned HTTP {}: {}",
-                rpc_label(&candidate),
+                rpc_label(candidate),
                 status,
                 String::from_utf8_lossy(&body).trim()
             ));
             continue;
         }
         match serde_json::from_slice::<serde_json::Value>(&body) {
-            Ok(response) if response.get("error").is_none() => return Ok(body.to_vec()),
+            Ok(response) if response.get("error").is_none() => {
+                rpc_health::succeeded(candidate);
+                if slot_read
+                    && response
+                        .get("result")
+                        .is_some_and(serde_json::Value::is_u64)
+                {
+                    rpc_health::cache_slot(endpoints, request, body.to_vec());
+                }
+                return Ok(body.to_vec());
+            }
             Ok(response) => {
                 let error = &response["error"];
                 let code = error.get("code").and_then(serde_json::Value::as_i64);
@@ -947,30 +1021,31 @@ fn rpc_request(
                 if matches!(code, Some(-32002 | -32600 | -32601 | -32602)) {
                     return Err(format!(
                         "{} returned deterministic JSON-RPC error {error}",
-                        rpc_label(&candidate)
+                        rpc_label(candidate)
                     )
                     .into());
                 }
                 if submission && !is_rate_limited_json_rpc(error) {
                     return Err(format!(
                         "{} returned JSON-RPC error {error}",
-                        rpc_label(&candidate)
+                        rpc_label(candidate)
                     )
                     .into());
                 }
+                rpc_health::failed(candidate, is_rate_limited_json_rpc(error), None);
                 failures.push(format!(
                     "{} returned JSON-RPC error {error}",
-                    rpc_label(&candidate)
+                    rpc_label(candidate)
                 ));
             }
             Err(error) if submission => {
                 return Err(
-                    format!("{} returned invalid JSON: {error}", rpc_label(&candidate)).into(),
+                    format!("{} returned invalid JSON: {error}", rpc_label(candidate)).into(),
                 );
             }
             Err(error) => failures.push(format!(
                 "{} returned invalid JSON: {error}",
-                rpc_label(&candidate)
+                rpc_label(candidate)
             )),
         }
     }
@@ -1411,6 +1486,16 @@ fn send_bundle_rust_v1(
                 | "replace encrypted order"
                 | "claim previous auction and place next order"
         );
+    let signed_signature = transaction
+        .signatures
+        .first()
+        .ok_or("signed transaction has no signature")?
+        .to_string();
+    let last_valid_block_height = blockhash_response
+        .pointer("/result/value/lastValidBlockHeight")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or("latest blockhash response is missing its expiry")?;
+    private_journal::record_signed_transaction(signed_signature.clone(), last_valid_block_height)?;
     let send_request = serde_json::json!({
         "jsonrpc": "2.0", "id": 1, "method": "sendTransaction",
         "params": [BASE64.encode(encoded_bytes), {
@@ -1426,7 +1511,7 @@ fn send_bundle_rust_v1(
     .to_string();
     let send_bytes = rpc_request(&bundle.rpc_url, &send_request, "15").map_err(|error| {
         if error.to_string().starts_with("all RPC endpoints failed") {
-            format!("transaction submission outcome unknown: {error}").into()
+            format!("transaction submission outcome unknown for {signed_signature}: {error}").into()
         } else {
             error
         }
@@ -2519,14 +2604,7 @@ fn write_trader_state(
     owner: &Pubkey,
     state: &TraderPrivateState,
 ) -> Result<(), Box<dyn Error>> {
-    let path = trader_state_path(state_dir, owner);
-    let directory = path.parent().ok_or("trader state path has no parent")?;
-    fs::create_dir_all(&directory)?;
-    let temporary = path.with_extension("json.pending");
-    fs::write(&temporary, serde_json::to_vec_pretty(state)?)?;
-    restrict_permissions(&temporary)?;
-    fs::rename(temporary, path)?;
-    Ok(())
+    private_journal::atomic_private_write(&trader_state_path(state_dir, owner), state)
 }
 
 fn private_balance_address(market: &Pubkey, owner: &Pubkey) -> Pubkey {
@@ -2604,45 +2682,56 @@ fn deposit_balance(
         QueueCircuitKind::BalanceDeposit,
         queue::BALANCE_DEPOSIT_CIRCUIT_VERSION,
     );
-    send(
+    let mut next = state.clone();
+    next.balance = output.new_balance.into();
+    next.revision += 1;
+    send_private_transition(
         &config.wallet,
-        &config.rpc_url,
-        "deposit private collateral",
-        vec![
-            meta(owner, true, true),
-            meta(addresses.market, false, false),
-            meta(addresses.key_epoch, false, false),
-            meta(deposit_key, false, false),
-            meta(private_balance, true, false),
-            meta(market.base_mint, false, false),
-            meta(market.quote_mint, false, false),
-            meta(config.base_source, true, false),
-            meta(config.quote_source, true, false),
-            meta(market.base_vault, true, false),
-            meta(market.quote_vault, true, false),
-            meta(addresses.vault_authority, false, false),
-            meta(Pubkey::from_str(TOKEN_2022_PROGRAM_ID)?, false, false),
-        ],
-        beatex::instruction::DepositCollateral {
-            args: DepositCollateralArgs {
-                base_amount,
-                quote_amount,
-                new_encrypted_base: output.new_encrypted_base,
-                new_encrypted_quote: output.new_encrypted_quote,
-                proof: proof_input(
-                    output.proof_a,
-                    output.proof_b,
-                    output.proof_c,
-                    output.public_input,
-                ),
-            },
-        }
-        .data(),
-        vec![],
+        &config.common.state_dir,
+        owner,
+        state,
+        next,
+        [output.new_encrypted_base, output.new_encrypted_quote],
+        || {
+            send(
+                &config.wallet,
+                &config.rpc_url,
+                "deposit private collateral",
+                vec![
+                    meta(owner, true, true),
+                    meta(addresses.market, false, false),
+                    meta(addresses.key_epoch, false, false),
+                    meta(deposit_key, false, false),
+                    meta(private_balance, true, false),
+                    meta(market.base_mint, false, false),
+                    meta(market.quote_mint, false, false),
+                    meta(config.base_source, true, false),
+                    meta(config.quote_source, true, false),
+                    meta(market.base_vault, true, false),
+                    meta(market.quote_vault, true, false),
+                    meta(addresses.vault_authority, false, false),
+                    meta(Pubkey::from_str(TOKEN_2022_PROGRAM_ID)?, false, false),
+                ],
+                beatex::instruction::DepositCollateral {
+                    args: DepositCollateralArgs {
+                        base_amount,
+                        quote_amount,
+                        new_encrypted_base: output.new_encrypted_base,
+                        new_encrypted_quote: output.new_encrypted_quote,
+                        proof: proof_input(
+                            output.proof_a,
+                            output.proof_b,
+                            output.proof_c,
+                            output.public_input,
+                        ),
+                    },
+                }
+                .data(),
+                vec![],
+            )
+        },
     )?;
-    state.balance = output.new_balance.into();
-    state.revision += 1;
-    write_trader_state(&config.common.state_dir, &owner, state)
+    Ok(())
 }
 
 fn flatten_ciphertexts(
@@ -2703,43 +2792,10 @@ fn submit_order(
         auction.order_circuit_version,
     );
     ensure_order_submission_time(&config.rpc_url, auction)?;
-    send(
-        &config.wallet,
-        &config.rpc_url,
-        "submit encrypted order",
-        vec![
-            meta(owner, true, true),
-            meta(addresses.market, false, false),
-            meta(auction_addresses.auction, false, false),
-            meta(addresses.key_epoch, false, false),
-            meta(order_key, false, false),
-            meta(auction_addresses.submission_counter, true, false),
-            meta(private_balance, true, false),
-            meta(event, true, false),
-            meta(active_order, true, false),
-            meta(anchor_lang::system_program::ID, false, false),
-        ],
-        beatex::instruction::SubmitQueuedOrder {
-            args: SubmitQueuedOrderArgs {
-                client_order_nonce: intent.client_order_nonce,
-                order_commitment: output.order_commitment,
-                ciphertexts: flatten_ciphertexts(output.ciphertexts),
-                new_encrypted_base: output.new_encrypted_base,
-                new_encrypted_quote: output.new_encrypted_quote,
-                proof: proof_input(
-                    output.proof_a,
-                    output.proof_b,
-                    output.proof_c,
-                    output.public_input,
-                ),
-            },
-        }
-        .data(),
-        vec![],
-    )?;
-    state.balance = output.new_balance.into();
-    state.revision += 1;
-    state.upsert_order(StoredOrder {
+    let mut next = state.clone();
+    next.balance = output.new_balance.into();
+    next.revision += 1;
+    next.upsert_order(StoredOrder {
         auction_id: auction_addresses.auction_id,
         auction: auction_addresses.auction.to_string(),
         event: event.to_string(),
@@ -2751,7 +2807,51 @@ fn submit_order(
         base_reserve: output.base_reserve,
         quote_reserve: output.quote_reserve,
     });
-    write_trader_state(&config.common.state_dir, &owner, state)?;
+    send_private_transition(
+        &config.wallet,
+        &config.common.state_dir,
+        owner,
+        state,
+        next,
+        [output.new_encrypted_base, output.new_encrypted_quote],
+        || {
+            send(
+                &config.wallet,
+                &config.rpc_url,
+                "submit encrypted order",
+                vec![
+                    meta(owner, true, true),
+                    meta(addresses.market, false, false),
+                    meta(auction_addresses.auction, false, false),
+                    meta(addresses.key_epoch, false, false),
+                    meta(order_key, false, false),
+                    meta(auction_addresses.submission_counter, true, false),
+                    meta(private_balance, true, false),
+                    meta(event, true, false),
+                    meta(active_order, true, false),
+                    meta(anchor_lang::system_program::ID, false, false),
+                ],
+                beatex::instruction::SubmitQueuedOrder {
+                    args: SubmitQueuedOrderArgs {
+                        client_order_nonce: intent.client_order_nonce,
+                        order_commitment: output.order_commitment,
+                        ciphertexts: flatten_ciphertexts(output.ciphertexts),
+                        new_encrypted_base: output.new_encrypted_base,
+                        new_encrypted_quote: output.new_encrypted_quote,
+                        proof: proof_input(
+                            output.proof_a,
+                            output.proof_b,
+                            output.proof_c,
+                            output.public_input,
+                        ),
+                    },
+                }
+                .data(),
+                vec![],
+            )
+        },
+    )?;
+
     emit_order_event(NativeOrderEvent::Placed {
         auction_id: auction_addresses.auction_id,
     });
@@ -2841,57 +2941,10 @@ fn replace_order(
         auction.order_circuit_version,
     );
     ensure_order_submission_time(&config.rpc_url, auction)?;
-    send(
-        &config.wallet,
-        &config.rpc_url,
-        "replace encrypted order",
-        vec![
-            meta(owner, true, true),
-            meta(addresses.market, false, false),
-            meta(auction_addresses.auction, false, false),
-            meta(addresses.key_epoch, false, false),
-            meta(release_key, false, false),
-            meta(auction_addresses.submission_counter, true, false),
-            meta(private_balance, true, false),
-            meta(active_order, true, false),
-            meta(previous_event, false, false),
-            meta(order_key, false, false),
-            meta(event, true, false),
-            meta(anchor_lang::system_program::ID, false, false),
-        ],
-        beatex::instruction::ReplaceQueuedOrder {
-            args: ReplaceQueuedOrderArgs {
-                release: ReleaseOrderCollateralArgs {
-                    released_encrypted_base: output.release.released_encrypted_base,
-                    released_encrypted_quote: output.release.released_encrypted_quote,
-                    proof: proof_input(
-                        output.release.proof_a,
-                        output.release.proof_b,
-                        output.release.proof_c,
-                        output.release.public_input,
-                    ),
-                },
-                replacement: SubmitQueuedOrderArgs {
-                    client_order_nonce: intent.client_order_nonce,
-                    order_commitment: output.replacement.order_commitment,
-                    ciphertexts: flatten_ciphertexts(output.replacement.ciphertexts),
-                    new_encrypted_base: output.replacement.new_encrypted_base,
-                    new_encrypted_quote: output.replacement.new_encrypted_quote,
-                    proof: proof_input(
-                        output.replacement.proof_a,
-                        output.replacement.proof_b,
-                        output.replacement.proof_c,
-                        output.replacement.public_input,
-                    ),
-                },
-            },
-        }
-        .data(),
-        vec![],
-    )?;
-    state.balance = output.replacement.new_balance.into();
-    state.revision += 1;
-    state.upsert_order(StoredOrder {
+    let mut next = state.clone();
+    next.balance = output.replacement.new_balance.into();
+    next.revision += 1;
+    next.upsert_order(StoredOrder {
         auction_id: auction_addresses.auction_id,
         auction: auction_addresses.auction.to_string(),
         event: event.to_string(),
@@ -2903,7 +2956,68 @@ fn replace_order(
         base_reserve: output.replacement.base_reserve,
         quote_reserve: output.replacement.quote_reserve,
     });
-    write_trader_state(&config.common.state_dir, &owner, state)?;
+    send_private_transition(
+        &config.wallet,
+        &config.common.state_dir,
+        owner,
+        state,
+        next,
+        [
+            output.replacement.new_encrypted_base,
+            output.replacement.new_encrypted_quote,
+        ],
+        || {
+            send(
+                &config.wallet,
+                &config.rpc_url,
+                "replace encrypted order",
+                vec![
+                    meta(owner, true, true),
+                    meta(addresses.market, false, false),
+                    meta(auction_addresses.auction, false, false),
+                    meta(addresses.key_epoch, false, false),
+                    meta(release_key, false, false),
+                    meta(auction_addresses.submission_counter, true, false),
+                    meta(private_balance, true, false),
+                    meta(active_order, true, false),
+                    meta(previous_event, false, false),
+                    meta(order_key, false, false),
+                    meta(event, true, false),
+                    meta(anchor_lang::system_program::ID, false, false),
+                ],
+                beatex::instruction::ReplaceQueuedOrder {
+                    args: ReplaceQueuedOrderArgs {
+                        release: ReleaseOrderCollateralArgs {
+                            released_encrypted_base: output.release.released_encrypted_base,
+                            released_encrypted_quote: output.release.released_encrypted_quote,
+                            proof: proof_input(
+                                output.release.proof_a,
+                                output.release.proof_b,
+                                output.release.proof_c,
+                                output.release.public_input,
+                            ),
+                        },
+                        replacement: SubmitQueuedOrderArgs {
+                            client_order_nonce: intent.client_order_nonce,
+                            order_commitment: output.replacement.order_commitment,
+                            ciphertexts: flatten_ciphertexts(output.replacement.ciphertexts),
+                            new_encrypted_base: output.replacement.new_encrypted_base,
+                            new_encrypted_quote: output.replacement.new_encrypted_quote,
+                            proof: proof_input(
+                                output.replacement.proof_a,
+                                output.replacement.proof_b,
+                                output.replacement.proof_c,
+                                output.replacement.public_input,
+                            ),
+                        },
+                    },
+                }
+                .data(),
+                vec![],
+            )
+        },
+    )?;
+
     emit_order_event(NativeOrderEvent::Replaced {
         auction_id: auction_addresses.auction_id,
     });
@@ -3051,153 +3165,11 @@ fn rollover_order(
     let mut order_expected_input = output.next_order.public_input;
     order_expected_input.reverse();
     ensure_order_submission_time(&config.rpc_url, next_auction)?;
-    send_bundle(
-        &config.wallet,
-        &config.rpc_url,
-        "claim previous auction and place next order",
-        vec![
-            BundleInstruction {
-                program_id: beatex::ID.to_string(),
-                accounts: vec![
-                    meta(owner, true, true),
-                    meta(addresses.market, false, false),
-                    meta(next_addresses.auction, false, false),
-                    meta(next_addresses.submission_counter, false, false),
-                    meta(next_order_address, true, false),
-                    meta(next_active_order, true, false),
-                    meta(solana_instructions_sysvar::ID, false, false),
-                    meta(anchor_lang::system_program::ID, false, false),
-                ],
-                data_base64: BASE64.encode(beatex::instruction::PrepareRollover {}.data()),
-            },
-            BundleInstruction {
-                program_id: beatex::ID.to_string(),
-                accounts: vec![
-                    meta(addresses.market, false, false),
-                    meta(rollover_key, false, false),
-                ],
-                data_base64: BASE64.encode(
-                    beatex::instruction::VerifyRolloverProof {
-                        args: VerifyRolloverProofArgs {
-                            circuit_kind: QueueCircuitKind::RolloverSettlement,
-                            expected_public_input: settlement_expected_input,
-                            proof: proof_input(
-                                output.settlement.proof_a,
-                                output.settlement.proof_b,
-                                output.settlement.proof_c,
-                                output.settlement.public_input,
-                            ),
-                        },
-                    }
-                    .data(),
-                ),
-            },
-            BundleInstruction {
-                program_id: beatex::ID.to_string(),
-                accounts: vec![
-                    meta(owner, false, true),
-                    meta(addresses.market, false, false),
-                    meta(old_addresses.auction, false, false),
-                    meta(addresses.key_epoch, false, false),
-                    meta(old_order_address, false, false),
-                    meta(old_active_order, false, false),
-                    meta(private_balance, false, false),
-                    meta(rollover_key, false, false),
-                    meta(solana_instructions_sysvar::ID, false, false),
-                ],
-                data_base64: BASE64.encode(
-                    beatex::instruction::BindRolloverSettlement {
-                        args: BindRolloverSettlementArgs {
-                            settlement: RolloverSettlementArgs {
-                                terminal_nullifier: output.settlement.terminal_nullifier,
-                                credited_encrypted_base: output.settlement.credited_encrypted_base,
-                                credited_encrypted_quote: output
-                                    .settlement
-                                    .credited_encrypted_quote,
-                            },
-                            expected_public_input: settlement_expected_input,
-                        },
-                    }
-                    .data(),
-                ),
-            },
-            BundleInstruction {
-                program_id: beatex::ID.to_string(),
-                accounts: vec![
-                    meta(addresses.market, false, false),
-                    meta(order_key, false, false),
-                ],
-                data_base64: BASE64.encode(
-                    beatex::instruction::VerifyRolloverProof {
-                        args: VerifyRolloverProofArgs {
-                            circuit_kind: QueueCircuitKind::OrderSubmission,
-                            expected_public_input: order_expected_input,
-                            proof: proof_input(
-                                output.next_order.proof_a,
-                                output.next_order.proof_b,
-                                output.next_order.proof_c,
-                                output.next_order.public_input,
-                            ),
-                        },
-                    }
-                    .data(),
-                ),
-            },
-            BundleInstruction {
-                program_id: beatex::ID.to_string(),
-                accounts: vec![
-                    meta(owner, false, true),
-                    meta(addresses.market, false, false),
-                    meta(next_addresses.auction, false, false),
-                    meta(addresses.key_epoch, false, false),
-                    meta(order_key, false, false),
-                    meta(solana_instructions_sysvar::ID, false, false),
-                ],
-                data_base64: BASE64.encode(
-                    beatex::instruction::BindRolloverOrder {
-                        args: BindRolloverOrderArgs {
-                            next_order: RolloverNextOrderArgs {
-                                client_order_nonce: intent.client_order_nonce,
-                                order_commitment: output.next_order.order_commitment,
-                                ciphertexts: flatten_ciphertexts(output.next_order.ciphertexts),
-                                new_encrypted_base: output.next_order.new_encrypted_base,
-                                new_encrypted_quote: output.next_order.new_encrypted_quote,
-                            },
-                            credited_encrypted_base: output.settlement.credited_encrypted_base,
-                            credited_encrypted_quote: output.settlement.credited_encrypted_quote,
-                            expected_public_input: order_expected_input,
-                        },
-                    }
-                    .data(),
-                ),
-            },
-            BundleInstruction {
-                program_id: beatex::ID.to_string(),
-                accounts: vec![
-                    meta(owner, true, true),
-                    meta(addresses.market, false, false),
-                    meta(old_addresses.auction, false, false),
-                    meta(next_addresses.auction, false, false),
-                    meta(addresses.key_epoch, false, false),
-                    meta(old_order_address, true, false),
-                    meta(old_active_order, true, false),
-                    meta(next_addresses.submission_counter, true, false),
-                    meta(private_balance, true, false),
-                    meta(rollover_key, false, false),
-                    meta(order_key, false, false),
-                    meta(next_order_address, true, false),
-                    meta(next_active_order, true, false),
-                    meta(solana_instructions_sysvar::ID, false, false),
-                ],
-                data_base64: BASE64.encode(beatex::instruction::RolloverOrder {}.data()),
-            },
-        ],
-        vec![],
-    )?;
-    state.balance = output.next_order.new_balance.into();
-    state.revision += 1;
-    state.remove_order(previous.auction_id);
-    state.upsert_order(StoredOrder {
+    let mut next = state.clone();
+    next.balance = output.next_order.new_balance.into();
+    next.revision += 1;
+    next.remove_order(previous.auction_id);
+    next.upsert_order(StoredOrder {
         auction_id: next_addresses.auction_id,
         auction: next_addresses.auction.to_string(),
         event: next_order_address.to_string(),
@@ -3209,7 +3181,171 @@ fn rollover_order(
         base_reserve: output.next_order.base_reserve,
         quote_reserve: output.next_order.quote_reserve,
     });
-    write_trader_state(&config.common.state_dir, &owner, state)?;
+    send_private_transition(
+        &config.wallet,
+        &config.common.state_dir,
+        owner,
+        state,
+        next,
+        [
+            output.next_order.new_encrypted_base,
+            output.next_order.new_encrypted_quote,
+        ],
+        || {
+            send_bundle(
+                &config.wallet,
+                &config.rpc_url,
+                "claim previous auction and place next order",
+                vec![
+                    BundleInstruction {
+                        program_id: beatex::ID.to_string(),
+                        accounts: vec![
+                            meta(owner, true, true),
+                            meta(addresses.market, false, false),
+                            meta(next_addresses.auction, false, false),
+                            meta(next_addresses.submission_counter, false, false),
+                            meta(next_order_address, true, false),
+                            meta(next_active_order, true, false),
+                            meta(solana_instructions_sysvar::ID, false, false),
+                            meta(anchor_lang::system_program::ID, false, false),
+                        ],
+                        data_base64: BASE64.encode(beatex::instruction::PrepareRollover {}.data()),
+                    },
+                    BundleInstruction {
+                        program_id: beatex::ID.to_string(),
+                        accounts: vec![
+                            meta(addresses.market, false, false),
+                            meta(rollover_key, false, false),
+                        ],
+                        data_base64: BASE64.encode(
+                            beatex::instruction::VerifyRolloverProof {
+                                args: VerifyRolloverProofArgs {
+                                    circuit_kind: QueueCircuitKind::RolloverSettlement,
+                                    expected_public_input: settlement_expected_input,
+                                    proof: proof_input(
+                                        output.settlement.proof_a,
+                                        output.settlement.proof_b,
+                                        output.settlement.proof_c,
+                                        output.settlement.public_input,
+                                    ),
+                                },
+                            }
+                            .data(),
+                        ),
+                    },
+                    BundleInstruction {
+                        program_id: beatex::ID.to_string(),
+                        accounts: vec![
+                            meta(owner, false, true),
+                            meta(addresses.market, false, false),
+                            meta(old_addresses.auction, false, false),
+                            meta(addresses.key_epoch, false, false),
+                            meta(old_order_address, false, false),
+                            meta(old_active_order, false, false),
+                            meta(private_balance, false, false),
+                            meta(rollover_key, false, false),
+                            meta(solana_instructions_sysvar::ID, false, false),
+                        ],
+                        data_base64: BASE64.encode(
+                            beatex::instruction::BindRolloverSettlement {
+                                args: BindRolloverSettlementArgs {
+                                    settlement: RolloverSettlementArgs {
+                                        terminal_nullifier: output.settlement.terminal_nullifier,
+                                        credited_encrypted_base: output
+                                            .settlement
+                                            .credited_encrypted_base,
+                                        credited_encrypted_quote: output
+                                            .settlement
+                                            .credited_encrypted_quote,
+                                    },
+                                    expected_public_input: settlement_expected_input,
+                                },
+                            }
+                            .data(),
+                        ),
+                    },
+                    BundleInstruction {
+                        program_id: beatex::ID.to_string(),
+                        accounts: vec![
+                            meta(addresses.market, false, false),
+                            meta(order_key, false, false),
+                        ],
+                        data_base64: BASE64.encode(
+                            beatex::instruction::VerifyRolloverProof {
+                                args: VerifyRolloverProofArgs {
+                                    circuit_kind: QueueCircuitKind::OrderSubmission,
+                                    expected_public_input: order_expected_input,
+                                    proof: proof_input(
+                                        output.next_order.proof_a,
+                                        output.next_order.proof_b,
+                                        output.next_order.proof_c,
+                                        output.next_order.public_input,
+                                    ),
+                                },
+                            }
+                            .data(),
+                        ),
+                    },
+                    BundleInstruction {
+                        program_id: beatex::ID.to_string(),
+                        accounts: vec![
+                            meta(owner, false, true),
+                            meta(addresses.market, false, false),
+                            meta(next_addresses.auction, false, false),
+                            meta(addresses.key_epoch, false, false),
+                            meta(order_key, false, false),
+                            meta(solana_instructions_sysvar::ID, false, false),
+                        ],
+                        data_base64: BASE64.encode(
+                            beatex::instruction::BindRolloverOrder {
+                                args: BindRolloverOrderArgs {
+                                    next_order: RolloverNextOrderArgs {
+                                        client_order_nonce: intent.client_order_nonce,
+                                        order_commitment: output.next_order.order_commitment,
+                                        ciphertexts: flatten_ciphertexts(
+                                            output.next_order.ciphertexts,
+                                        ),
+                                        new_encrypted_base: output.next_order.new_encrypted_base,
+                                        new_encrypted_quote: output.next_order.new_encrypted_quote,
+                                    },
+                                    credited_encrypted_base: output
+                                        .settlement
+                                        .credited_encrypted_base,
+                                    credited_encrypted_quote: output
+                                        .settlement
+                                        .credited_encrypted_quote,
+                                    expected_public_input: order_expected_input,
+                                },
+                            }
+                            .data(),
+                        ),
+                    },
+                    BundleInstruction {
+                        program_id: beatex::ID.to_string(),
+                        accounts: vec![
+                            meta(owner, true, true),
+                            meta(addresses.market, false, false),
+                            meta(old_addresses.auction, false, false),
+                            meta(next_addresses.auction, false, false),
+                            meta(addresses.key_epoch, false, false),
+                            meta(old_order_address, true, false),
+                            meta(old_active_order, true, false),
+                            meta(next_addresses.submission_counter, true, false),
+                            meta(private_balance, true, false),
+                            meta(rollover_key, false, false),
+                            meta(order_key, false, false),
+                            meta(next_order_address, true, false),
+                            meta(next_active_order, true, false),
+                            meta(solana_instructions_sysvar::ID, false, false),
+                        ],
+                        data_base64: BASE64.encode(beatex::instruction::RolloverOrder {}.data()),
+                    },
+                ],
+                vec![],
+            )
+        },
+    )?;
+
     emit_order_event(NativeOrderEvent::Rollover {
         previous_auction_id: previous.auction_id,
         next_auction_id: next_addresses.auction_id,
@@ -3353,6 +3489,14 @@ fn execute_order_intent_once(
         return Err("mainnet is not supported by the Devnet client".into());
     }
     let owner = wallet_pubkey(&config.wallet)?;
+    let _state_lock = private_journal::lock_state(&config.common.state_dir, &owner)?;
+    if private_journal::recover(&config.common.state_dir, &owner, &config.rpc_url)?
+        == NativeRecovery::Waiting
+    {
+        return Err(
+            "pending private transaction is awaiting finality or block-height expiry".into(),
+        );
+    }
     let addresses = addresses(&config.common);
     let private_balance = private_balance_address(&addresses.market, &owner);
     let (market, key_epoch, auction_addresses, auction, onchain_before) = if let Some(auction_id) =
@@ -3549,7 +3693,7 @@ fn execute_order_intent_once(
             Some((previous, previous_auction))
                 if previous_auction.state == beatex::AuctionState::Cancelled =>
             {
-                execute_balance_settlement(BalanceSettlementConfig {
+                execute_balance_settlement_locked(BalanceSettlementConfig {
                     common: config.common.clone(),
                     wallet: config.wallet.clone(),
                     rpc_url: config.rpc_url.clone(),
@@ -5083,6 +5227,21 @@ fn execute_claim(config: ClaimConfig) -> Result<(), Box<dyn Error>> {
 }
 
 fn execute_balance_settlement(config: BalanceSettlementConfig) -> Result<(), Box<dyn Error>> {
+    let owner = wallet_pubkey(&config.wallet)?;
+    let _lock = private_journal::lock_state(&config.common.state_dir, &owner)?;
+    if private_journal::recover(&config.common.state_dir, &owner, &config.rpc_url)?
+        == NativeRecovery::Waiting
+    {
+        return Err(
+            "pending private transaction is awaiting finality or block-height expiry".into(),
+        );
+    }
+    execute_balance_settlement_locked(config)
+}
+
+fn execute_balance_settlement_locked(
+    config: BalanceSettlementConfig,
+) -> Result<(), Box<dyn Error>> {
     if config.rpc_url.contains("mainnet") {
         return Err("mainnet is not supported by the Devnet client".into());
     }
@@ -5210,50 +5369,70 @@ fn execute_balance_settlement(config: BalanceSettlementConfig) -> Result<(), Box
             settlement_accounts[4].writable = true;
             settlement_accounts[5].writable = true;
             settlement_accounts[6].writable = true;
-            send_bundle(
+            let mut next = state.clone();
+            next.balance = output.credited_balance.into();
+            next.revision = next
+                .revision
+                .checked_add(1)
+                .ok_or("private balance revision overflow")?;
+            next.remove_order(config.auction_id);
+            send_private_transition(
                 &config.wallet,
-                &config.rpc_url,
-                "settle order into encrypted balance",
-                vec![
-                    BundleInstruction {
-                        program_id: beatex::ID.to_string(),
-                        accounts: vec![
-                            meta(addresses.market, false, false),
-                            meta(rollover_key, false, false),
-                        ],
-                        data_base64: BASE64.encode(
-                            beatex::instruction::VerifyRolloverProof {
-                                args: VerifyRolloverProofArgs {
-                                    circuit_kind: QueueCircuitKind::RolloverSettlement,
-                                    expected_public_input,
-                                    proof: proof_input(
-                                        output.proof_a,
-                                        output.proof_b,
-                                        output.proof_c,
-                                        output.public_input,
-                                    ),
-                                },
-                            }
-                            .data(),
-                        ),
-                    },
-                    BundleInstruction {
-                        program_id: beatex::ID.to_string(),
-                        accounts: binding_accounts,
-                        data_base64: BASE64.encode(
-                            beatex::instruction::BindRolloverSettlement { args: binding }.data(),
-                        ),
-                    },
-                    BundleInstruction {
-                        program_id: beatex::ID.to_string(),
-                        accounts: settlement_accounts,
-                        data_base64: BASE64
-                            .encode(beatex::instruction::SettleOrderToBalance {}.data()),
-                    },
+                &config.common.state_dir,
+                owner,
+                &mut state,
+                next,
+                [
+                    output.credited_encrypted_base,
+                    output.credited_encrypted_quote,
                 ],
-                vec![],
+                || {
+                    send_bundle(
+                        &config.wallet,
+                        &config.rpc_url,
+                        "settle order into encrypted balance",
+                        vec![
+                            BundleInstruction {
+                                program_id: beatex::ID.to_string(),
+                                accounts: vec![
+                                    meta(addresses.market, false, false),
+                                    meta(rollover_key, false, false),
+                                ],
+                                data_base64: BASE64.encode(
+                                    beatex::instruction::VerifyRolloverProof {
+                                        args: VerifyRolloverProofArgs {
+                                            circuit_kind: QueueCircuitKind::RolloverSettlement,
+                                            expected_public_input,
+                                            proof: proof_input(
+                                                output.proof_a,
+                                                output.proof_b,
+                                                output.proof_c,
+                                                output.public_input,
+                                            ),
+                                        },
+                                    }
+                                    .data(),
+                                ),
+                            },
+                            BundleInstruction {
+                                program_id: beatex::ID.to_string(),
+                                accounts: binding_accounts,
+                                data_base64: BASE64.encode(
+                                    beatex::instruction::BindRolloverSettlement { args: binding }
+                                        .data(),
+                                ),
+                            },
+                            BundleInstruction {
+                                program_id: beatex::ID.to_string(),
+                                accounts: settlement_accounts,
+                                data_base64: BASE64
+                                    .encode(beatex::instruction::SettleOrderToBalance {}.data()),
+                            },
+                        ],
+                        vec![],
+                    )
+                },
             )?;
-            state.balance = output.credited_balance.into();
             if let Some(fill) = fill {
                 emit_order_event(NativeOrderEvent::Fill {
                     auction_id: config.auction_id,
@@ -5291,38 +5470,57 @@ fn execute_balance_settlement(config: BalanceSettlementConfig) -> Result<(), Box
                 QueueCircuitKind::OrderModification,
                 queue::ORDER_MODIFICATION_CIRCUIT_VERSION,
             );
-            send(
-                &config.wallet,
-                &config.rpc_url,
-                "refund cancelled order into encrypted balance",
-                vec![
-                    meta(owner, true, true),
-                    meta(addresses.market, false, false),
-                    meta(auction_addresses.auction, false, false),
-                    meta(auction.key_epoch, false, false),
-                    meta(release_key, false, false),
-                    meta(private_balance, true, false),
-                    meta(active_order, true, false),
-                    meta(order_address, true, false),
-                ],
-                beatex::instruction::RefundOrderToBalance {
-                    args: ReleaseOrderCollateralArgs {
-                        released_encrypted_base: output.released_encrypted_base,
-                        released_encrypted_quote: output.released_encrypted_quote,
-                        proof: proof_input(
-                            output.proof_a,
-                            output.proof_b,
-                            output.proof_c,
-                            output.public_input,
-                        ),
-                    },
-                }
-                .data(),
-                vec![],
-            )?;
             let released_base = output.released_balance.base_value;
             let released_quote = output.released_balance.quote_value;
-            state.balance = output.released_balance.into();
+            let mut next = state.clone();
+            next.balance = output.released_balance.into();
+            next.revision = next
+                .revision
+                .checked_add(1)
+                .ok_or("private balance revision overflow")?;
+            next.remove_order(config.auction_id);
+            send_private_transition(
+                &config.wallet,
+                &config.common.state_dir,
+                owner,
+                &mut state,
+                next,
+                [
+                    output.released_encrypted_base,
+                    output.released_encrypted_quote,
+                ],
+                || {
+                    send(
+                        &config.wallet,
+                        &config.rpc_url,
+                        "refund cancelled order into encrypted balance",
+                        vec![
+                            meta(owner, true, true),
+                            meta(addresses.market, false, false),
+                            meta(auction_addresses.auction, false, false),
+                            meta(auction.key_epoch, false, false),
+                            meta(release_key, false, false),
+                            meta(private_balance, true, false),
+                            meta(active_order, true, false),
+                            meta(order_address, true, false),
+                        ],
+                        beatex::instruction::RefundOrderToBalance {
+                            args: ReleaseOrderCollateralArgs {
+                                released_encrypted_base: output.released_encrypted_base,
+                                released_encrypted_quote: output.released_encrypted_quote,
+                                proof: proof_input(
+                                    output.proof_a,
+                                    output.proof_b,
+                                    output.proof_c,
+                                    output.public_input,
+                                ),
+                            },
+                        }
+                        .data(),
+                        vec![],
+                    )
+                },
+            )?;
             emit_order_event(NativeOrderEvent::Refund {
                 auction_id: config.auction_id,
                 base_amount: released_base,
@@ -5330,12 +5528,7 @@ fn execute_balance_settlement(config: BalanceSettlementConfig) -> Result<(), Box
             });
         }
     }
-    state.revision = state
-        .revision
-        .checked_add(1)
-        .ok_or("private balance revision overflow")?;
-    state.remove_order(config.auction_id);
-    write_trader_state(&config.common.state_dir, &owner, &state)
+    Ok(())
 }
 
 fn execute_public_balance_withdrawal(
@@ -5351,6 +5544,14 @@ fn execute_public_balance_withdrawal(
         fetch_anchor_account::<beatex::KeyEpoch>(&config.rpc_url, &addresses.key_epoch)?
             .ok_or("key epoch account is missing")?;
     let owner = wallet_pubkey(&config.wallet)?;
+    let _lock = private_journal::lock_state(&config.common.state_dir, &owner)?;
+    if private_journal::recover(&config.common.state_dir, &owner, &config.rpc_url)?
+        == NativeRecovery::Waiting
+    {
+        return Err(
+            "pending private transaction is awaiting finality or block-height expiry".into(),
+        );
+    }
     let mut state = read_trader_state(&config.common.state_dir, &owner)?
         .ok_or("the trader private-state file is missing")?;
     if state.has_active_orders() {
@@ -5394,48 +5595,61 @@ fn execute_public_balance_withdrawal(
         QueueCircuitKind::BalanceDeposit,
         queue::BALANCE_DEPOSIT_CIRCUIT_VERSION,
     );
-    send(
-        &config.wallet,
-        &config.rpc_url,
-        "withdraw public tokens from encrypted balance",
-        vec![
-            meta(owner, true, true),
-            meta(addresses.market, false, false),
-            meta(addresses.key_epoch, false, false),
-            meta(deposit_key, false, false),
-            meta(private_balance, true, false),
-            meta(market.base_mint, false, false),
-            meta(market.quote_mint, false, false),
-            meta(market.base_vault, true, false),
-            meta(market.quote_vault, true, false),
-            meta(config.base_destination, true, false),
-            meta(config.quote_destination, true, false),
-            meta(addresses.vault_authority, false, false),
-            meta(Pubkey::from_str(TOKEN_2022_PROGRAM_ID)?, false, false),
-        ],
-        beatex::instruction::WithdrawPublicBalance {
-            args: WithdrawPublicBalanceArgs {
-                base_amount: config.base_amount,
-                quote_amount: config.quote_amount,
-                remaining_encrypted_base: output.remaining_encrypted_base,
-                remaining_encrypted_quote: output.remaining_encrypted_quote,
-                proof: proof_input(
-                    output.proof_a,
-                    output.proof_b,
-                    output.proof_c,
-                    output.public_input,
-                ),
-            },
-        }
-        .data(),
-        vec![],
-    )?;
-    state.balance = output.remaining_balance.into();
-    state.revision = state
+    let mut next = state.clone();
+    next.balance = output.remaining_balance.into();
+    next.revision = next
         .revision
         .checked_add(1)
         .ok_or("private balance revision overflow")?;
-    write_trader_state(&config.common.state_dir, &owner, &state)?;
+    send_private_transition(
+        &config.wallet,
+        &config.common.state_dir,
+        owner,
+        &mut state,
+        next,
+        [
+            output.remaining_encrypted_base,
+            output.remaining_encrypted_quote,
+        ],
+        || {
+            send(
+                &config.wallet,
+                &config.rpc_url,
+                "withdraw public tokens from encrypted balance",
+                vec![
+                    meta(owner, true, true),
+                    meta(addresses.market, false, false),
+                    meta(addresses.key_epoch, false, false),
+                    meta(deposit_key, false, false),
+                    meta(private_balance, true, false),
+                    meta(market.base_mint, false, false),
+                    meta(market.quote_mint, false, false),
+                    meta(market.base_vault, true, false),
+                    meta(market.quote_vault, true, false),
+                    meta(config.base_destination, true, false),
+                    meta(config.quote_destination, true, false),
+                    meta(addresses.vault_authority, false, false),
+                    meta(Pubkey::from_str(TOKEN_2022_PROGRAM_ID)?, false, false),
+                ],
+                beatex::instruction::WithdrawPublicBalance {
+                    args: WithdrawPublicBalanceArgs {
+                        base_amount: config.base_amount,
+                        quote_amount: config.quote_amount,
+                        remaining_encrypted_base: output.remaining_encrypted_base,
+                        remaining_encrypted_quote: output.remaining_encrypted_quote,
+                        proof: proof_input(
+                            output.proof_a,
+                            output.proof_b,
+                            output.proof_c,
+                            output.public_input,
+                        ),
+                    },
+                }
+                .data(),
+                vec![],
+            )
+        },
+    )?;
     println!(
         "withdrew {} base units and {} quote units",
         config.base_amount, config.quote_amount

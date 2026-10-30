@@ -20,7 +20,7 @@ maker=''
 buy_on=''
 base_symbol='tBTC'
 quote_symbol='tUSD'
-interval_ms='200'
+interval_ms='1000'
 balance_every_auctions='10'
 budget_bps='1000'
 state_dir="$project_root/.devnet/devnet"
@@ -45,7 +45,7 @@ Options:
   --maker <NAME>                  Maker wallet in market-makers/ (default: <source>-maker)
   --buy-on even|odd               Auctions this maker buys in (default: even for pyth-maker,
                                   odd for binance-maker); the two makers must differ
-  --interval-ms <MILLISECONDS>    Auction polling interval (default: 200)
+  --interval-ms <MILLISECONDS>    Auction polling interval (default: 1000)
   --balance-every-auctions <N>    Print the private balance every N auctions (default: 10)
   --budget-bps <N>                Maximum private balance committed per auction (default: 1000 = 10%)
   --state-dir <DIRECTORY>         Setup state (default: .devnet/devnet)
