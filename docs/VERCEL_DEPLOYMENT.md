@@ -1,33 +1,5 @@
 # Vercel frontend with a local indexer
 
-## Configured deployment
-
-The named tunnel `beatex-indexer` on this Mac serves
-`https://indexer.raun.cc`, forwarding to `http://127.0.0.1:8787`.
-Its ID is `c6a63394-589c-439b-8cb9-aee47d775ac1`.
-
-For Vercel Production and applicable Preview deployments, set:
-
-```dotenv
-BEATEX_INDEXER_URL=https://indexer.raun.cc
-```
-
-The tunnel configuration is `~/.cloudflared/beatex-indexer.yml`. A dedicated
-LaunchAgent at `~/Library/LaunchAgents/com.beatex.indexer-tunnel.plist` starts it
-at login and restarts it if the process exits. It uses IPv4 connections to
-Cloudflare. The indexer itself still needs to keep running independently.
-
-Verify or restart the tunnel on this Mac:
-
-```sh
-curl --fail https://indexer.raun.cc/health
-cloudflared tunnel info beatex-indexer
-launchctl kickstart -k "gui/$(id -u)/com.beatex.indexer-tunnel"
-```
-
-Logs are in `~/Library/Logs/beatex-indexer-tunnel.error.log` (cloudflared writes
-its connection logs to stderr). Credentials stay outside the repository.
-
 ## How the proxy works
 
 The browser requests `/api/indexer/v1/markets/<market>/auctions`. Next.js rewrites
