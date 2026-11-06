@@ -8,6 +8,7 @@ import {
   type PointerEvent,
 } from "react";
 
+import type { ExternalPrice } from "@/lib/beatex/external-prices";
 import { formatBase, formatPrice } from "@/lib/format";
 
 import type { BatchSummary } from "../model/batch-summary";
@@ -86,6 +87,8 @@ export function PriceChart({
   batch,
   lastClearingPrice,
   limitPrice,
+  externalPrices,
+  loading,
 }: {
   readonly history: readonly BatchSummary[];
   /** Older auctions loaded on demand; merged with `history` by id. */
@@ -95,6 +98,9 @@ export function PriceChart({
   readonly batch: CurrentBatch | null;
   readonly lastClearingPrice: bigint | null;
   readonly limitPrice: bigint | null;
+  /** Outside prices drawn as a plain line while the market is idle. */
+  readonly externalPrices: readonly ExternalPrice[];
+  readonly loading: boolean;
 }) {
   const box = useRef<HTMLDivElement>(null);
   const svg = useRef<SVGSVGElement>(null);
@@ -206,12 +212,17 @@ export function PriceChart({
   const candles =
     candleSeconds === null ? [] : toCandles(visible, candleSeconds);
 
+  const externalVisible = externalPrices.filter(
+    (point) => point.time >= start && point.time <= end,
+  );
+
   const grid = batch?.grid ?? null;
   const live = batch?.referencePrice ?? null;
   const liveVisible = now >= start && now <= end;
   const autoDomain =
     priceDomain([
       ...visible.map((point) => point.price),
+      ...externalVisible.map((point) => point.price),
       ...(liveVisible && grid !== null
         ? [grid[0]!.price, grid[grid.length - 1]!.price]
         : []),
@@ -623,7 +634,18 @@ export function PriceChart({
             pointerEvents="none"
           />
         ) : null}
-        {points.length === 0 ? (
+        {externalPrices.length > 1 ? (
+          <polyline
+            points={externalPrices
+              .map((point) => `${x(point.time)},${y(point.price)}`)
+              .join(" ")}
+            fill="none"
+            stroke="var(--color-muted)"
+            strokeWidth={1.5}
+            pointerEvents="none"
+          />
+        ) : null}
+        {points.length === 0 && externalPrices.length === 0 ? (
           <text
             x={plotWidth / 2}
             y={(TOP + priceBottom) / 2}
@@ -631,7 +653,7 @@ export function PriceChart({
             fontSize={13}
             textAnchor="middle"
           >
-            Loading price history…
+            {loading ? "Loading price history…" : "No recent auctions"}
           </text>
         ) : null}
         <rect
