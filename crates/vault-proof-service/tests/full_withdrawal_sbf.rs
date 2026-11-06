@@ -6,10 +6,9 @@ use {
     ark_groth16::Groth16,
     ark_snark::SNARK,
     beatex::{
-        AuctionResult, RecentClearing, RECENT_CLEARINGS,
         ActiveOrder, Auction, AuctionState, DleqProofInput, KeyEpoch, Market,
         PrivateWithdrawalArgs, QueueCircuitKind, QueueVerificationKey, QueuedOrder,
-        QueuedOrderState, WithdrawalState,
+        QueuedOrderState, RecentClearing, WithdrawalState, RECENT_CLEARINGS,
     },
     beatex_babyjubjub_groth16_spike::claim::{
         export_private_withdrawal_verifying_key, PrivateWithdrawalCircuit, PrivateWithdrawalKind,
