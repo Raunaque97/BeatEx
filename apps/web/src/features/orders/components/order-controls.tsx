@@ -6,6 +6,7 @@ import type { KeyboardEvent, PointerEvent } from "react";
 import type { MarketConfig } from "@/lib/config/markets";
 import { sanitizeDecimal } from "@/lib/decimal-input";
 import {
+  baseQuantityDecimals,
   formatBaseAtoms,
   formatBps,
   formatPrice,
@@ -125,8 +126,8 @@ export function AmountField({
                 event.target.value,
                 unit === "quote"
                   ? market.quote.decimals
-                  : // Orders trade whole 100-satoshi base units.
-                    market.base.decimals - 2,
+                  : // Orders trade whole 100-atom base units.
+                    baseQuantityDecimals(market),
               ),
             )
           }
@@ -147,12 +148,14 @@ export function AmountField({
 
 /** A horizontal 17-level strip: drag or use arrow keys to choose the limit level. */
 export function LimitStrip({
+  market,
   grid,
   side,
   limitIndex,
   stepBps,
   onChange,
 }: {
+  readonly market: MarketConfig;
   readonly grid: readonly AuctionGridLevel[];
   readonly side: OrderSide;
   readonly limitIndex: number;
@@ -182,7 +185,7 @@ export function LimitStrip({
           {side === "buy" ? "Buy at or below" : "Sell at or above"}
         </span>
         <span className="font-mono text-xl">
-          {level === undefined ? "—" : formatPrice(level.price)}{" "}
+          {level === undefined ? "—" : formatPrice(level.price, market)}{" "}
           <span className="text-muted text-xs">
             {formatBps(limitIndex - center, stepBps)}
           </span>
@@ -196,7 +199,7 @@ export function LimitStrip({
         aria-valuemax={grid.length - 1}
         aria-valuenow={limitIndex}
         aria-valuetext={
-          level === undefined ? undefined : formatPrice(level.price)
+          level === undefined ? undefined : formatPrice(level.price, market)
         }
         onPointerDown={(event) => {
           event.currentTarget.setPointerCapture(event.pointerId);
@@ -234,9 +237,9 @@ export function LimitStrip({
         })}
       </div>
       <div className="text-faint flex justify-between font-mono text-[11px]">
-        <span>{formatPrice(grid[0]!.price)}</span>
+        <span>{formatPrice(grid[0]!.price, market)}</span>
         <span>reference</span>
-        <span>{formatPrice(grid[grid.length - 1]!.price)}</span>
+        <span>{formatPrice(grid[grid.length - 1]!.price, market)}</span>
       </div>
     </div>
   );
@@ -288,7 +291,7 @@ export function BalanceLine({
   const label =
     side === "buy"
       ? `${formatQuoteShort(balance.quoteAtoms)} ${market.quote.symbol}`
-      : `${formatBaseAtoms(balance.baseAtoms)} ${market.base.symbol}`;
+      : `${formatBaseAtoms(balance.baseAtoms, market)} ${market.base.symbol}`;
   return (
     <p className="text-muted text-xs">
       BeatEx balance <span className="text-text font-mono">{label}</span>

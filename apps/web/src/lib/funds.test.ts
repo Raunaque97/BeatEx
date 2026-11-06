@@ -20,6 +20,7 @@ const tbtcMarket: MarketConfig = {
   base: { symbol: "tBTC", decimals: 8 },
   quote: { symbol: "tUSD", decimals: 6 },
   faucet: true,
+  defaultCurveMax: "0.1",
 };
 const beatMarket: MarketConfig = {
   slug: "beat-tusd",
@@ -28,6 +29,7 @@ const beatMarket: MarketConfig = {
   base: { symbol: "BEAT", decimals: 2 },
   quote: { symbol: "tUSD", decimals: 6 },
   faucet: false,
+  defaultCurveMax: "0.1",
 };
 
 const funds = (

@@ -16,6 +16,8 @@ export interface MarketConfig {
   /** Whether the test-token faucet dispenses this market's tokens. BEAT has
    * no faucet: users buy it on the DEX with faucet tUSD. */
   readonly faucet: boolean;
+  /** Starting Max buy and Max sell of a custom curve, in base tokens. */
+  readonly defaultCurveMax: string;
 }
 
 /**
@@ -33,6 +35,7 @@ export const MARKETS: readonly MarketConfig[] = [
           base: { symbol: "tBTC", decimals: 8 },
           quote: { symbol: "tUSD", decimals: 6 },
           faucet: true,
+          defaultCurveMax: "0.1",
         },
       ]),
   ...(publicEnv.beatMarketId === undefined
@@ -45,6 +48,7 @@ export const MARKETS: readonly MarketConfig[] = [
           base: { symbol: "BEAT", decimals: 2 },
           quote: { symbol: "tUSD", decimals: 6 },
           faucet: false,
+          defaultCurveMax: "1000",
         },
       ]),
 ];

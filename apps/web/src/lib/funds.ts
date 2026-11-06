@@ -14,7 +14,7 @@ export interface MarketFunds {
   readonly freeQuote: bigint;
   readonly lockedBase: bigint;
   readonly lockedQuote: bigint;
-  /** Quote atoms per 100-satoshi base unit, or null with no price yet. */
+  /** Quote atoms per 100-atom base unit, or null with no price yet. */
   readonly price: bigint | null;
 }
 

@@ -3,8 +3,15 @@
 import type { AuctionGridLevel } from "@beatex/sdk";
 import { useState, type KeyboardEvent, type PointerEvent } from "react";
 
+import type { MarketConfig } from "@/lib/config/markets";
 import { sanitizeDecimal } from "@/lib/decimal-input";
-import { formatBase, formatBps, formatPrice, formatQuote } from "@/lib/format";
+import {
+  baseQuantityDecimals,
+  formatBase,
+  formatBps,
+  formatPrice,
+  formatQuote,
+} from "@/lib/format";
 
 import type { OrderIntentState } from "../hooks/use-order-intent";
 
@@ -18,10 +25,12 @@ type CustomDisplay = "percent" | "amount";
  * drag each bar; limit orders drag a line across the ladder.
  */
 export function CurveEditor({
+  market,
   grid,
   stepBps,
   order,
 }: {
+  readonly market: MarketConfig;
   readonly grid: readonly AuctionGridLevel[];
   readonly stepBps: number;
   readonly order: OrderIntentState;
@@ -87,13 +96,13 @@ export function CurveEditor({
                 onClick={() => setDisplay(option)}
                 className={`h-5 px-1.5 leading-5 ${display === option ? "bg-raised text-text" : "text-muted"}`}
               >
-                {option === "percent" ? "%" : "tBTC"}
+                {option === "percent" ? "%" : market.base.symbol}
               </button>
             ))}
           </span>
         ) : (
           <span className="text-right">
-            {intent.unit === "base" ? "tBTC" : "tUSD"}
+            {intent.unit === "base" ? market.base.symbol : market.quote.symbol}
           </span>
         )}
       </div>
@@ -129,7 +138,7 @@ export function CurveEditor({
               ? ""
               : !isCustom && intent.unit === "quote"
                 ? formatQuote(magnitude * level.price).split(".")[0]
-                : formatBase(magnitude);
+                : formatBase(magnitude, market);
           return (
             <div
               key={level.index}
@@ -140,7 +149,7 @@ export function CurveEditor({
                 className={`font-mono text-[11px] ${level.index === center ? "text-text" : "text-muted"}`}
                 title={formatBps(level.offset, stepBps)}
               >
-                {formatPrice(level.price)}
+                {formatPrice(level.price, market)}
               </span>
               <div className="has-[:focus-visible]:outline-accent relative h-4 rounded-sm has-[:focus-visible]:outline has-[:focus-visible]:outline-2">
                 <span
@@ -165,14 +174,14 @@ export function CurveEditor({
                         Number(event.target.value),
                       )
                     }
-                    aria-label={`Size at ${formatPrice(level.price)}: left sells, right buys`}
+                    aria-label={`Size at ${formatPrice(level.price, market)}: left sells, right buys`}
                     aria-valuetext={
                       percent === 0
                         ? "none"
                         : `${percent > 0 ? "buy" : "sell"} ${Math.abs(percent)}% of max${
                             value === 0n
                               ? ""
-                              : `, ${formatBase(magnitude)} tBTC`
+                              : `, ${formatBase(magnitude, market)} ${market.base.symbol}`
                           }`
                     }
                     className="level-slider"
@@ -201,11 +210,14 @@ export function CurveEditor({
               aria-valuemin={0}
               aria-valuemax={grid.length - 1}
               aria-valuenow={intent.limitIndex}
-              aria-valuetext={formatPrice(grid[intent.limitIndex]!.price)}
+              aria-valuetext={formatPrice(
+                grid[intent.limitIndex]!.price,
+                market,
+              )}
               onKeyDown={onLimitKey}
               className="bg-accent text-accent-ink pointer-events-auto absolute -top-3 left-0 rounded px-2 py-0.5 font-mono text-[11px] font-semibold"
             >
-              {formatPrice(grid[intent.limitIndex]!.price)} ⇕
+              {formatPrice(grid[intent.limitIndex]!.price, market)} ⇕
             </div>
           </div>
         ) : null}
@@ -216,12 +228,14 @@ export function CurveEditor({
 
 /** One side's 100% amount for custom curves. */
 export function MaxField({
+  market,
   id,
   label,
   value,
   onChange,
   tone,
 }: {
+  readonly market: MarketConfig;
   readonly id: string;
   readonly label: string;
   readonly value: string;
@@ -245,10 +259,14 @@ export function MaxField({
         autoComplete="off"
         placeholder="0"
         value={value}
-        onChange={(event) => onChange(sanitizeDecimal(event.target.value, 6))}
+        onChange={(event) =>
+          onChange(
+            sanitizeDecimal(event.target.value, baseQuantityDecimals(market)),
+          )
+        }
         className="placeholder:text-faint h-7 min-w-0 flex-1 bg-transparent text-right font-mono text-sm outline-none focus-visible:outline-none"
       />
-      <span className="text-muted text-xs">tBTC</span>
+      <span className="text-muted text-xs">{market.base.symbol}</span>
     </div>
   );
 }

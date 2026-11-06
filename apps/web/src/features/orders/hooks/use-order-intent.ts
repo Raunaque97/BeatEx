@@ -3,6 +3,8 @@
 import { PRICE_LEVELS, type AuctionGridLevel } from "@beatex/sdk";
 import { useCallback, useMemo, useState } from "react";
 
+import type { MarketConfig } from "@/lib/config/markets";
+
 import {
   CENTER_INDEX,
   buildOrder,
@@ -24,23 +26,28 @@ function defaultCustomLevels(): number[] {
   });
 }
 
-const INITIAL_INTENT: OrderIntent = {
-  type: "market",
-  side: "buy",
-  amount: "1000",
-  unit: "quote",
-  limitIndex: CENTER_INDEX - 1,
-  customLevels: defaultCustomLevels(),
-  maxBuy: "0.1",
-  maxSell: "0.1",
-};
+function initialIntent(market: MarketConfig): OrderIntent {
+  return {
+    type: "market",
+    side: "buy",
+    amount: "1000",
+    unit: "quote",
+    limitIndex: CENTER_INDEX - 1,
+    customLevels: defaultCustomLevels(),
+    maxBuy: market.defaultCurveMax,
+    maxSell: market.defaultCurveMax,
+  };
+}
 
 /** The order being composed, shared by the Simple and Advanced views. */
 export function useOrderIntent(
   grid: readonly AuctionGridLevel[] | null,
   maxOrderQuantity: bigint | undefined,
+  market: MarketConfig,
 ) {
-  const [intent, setIntent] = useState<OrderIntent>(INITIAL_INTENT);
+  const [intent, setIntent] = useState<OrderIntent>(() =>
+    initialIntent(market),
+  );
 
   const setType = useCallback(
     (type: OrderType) => setIntent((current) => ({ ...current, type })),
@@ -113,8 +120,8 @@ export function useOrderIntent(
     () =>
       grid === null || maxOrderQuantity === undefined
         ? null
-        : buildOrder(intent, grid, maxOrderQuantity),
-    [intent, grid, maxOrderQuantity],
+        : buildOrder(intent, grid, maxOrderQuantity, market),
+    [intent, grid, maxOrderQuantity, market],
   );
 
   return {

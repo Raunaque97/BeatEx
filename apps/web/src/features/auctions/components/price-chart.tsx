@@ -8,6 +8,7 @@ import {
   type PointerEvent,
 } from "react";
 
+import type { MarketConfig } from "@/lib/config/markets";
 import { formatBase, formatPrice } from "@/lib/format";
 
 import type { BatchSummary } from "../model/batch-summary";
@@ -80,6 +81,7 @@ type Hover =
  * what that auction (or minute) revealed.
  */
 export function PriceChart({
+  market,
   history,
   older,
   onNeedOlder,
@@ -87,6 +89,7 @@ export function PriceChart({
   lastClearingPrice,
   limitPrice,
 }: {
+  readonly market: MarketConfig;
   readonly history: readonly BatchSummary[];
   /** Older auctions loaded on demand; merged with `history` by id. */
   readonly older: readonly BatchSummary[];
@@ -412,7 +415,7 @@ export function PriceChart({
               textAnchor="end"
               style={mono}
             >
-              {formatPrice(tick)}
+              {formatPrice(tick, market)}
             </text>
           </g>
         ))}
@@ -588,7 +591,7 @@ export function PriceChart({
               textAnchor="middle"
               style={mono}
             >
-              {formatPrice(live)}
+              {formatPrice(live, market)}
             </text>
           </>
         ) : null}
@@ -702,10 +705,14 @@ export function PriceChart({
               <p className="text-faint mb-1 font-mono text-[10px]">
                 {formatTick(hover.point.time, 1)}
               </p>
-              <BatchReveal auction={hover.point.auction} />
+              <BatchReveal auction={hover.point.auction} market={market} />
             </>
           ) : (
-            <CandleCard candle={hover.candle} seconds={candleSeconds ?? 60} />
+            <CandleCard
+              market={market}
+              candle={hover.candle}
+              seconds={candleSeconds ?? 60}
+            />
           )}
         </div>
       ) : null}
@@ -726,18 +733,20 @@ function clampView(span: number, end: number): View {
 }
 
 function CandleCard({
+  market,
   candle,
   seconds,
 }: {
+  readonly market: MarketConfig;
   readonly candle: Candle;
   readonly seconds: number;
 }) {
   const rows: readonly (readonly [string, string])[] = [
-    ["O", formatPrice(candle.open)],
-    ["H", formatPrice(candle.high)],
-    ["L", formatPrice(candle.low)],
-    ["C", formatPrice(candle.close)],
-    ["Vol", `${formatBase(candle.volume)} tBTC`],
+    ["O", formatPrice(candle.open, market)],
+    ["H", formatPrice(candle.high, market)],
+    ["L", formatPrice(candle.low, market)],
+    ["C", formatPrice(candle.close, market)],
+    ["Vol", `${formatBase(candle.volume, market)} ${market.base.symbol}`],
   ];
   return (
     <div className="w-[150px] font-mono text-xs">

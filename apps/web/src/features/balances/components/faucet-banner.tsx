@@ -63,7 +63,9 @@ export function FaucetBanner({
 
   const sent = faucet.status === "sent";
   const sending = faucet.status === "sending";
-  const tokens = `${market.base.symbol}, ${market.quote.symbol}`;
+  const tokens = market.faucet
+    ? `${market.base.symbol}, ${market.quote.symbol}`
+    : market.quote.symbol;
 
   return (
     <div className="faucet-banner" data-leaving={leaving ? "" : undefined}>

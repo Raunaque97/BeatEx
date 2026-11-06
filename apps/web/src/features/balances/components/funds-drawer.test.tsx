@@ -47,6 +47,7 @@ const market: MarketConfig = {
   base: { symbol: "tBTC", decimals: 8 },
   quote: { symbol: "tUSD", decimals: 6 },
   faucet: true,
+  defaultCurveMax: "0.1",
 };
 
 beforeEach(() => vi.clearAllMocks());

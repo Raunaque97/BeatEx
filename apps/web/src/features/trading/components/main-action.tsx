@@ -336,16 +336,15 @@ export function MainAction({
       onClick={() => void faucet.request()}
       hint={
         faucet.message ??
-        `Free Devnet ${market.base.symbol}, ${market.quote.symbol}, and SOL for fees.`
+        (market.faucet
+          ? `Free Devnet ${market.base.symbol}, ${market.quote.symbol}, and SOL for fees.`
+          : `Free Devnet ${market.quote.symbol} and SOL for fees. Buy ${market.base.symbol} here with ${market.quote.symbol}.`)
       }
     />
   );
   const walletBase = wallet.data?.baseAtoms ?? 0n;
   const walletQuote = wallet.data?.quoteAtoms ?? 0n;
-  const walletFunds = describeAmounts(walletBase, walletQuote, {
-    base: market.base.symbol,
-    quote: market.quote.symbol,
-  });
+  const walletFunds = describeAmounts(walletBase, walletQuote, market);
   if (!hasPrivateFunds && active === null) {
     if (walletEmpty || lowOnSol) return getFunds;
     return (
