@@ -108,6 +108,14 @@ const MAX_COMMITTEE_AUCTION_WORKERS: usize = 4;
 // slots before the close instead of waiting for it. Orders arriving later are
 // picked up by one extra fold before publication.
 const FINAL_FOLD_LEAD_SLOTS: u64 = 12;
+const COMMITTEE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// Well inside the final-fold lead, and gentle enough for a free RPC tier.
+const ON_DEMAND_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+/// SOL an on-demand committee keeps for fees; it never pays auction rent.
+const SWEEP_RESERVE_LAMPORTS: u64 = 250_000_000;
+/// Smallest surplus worth a transaction.
+const SWEEP_MINIMUM_LAMPORTS: u64 = 100_000_000;
 // Leave enough room for RPC submission and validator execution after proving.
 // Two slots was shorter than the observed native transaction path on Devnet.
 const MIN_ORDER_SEND_REMAINING_SLOTS: u64 = 8;
@@ -608,10 +616,12 @@ struct PipelineAuction {
     folded_orders: u64,
 }
 
+type CommitteeAuctionAccounts = (beatex::Auction, SubmissionCounter, AggregateAccumulator);
+
 fn fetch_committee_auction_accounts(
     rpc_url: &str,
     addresses: &AuctionAddresses,
-) -> Result<Option<(beatex::Auction, SubmissionCounter, AggregateAccumulator)>, Box<dyn Error>> {
+) -> Result<Option<CommitteeAuctionAccounts>, Box<dyn Error>> {
     let mut accounts = fetch_multiple_account_bytes(
         rpc_url,
         &[
@@ -697,7 +707,7 @@ struct AuctionAddresses {
 
 fn usage() {
     eprintln!(
-        "Usage:\n  beatex-devnet-client addresses --base-mint PUBKEY --quote-mint PUBKEY --state-dir DIR\n\n  beatex-devnet-client initialize --base-mint PUBKEY --quote-mint PUBKEY --base-vault PUBKEY --quote-vault PUBKEY --wallet KEYPAIR --vault-owner KEYPAIR --state-dir DIR --market-start-slot SLOT [--rpc-url URL]\n\n  beatex-devnet-client committee --base-mint PUBKEY --quote-mint PUBKEY --wallet KEYPAIR --state-dir DIR [--rpc-url URL]\n\n  beatex-devnet-client watch-auctions --base-mint PUBKEY --quote-mint PUBKEY --wallet KEYPAIR --state-dir DIR [--rpc-url URL]\n\n  beatex-devnet-client auction --base-mint PUBKEY --quote-mint PUBKEY --auction-id N --wallet KEYPAIR --state-dir DIR [--rpc-url URL]\n\n  beatex-devnet-client market-status|pipeline-status --base-mint PUBKEY --quote-mint PUBKEY --state-dir DIR [--rpc-url URL]\n\n  beatex-devnet-client auction-status --base-mint PUBKEY --quote-mint PUBKEY --auction-id N --state-dir DIR [--rpc-url URL]\n\n  beatex-devnet-client order --base-mint PUBKEY --quote-mint PUBKEY --base-source PUBKEY --quote-source PUBKEY --wallet KEYPAIR --state-dir DIR [--rpc-url URL]\n\n  beatex-devnet-client fold --base-mint PUBKEY --quote-mint PUBKEY --auction-id N --wallet KEYPAIR --state-dir DIR [--rpc-url URL] [--max-batches N]\n\n  beatex-devnet-client publish --base-mint PUBKEY --quote-mint PUBKEY --auction-id N --wallet KEYPAIR --state-dir DIR [--rpc-url URL]\n\n  beatex-devnet-client cancel --base-mint PUBKEY --quote-mint PUBKEY --auction-id N --wallet KEYPAIR --state-dir DIR [--rpc-url URL]\n\n  beatex-devnet-client settle-balance|refund-balance --base-mint PUBKEY --quote-mint PUBKEY --auction-id N --wallet TRADER_KEYPAIR --state-dir DIR [--rpc-url URL]\n\n  beatex-devnet-client withdraw --base-mint PUBKEY --quote-mint PUBKEY --wallet TRADER_KEYPAIR --base-destination PUBKEY --quote-destination PUBKEY --base-amount N --quote-amount N --state-dir DIR [--rpc-url URL]\n\n  beatex-devnet-client claim|refund --base-mint PUBKEY --quote-mint PUBKEY --auction-id N --wallet FEE_PAYER_KEYPAIR --owner TRADER_KEYPAIR --vault-owner KEYPAIR --base-destination PUBKEY --quote-destination PUBKEY --state-dir DIR [--rpc-url URL]\n\nThe default fast path keeps custody in the vault's public Token-2022 balance while all trading balances remain encrypted. settle-balance and refund-balance credit the internal ledger; withdraw debits it and performs one public token withdrawal. Legacy claim and refund retain the slower confidential Token-2022 exit. The client refuses mainnet URLs."
+        "Usage:\n  beatex-devnet-client addresses --base-mint PUBKEY --quote-mint PUBKEY --state-dir DIR\n\n  beatex-devnet-client initialize --base-mint PUBKEY --quote-mint PUBKEY --base-vault PUBKEY --quote-vault PUBKEY --wallet KEYPAIR --vault-owner KEYPAIR --state-dir DIR --market-start-slot SLOT [--rpc-url URL]\n\n  beatex-devnet-client committee --base-mint PUBKEY --quote-mint PUBKEY --wallet KEYPAIR --state-dir DIR [--rpc-url URL] [--on-demand [--sweep-to PUBKEY]]\n\n  beatex-devnet-client watch-auctions --base-mint PUBKEY --quote-mint PUBKEY --wallet KEYPAIR --state-dir DIR [--rpc-url URL]\n\n  beatex-devnet-client auction --base-mint PUBKEY --quote-mint PUBKEY --auction-id N --wallet KEYPAIR --state-dir DIR [--rpc-url URL]\n\n  beatex-devnet-client market-status|pipeline-status --base-mint PUBKEY --quote-mint PUBKEY --state-dir DIR [--rpc-url URL]\n\n  beatex-devnet-client auction-status --base-mint PUBKEY --quote-mint PUBKEY --auction-id N --state-dir DIR [--rpc-url URL]\n\n  beatex-devnet-client order --base-mint PUBKEY --quote-mint PUBKEY --base-source PUBKEY --quote-source PUBKEY --wallet KEYPAIR --state-dir DIR [--rpc-url URL]\n\n  beatex-devnet-client fold --base-mint PUBKEY --quote-mint PUBKEY --auction-id N --wallet KEYPAIR --state-dir DIR [--rpc-url URL] [--max-batches N]\n\n  beatex-devnet-client publish --base-mint PUBKEY --quote-mint PUBKEY --auction-id N --wallet KEYPAIR --state-dir DIR [--rpc-url URL]\n\n  beatex-devnet-client cancel --base-mint PUBKEY --quote-mint PUBKEY --auction-id N --wallet KEYPAIR --state-dir DIR [--rpc-url URL]\n\n  beatex-devnet-client settle-balance|refund-balance --base-mint PUBKEY --quote-mint PUBKEY --auction-id N --wallet TRADER_KEYPAIR --state-dir DIR [--rpc-url URL]\n\n  beatex-devnet-client withdraw --base-mint PUBKEY --quote-mint PUBKEY --wallet TRADER_KEYPAIR --base-destination PUBKEY --quote-destination PUBKEY --base-amount N --quote-amount N --state-dir DIR [--rpc-url URL]\n\n  beatex-devnet-client claim|refund --base-mint PUBKEY --quote-mint PUBKEY --auction-id N --wallet FEE_PAYER_KEYPAIR --owner TRADER_KEYPAIR --vault-owner KEYPAIR --base-destination PUBKEY --quote-destination PUBKEY --state-dir DIR [--rpc-url URL]\n\nThe default fast path keeps custody in the vault's public Token-2022 balance while all trading balances remain encrypted. settle-balance and refund-balance credit the internal ledger; withdraw debits it and performs one public token withdrawal. Legacy claim and refund retain the slower confidential Token-2022 exit. The client refuses mainnet URLs."
     );
 }
 
@@ -2161,6 +2171,7 @@ fn send_initialization_direct(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn submit_auction_initialization(
     wallet: &Path,
     rpc_url: &str,
@@ -2647,6 +2658,7 @@ fn initialize_private_balance(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn deposit_balance(
     config: &OrderConfig,
     addresses: &Addresses,
@@ -3394,6 +3406,7 @@ fn order_reserves(
     Ok((u64::try_from(base)?, u64::try_from(max_quote)?))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn top_up_private_balance_if_needed(
     config: &OrderConfig,
     addresses: &Addresses,
@@ -3776,8 +3789,8 @@ pub fn execute_native_order(
         target_base: config.target_base,
         target_quote: config.target_quote,
     };
-    let previous_capture = NATIVE_ORDER_EVENTS
-        .with(|capture| std::mem::replace(&mut *capture.borrow_mut(), Some(Vec::new())));
+    let previous_capture =
+        NATIVE_ORDER_EVENTS.with(|capture| capture.borrow_mut().replace(Vec::new()));
     let result = execute_order_intent(order_config, intent).map_err(|error| error.to_string());
     let events = NATIVE_ORDER_EVENTS.with(|capture| {
         let mut capture = capture.borrow_mut();
@@ -3890,9 +3903,9 @@ fn execute_pipeline_status(config: MarketStatusConfig) -> Result<(), Box<dyn Err
         let Some(accumulator_bytes) = accounts[2].as_deref() else {
             continue;
         };
-        let auction = beatex::Auction::try_deserialize(&mut auction_bytes.as_ref())?;
-        let counter = SubmissionCounter::try_deserialize(&mut counter_bytes.as_ref())?;
-        let accumulator = AggregateAccumulator::try_deserialize(&mut accumulator_bytes.as_ref())?;
+        let auction = beatex::Auction::try_deserialize(&mut &auction_bytes[..])?;
+        let counter = SubmissionCounter::try_deserialize(&mut &counter_bytes[..])?;
+        let accumulator = AggregateAccumulator::try_deserialize(&mut &accumulator_bytes[..])?;
         let state = match auction.state {
             beatex::AuctionState::Pending => "pending",
             beatex::AuctionState::Settled => "settled",
@@ -3953,9 +3966,9 @@ fn fetch_pipeline_auctions(
         else {
             continue;
         };
-        let auction = beatex::Auction::try_deserialize(&mut auction_bytes.as_ref())?;
-        let counter = SubmissionCounter::try_deserialize(&mut counter_bytes.as_ref())?;
-        let accumulator = AggregateAccumulator::try_deserialize(&mut accumulator_bytes.as_ref())?;
+        let auction = beatex::Auction::try_deserialize(&mut &auction_bytes[..])?;
+        let counter = SubmissionCounter::try_deserialize(&mut &counter_bytes[..])?;
+        let accumulator = AggregateAccumulator::try_deserialize(&mut &accumulator_bytes[..])?;
         snapshots.push(PipelineAuction {
             auction_id: *auction_id,
             state: auction.state,
@@ -4111,7 +4124,12 @@ fn process_committee_auction(
     }
 }
 
-fn run_committee_pipeline(common: CommonConfig, wallet: PathBuf, rpc_url: String) {
+fn run_committee_pipeline(
+    common: CommonConfig,
+    wallet: PathBuf,
+    rpc_url: String,
+    poll_interval: Duration,
+) {
     let addresses = addresses(&common);
     let market = loop {
         match fetch_anchor_account::<beatex::Market>(&rpc_url, &addresses.market) {
@@ -4145,16 +4163,16 @@ fn run_committee_pipeline(common: CommonConfig, wallet: PathBuf, rpc_url: String
             Ok(slot) => slot,
             Err(error) => {
                 coordinator_error(error.as_ref());
-                thread::sleep(Duration::from_millis(250));
+                thread::sleep(poll_interval);
                 continue;
             }
         };
         if slot < market.market_start_slot {
-            thread::sleep(Duration::from_millis(250));
+            thread::sleep(poll_interval);
             continue;
         }
         if last_snapshot_slot == Some(slot) && !snapshot_dirty {
-            thread::sleep(Duration::from_millis(250));
+            thread::sleep(poll_interval);
             continue;
         }
         let current_id = (slot - market.market_start_slot) / market.submission_duration_slots;
@@ -4192,7 +4210,52 @@ fn run_committee_pipeline(common: CommonConfig, wallet: PathBuf, rpc_url: String
             }
             Err(error) => coordinator_error(error.as_ref()),
         }
-        thread::sleep(Duration::from_millis(250));
+        thread::sleep(poll_interval);
+    }
+}
+
+/// What to send on, leaving the reserve behind.
+fn sweep_amount(balance: u64) -> Option<u64> {
+    balance
+        .checked_sub(SWEEP_RESERVE_LAMPORTS)
+        .filter(|surplus| *surplus >= SWEEP_MINIMUM_LAMPORTS)
+}
+
+fn sweep_surplus(wallet: &Path, rpc_url: &str, destination: &Pubkey) -> Result<(), Box<dyn Error>> {
+    let source = wallet_pubkey(wallet)?;
+    let Some(lamports) = sweep_amount(lamport_balance(rpc_url, &source)?) else {
+        return Ok(());
+    };
+    // System Program transfer: instruction index 2, then the amount.
+    let mut data = 2_u32.to_le_bytes().to_vec();
+    data.extend_from_slice(&lamports.to_le_bytes());
+    send_bundle(
+        wallet,
+        rpc_url,
+        "sweep surplus SOL",
+        vec![BundleInstruction {
+            program_id: anchor_lang::system_program::ID.to_string(),
+            accounts: vec![meta(source, true, true), meta(*destination, true, false)],
+            data_base64: BASE64.encode(data),
+        }],
+        vec![],
+    )?;
+    println!(
+        "[{}] swept {:.9} SOL to {destination}",
+        coordinator_timestamp(),
+        lamports as f64 / 1_000_000_000.0,
+    );
+    Ok(())
+}
+
+/// Finishing an auction refunds its rent here, the market authority, while
+/// whoever opened it paid. This returns that rent to the wallet that opens them.
+fn run_sweeper(wallet: PathBuf, rpc_url: String, destination: Pubkey) {
+    loop {
+        if let Err(error) = sweep_surplus(&wallet, &rpc_url, &destination) {
+            coordinator_error(&format!("sweep failed: {error}"));
+        }
+        thread::sleep(SWEEP_INTERVAL);
     }
 }
 
@@ -4200,17 +4263,39 @@ fn run_committee_bot(
     common: CommonConfig,
     wallet: PathBuf,
     rpc_url: String,
+    on_demand: bool,
+    sweep_to: Option<Pubkey>,
 ) -> Result<(), Box<dyn Error>> {
     // Bot execution is deliberately keypair-only. Browser-wallet sessions use
     // the interactive Node bridge elsewhere in the CLI and must never enter a
     // long-running committee process.
     read_v1_keypair_file(&wallet)?;
+    if sweep_to.is_some() && !on_demand {
+        return Err("--sweep-to requires --on-demand: this committee pays auction rent".into());
+    }
+    if on_demand {
+        if let Some(destination) = sweep_to {
+            let sweep_wallet = wallet.clone();
+            let sweep_rpc = rpc_url.clone();
+            thread::spawn(move || run_sweeper(sweep_wallet, sweep_rpc, destination));
+        }
+        // Auctions are opened by whoever trades, so an idle market sends nothing.
+        run_committee_pipeline(common, wallet, rpc_url, ON_DEMAND_POLL_INTERVAL);
+        return Err("committee pipeline stopped".into());
+    }
     let payer = wallet_pubkey(&wallet)?;
     ensure_committee_payer_can_initialize(&rpc_url, &payer)?;
     let pipeline_common = common.clone();
     let pipeline_wallet = wallet.clone();
     let pipeline_rpc = rpc_url.clone();
-    thread::spawn(move || run_committee_pipeline(pipeline_common, pipeline_wallet, pipeline_rpc));
+    thread::spawn(move || {
+        run_committee_pipeline(
+            pipeline_common,
+            pipeline_wallet,
+            pipeline_rpc,
+            COMMITTEE_POLL_INTERVAL,
+        )
+    });
     watch_and_initialize_auctions(common, wallet, rpc_url)
 }
 
@@ -5734,6 +5819,10 @@ fn run() -> Result<(), Box<dyn Error>> {
             common(&args[1..])?,
             PathBuf::from(value(&args[1..], "--wallet")?),
             optional(&args[1..], "--rpc-url").unwrap_or_else(|| DEFAULT_RPC_URL.to_owned()),
+            args[1..].iter().any(|arg| arg == "--on-demand"),
+            optional(&args[1..], "--sweep-to")
+                .map(|address| Pubkey::from_str(&address))
+                .transpose()?,
         ),
         "watch-auctions" => watch_and_initialize_auctions(
             common(&args[1..])?,
@@ -5909,6 +5998,18 @@ mod tests {
             base_reserve: 0,
             quote_reserve: 0,
         }
+    }
+
+    #[test]
+    fn sweeps_only_a_surplus_worth_sending() {
+        let reserve = SWEEP_RESERVE_LAMPORTS;
+        let minimum = SWEEP_MINIMUM_LAMPORTS;
+
+        assert_eq!(sweep_amount(0), None);
+        assert_eq!(sweep_amount(reserve), None);
+        assert_eq!(sweep_amount(reserve + minimum - 1), None);
+        assert_eq!(sweep_amount(reserve + minimum), Some(minimum));
+        assert_eq!(sweep_amount(3_000_000_000), Some(3_000_000_000 - reserve));
     }
 
     #[test]
