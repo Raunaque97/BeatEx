@@ -1,7 +1,7 @@
 "use client";
 
 import { AuctionState } from "@beatex/sdk";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import type { PrivateStateView } from "@/features/balances/hooks/use-private-state";
 import type { MarketConfig } from "@/lib/config/markets";
@@ -37,6 +37,8 @@ export type AutoSettleState =
 export function useAutoSettle(
   market: MarketConfig,
   privateState: PrivateStateView,
+  /** Told of each outcome; returns whether to show it to the trader. */
+  onSettled: (outcome: SettlementOutcome) => boolean,
 ) {
   const { client, tracker } = useBeatEx();
   const action = useTrackedAction();
@@ -44,6 +46,10 @@ export function useAutoSettle(
   // Newest first; each stays until the trader dismisses it.
   const [outcomes, setOutcomes] = useState<readonly SettlementOutcome[]>([]);
   const [attempt, setAttempt] = useState(0);
+  const notify = useRef(onSettled);
+  useEffect(() => {
+    notify.current = onSettled;
+  });
 
   const active =
     privateState.status === "ready"
@@ -101,10 +107,12 @@ export function useAutoSettle(
           refunded,
           market,
         );
-        setOutcomes((current) => [
-          outcome,
-          ...current.filter((item) => item.auctionId !== outcome.auctionId),
-        ]);
+        if (notify.current(outcome)) {
+          setOutcomes((current) => [
+            outcome,
+            ...current.filter((item) => item.auctionId !== outcome.auctionId),
+          ]);
+        }
         setState({ status: "idle" });
       } catch (error) {
         if (cancelled) return;

@@ -28,6 +28,7 @@ import { useMarketFunds } from "@/features/balances/hooks/use-market-funds";
 import { useBeatEx } from "@/providers/beatex-provider";
 
 import { useAutoSettle } from "../hooks/use-auto-settle";
+import { useWorkingLimit } from "../hooks/use-working-limit";
 import { useTradeView, type TradeView } from "../hooks/use-trade-view";
 import { MainAction } from "./main-action";
 
@@ -52,8 +53,15 @@ export function TradingWorkspace({
     snapshot.history,
     snapshot.historyLoading,
   );
-  // Lives here, not in the order button, so switching views never interrupts it.
-  const settlement = useAutoSettle(market, privateState);
+  // These live here, not in the order button, so switching views never
+  // interrupts them.
+  const limit = useWorkingLimit(
+    market,
+    snapshot.batch,
+    privateState,
+    snapshot.market?.maxOrderQuantity,
+  );
+  const settlement = useAutoSettle(market, privateState, limit.onSettled);
   const olderAuctions = useOlderAuctions(
     market.address,
     snapshot.market,
@@ -141,6 +149,7 @@ export function TradingWorkspace({
     <MainAction
       onDeposit={() => setBalances("deposit")}
       settlement={settlement}
+      limit={limit}
       funds={funds.tokens}
       mints={mints}
       market={market}
@@ -148,6 +157,7 @@ export function TradingWorkspace({
       orderLabel={orderLabel}
       orderError={orderError}
       order={built?.ok ? built.order : null}
+      intent={intent}
       batch={snapshot.batch}
     />
   );

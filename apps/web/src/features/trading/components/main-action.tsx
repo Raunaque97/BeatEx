@@ -1,6 +1,6 @@
 "use client";
 
-import { BASE_UNIT_SIZE, type BeatExClient } from "@beatex/sdk";
+import { BASE_UNIT_SIZE } from "@beatex/sdk";
 import { useEffect, useRef, useState } from "react";
 
 import { TxProgressLine } from "@/components/tx-progress-line";
@@ -12,57 +12,38 @@ import {
   type WalletMints,
 } from "@/features/balances/hooks/use-wallet-balances";
 import { ActionButton } from "@/features/orders/components/order-controls";
-import type { BuiltOrder } from "@/features/orders/model/order-curve";
+import type {
+  BuiltOrder,
+  OrderIntent,
+} from "@/features/orders/model/order-curve";
 import { SOL_TOP_UP_FLOOR_LAMPORTS } from "@/lib/config/faucet";
 import type { MarketConfig } from "@/lib/config/markets";
 import type { useAutoSettle } from "@/features/trading/hooks/use-auto-settle";
+import { useMakerWarmup } from "@/features/trading/hooks/use-maker-warmup";
+import type { WorkingLimitState } from "@/features/trading/hooks/use-working-limit";
+import {
+  CLOSING_SLOTS,
+  isAcceptingOrders,
+  missedAuction,
+  submitOrder,
+} from "@/features/trading/model/submit-order";
 import { describeAmounts } from "@/lib/format";
 import { planMoves, type TokenFunds } from "@/lib/funds";
 import { useBeatEx, useTrackedAction } from "@/providers/beatex-provider";
 
-/**
- * Stop taking orders this many slots before an auction closes. Building,
- * proving, and simulating an order takes about 2–3 s end to end.
- */
-const CLOSING_SLOTS = 12n;
-const AUCTION_WAIT_MS = 4_000;
+import { WorkingLimitLine } from "./working-limit-line";
+
 /** After moving funds, how long to wait for an auction that is open long enough. */
 const OPEN_AUCTION_WAIT_MS = 25_000;
-const AUCTION_POLL_MS = 400;
-
-/**
- * The crank creates each batch's auction just after it opens. Wait for it rather
- * than creating it here: racing the crank fails, and a winning trader would pay
- * the auction's ~0.0376 SOL of rent.
- */
-async function waitForAuction(
-  client: BeatExClient,
-  market: string,
-  auctionId: bigint,
-) {
-  const deadline = Date.now() + AUCTION_WAIT_MS;
-  for (;;) {
-    const auction = await client.getAuction(market, auctionId);
-    if (auction !== null) return auction;
-    if (Date.now() >= deadline)
-      throw new Error("This auction is still opening. Try again in a moment.");
-    await new Promise((resolve) => setTimeout(resolve, AUCTION_POLL_MS));
-  }
-}
+/** An auction can end while an order is being proved; try the next one this often. */
+const PLACE_ATTEMPTS = 3;
 
 /** Wait until `read()` shows an auction collecting with time to spare. */
 async function waitForOpenAuction(read: () => CurrentBatch | null) {
   const deadline = Date.now() + OPEN_AUCTION_WAIT_MS;
   for (;;) {
     const batch = read();
-    if (
-      batch !== null &&
-      batch.grid !== null &&
-      batch.phase === "collecting" &&
-      batch.slotsLeft >= CLOSING_SLOTS
-    ) {
-      return;
-    }
+    if (batch !== null && isAcceptingOrders(batch)) return;
     if (Date.now() >= deadline)
       throw new Error("No auction opened in time. Try again in a moment.");
     await new Promise((resolve) => setTimeout(resolve, 250));
@@ -79,9 +60,11 @@ export function MainAction({
   orderLabel,
   orderError,
   order,
+  intent,
   batch,
   onDeposit,
   settlement,
+  limit,
   funds,
   mints,
 }: {
@@ -90,11 +73,14 @@ export function MainAction({
   readonly orderLabel: string;
   readonly orderError: string | null;
   readonly order: BuiltOrder | null;
+  readonly intent: OrderIntent;
   readonly batch: CurrentBatch | null;
   /** Open the deposit slider in the Balances panel. */
   readonly onDeposit: () => void;
   /** Background settlement of the previous order, owned by the workspace. */
   readonly settlement: ReturnType<typeof useAutoSettle>;
+  /** The limit order being kept alive across auctions, owned by the workspace. */
+  readonly limit: WorkingLimitState;
   /** The trader's funds per token across every market. */
   readonly funds: ReadonlyMap<string, TokenFunds>;
   /** This market's token mints, once its account has loaded. */
@@ -115,6 +101,17 @@ export function MainAction({
   });
   const [error, setError] = useState<string | null>(null);
   const action = useTrackedAction();
+  const hasOpenOrder =
+    privateState.status === "ready" &&
+    privateState.record.state.activeOrder !== null;
+  useMakerWarmup(
+    market.slug,
+    owner,
+    batch?.auctionId ?? null,
+    limit.working !== null ||
+      (order !== null && privateState.status === "ready" && !hasOpenOrder),
+    limit.working !== null,
+  );
 
   const submit = async () => {
     if (
@@ -198,39 +195,40 @@ export function MainAction({
     if (client === null) return;
     setSubmitted(active === null ? "Order" : "Replacement");
     try {
-      await action.run(async (proofOptions) => {
-        // Pin the displayed grid to the auction selected for submission. A
-        // boundary or a newly snapshotted reference requires another review.
-        const auctionId = await client.getCurrentAuctionId(market.address);
-        if (auctionId !== batch.auctionId) {
-          throw new Error(
-            "The auction price grid changed. Review your order and try again.",
-          );
+      const placed = await action.run(async (proofOptions) => {
+        let next = { order, batch };
+        for (let attempt = 1; ; attempt += 1) {
+          try {
+            const auctionId = await submitOrder({
+              client,
+              market,
+              ...next,
+              replacing: active?.auctionId ?? null,
+              proofOptions,
+            });
+            return { auctionId, grid: next.batch.grid };
+          } catch (cause) {
+            if (attempt === PLACE_ATTEMPTS || !missedAuction(cause))
+              throw cause;
+            await waitForOpenAuction(() => latest.current.batch);
+            const newest = latest.current;
+            if (newest.order === null || newest.batch === null) throw cause;
+            next = { order: newest.order, batch: newest.batch };
+          }
         }
-        const auction = await waitForAuction(client, market.address, auctionId);
-        if (
-          auction.referencePrice !== batch.referencePrice ||
-          (batch.auction !== null &&
-            auction.gridStepBps !== batch.auction.gridStepBps)
-        ) {
-          throw new Error(
-            "The auction price grid changed. Review your order and try again.",
-          );
-        }
-        const params = {
-          market: market.address,
-          curve: order.curve,
-          proofOptions,
-        };
-        if (active !== null) {
-          if (active.auctionId !== auctionId)
-            throw new Error(
-              "Your previous order must settle before placing a new one.",
-            );
-          return client.replaceOrder(params);
-        }
-        return client.placeOrder({ ...params, initializeAuction: false });
       });
+      if (intent.type === "limit") {
+        const limitPrice = placed.grid?.[intent.limitIndex]?.price;
+        if (limitPrice !== undefined) {
+          limit.start({
+            side: intent.side,
+            limitPrice,
+            total: order.curve[intent.side][intent.limitIndex] ?? 0n,
+            filled: 0n,
+            auctionId: placed.auctionId,
+          });
+        }
+      }
     } catch {
       // Proof, wallet, and simulation errors are shown by the progress line.
     }
@@ -360,6 +358,9 @@ export function MainAction({
   if (lowOnSol && active === null) return getFunds;
 
   const eligibilityError =
+    (limit.working !== null
+      ? "Your limit order is still working. Stop it to place another."
+      : null) ??
     orderError ??
     (batch === null || batch.grid === null
       ? "Loading the auction price grid…"
@@ -411,6 +412,18 @@ export function MainAction({
             </li>
           ))}
         </ul>
+      ) : null}
+      {limit.working !== null ? (
+        <WorkingLimitLine
+          market={market}
+          working={limit.working}
+          onStop={limit.stop}
+        />
+      ) : null}
+      {limit.error !== null ? (
+        <p role="status" className="text-muted text-sm">
+          Your limit order stopped: {limit.error}
+        </p>
       ) : null}
       {/* Once the order has settled, its outcome replaces the confirmation. */}
       {action.progress.phase !== "idle" &&

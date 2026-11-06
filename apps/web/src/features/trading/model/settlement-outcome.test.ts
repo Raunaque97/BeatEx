@@ -63,7 +63,7 @@ describe("describeSettlement", () => {
     );
     expect(outcome.kind).toBe("unfilled");
     expect(outcome.summary).toBe(
-      "Auction #5725 didn't fill your order. 490 tUSD returned to your balance.",
+      "Auction #5725: there were no other orders for yours to match. 490 tUSD returned to your balance.",
     );
   });
 

@@ -694,8 +694,19 @@ export class BeatExClient {
     auction: string;
     transaction?: ConfirmedTransaction;
   }> {
+    return this.initializeAuction(market, await this.getCurrentAuctionId(market));
+  }
+
+  /** Open `auctionId`: the running auction, or the next one just before it starts. */
+  async initializeAuction(
+    market: string,
+    auctionId: bigint,
+  ): Promise<{
+    auctionId: bigint;
+    auction: string;
+    transaction?: ConfirmedTransaction;
+  }> {
     const marketState = await this.getMarket(market);
-    const auctionId = await this.getCurrentAuctionId(market);
     const [auction] = await deriveAuctionPda(market as KitAddress, auctionId, this.programId as KitAddress);
     if ((await this.#accountData(auction)) !== null) return { auctionId, auction };
     const [[counter], [accumulator]] = await Promise.all([
