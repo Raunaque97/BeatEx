@@ -89,7 +89,7 @@ export function useWorkingLimit(
     ) {
       return;
     }
-    const built = remainingOrder(working, batch.grid, maxOrderQuantity);
+    const built = remainingOrder(working, batch.grid, maxOrderQuantity, market);
     if (built === null) return;
     placing.current = true;
     lastAttempt.current = batch.auctionId;

@@ -16,6 +16,20 @@ const grid = buildAuctionGrid({
   gridSize: 17,
 });
 const MAX = 1_000_000n;
+const tbtc = {
+  base: { symbol: "tBTC", decimals: 8 },
+  quote: { symbol: "tUSD", decimals: 6 },
+};
+const beat = {
+  base: { symbol: "BEAT", decimals: 2 },
+  quote: { symbol: "tUSD", decimals: 6 },
+};
+// 1.002001 tUSD per BEAT: a 100-atom base unit is one whole BEAT.
+const beatGrid = buildAuctionGrid({
+  referencePrice: 1_002_001n,
+  gridStepBps: 10,
+  gridSize: 17,
+});
 
 function intent(overrides: Partial<OrderIntent>): OrderIntent {
   return {
@@ -32,7 +46,7 @@ function intent(overrides: Partial<OrderIntent>): OrderIntent {
 }
 
 function built(value: OrderIntent) {
-  const result = buildOrder(value, grid, MAX);
+  const result = buildOrder(value, grid, MAX, tbtc);
   if (!result.ok) throw new Error(result.error);
   return result.order;
 }
@@ -105,6 +119,7 @@ describe("buildOrder", () => {
         intent({ type: "custom", customLevels: buysOnly, maxSell: "" }),
         grid,
         MAX,
+        tbtc,
       ),
     ).toMatchObject({ ok: true });
     expect(
@@ -112,6 +127,7 @@ describe("buildOrder", () => {
         intent({ type: "custom", customLevels: buysOnly, maxBuy: "" }),
         grid,
         MAX,
+        tbtc,
       ),
     ).toMatchObject({ ok: false, error: "Set a max buy amount." });
     expect(
@@ -119,6 +135,7 @@ describe("buildOrder", () => {
         intent({ type: "custom", customLevels: buysOnly, maxBuy: "5" }),
         grid,
         MAX,
+        tbtc,
       ),
     ).toMatchObject({
       ok: false,
@@ -127,24 +144,84 @@ describe("buildOrder", () => {
   });
 
   it("rejects bad, empty, too-fine, and oversized amounts", () => {
-    expect(buildOrder(intent({ amount: "abc" }), grid, MAX)).toMatchObject({
-      ok: false,
-    });
-    expect(buildOrder(intent({ amount: "0" }), grid, MAX)).toMatchObject({
-      ok: false,
-    });
     expect(
-      buildOrder(intent({ unit: "base", amount: "0.00000001" }), grid, MAX),
-    ).toMatchObject({ ok: false, error: "tBTC amounts go down to 0.000001." });
-    expect(
-      buildOrder(intent({ unit: "base", amount: "2" }), grid, MAX),
+      buildOrder(intent({ amount: "abc" }), grid, MAX, tbtc),
     ).toMatchObject({
       ok: false,
     });
-    expect(buildOrder(intent({ type: "custom" }), grid, MAX)).toMatchObject({
+    expect(buildOrder(intent({ amount: "0" }), grid, MAX, tbtc)).toMatchObject({
       ok: false,
     });
-    expect(buildOrder(intent({}), [], MAX)).toMatchObject({ ok: false });
+    expect(
+      buildOrder(
+        intent({ unit: "base", amount: "0.00000001" }),
+        grid,
+        MAX,
+        tbtc,
+      ),
+    ).toMatchObject({ ok: false, error: "tBTC amounts go down to 0.000001." });
+    expect(
+      buildOrder(intent({ unit: "base", amount: "2" }), grid, MAX, tbtc),
+    ).toMatchObject({
+      ok: false,
+    });
+    expect(
+      buildOrder(intent({ type: "custom" }), grid, MAX, tbtc),
+    ).toMatchObject({
+      ok: false,
+    });
+    expect(buildOrder(intent({}), [], MAX, tbtc)).toMatchObject({ ok: false });
+  });
+});
+
+describe("buildOrder on the BEAT market", () => {
+  const order = (value: OrderIntent) => {
+    const result = buildOrder(value, beatGrid, MAX, beat);
+    if (!result.ok) throw new Error(result.error);
+    return result.order;
+  };
+
+  it("turns a tUSD budget into whole BEAT at each level", () => {
+    const { curve, quoteReserve } = order(intent({}));
+    expect(curve.buy[8]).toBe(998n);
+    expect(curve.buy[0]).toBe(1_000_000_000n / beatGrid[0]!.price);
+    expect(curve.buy[16]).toBe(1_000_000_000n / beatGrid[16]!.price);
+    expect(quoteReserve).toBeLessThanOrEqual(1_000_000_000n);
+  });
+
+  it("reads a typed BEAT amount as whole BEAT, not millionths", () => {
+    const { curve, baseReserve } = order(
+      intent({ side: "sell", unit: "base", amount: "250" }),
+    );
+    expect(curve.sell[8]).toBe(250n);
+    expect(baseReserve).toBe(250n);
+  });
+
+  it("reads custom maxima as whole BEAT", () => {
+    const customLevels = emptyCustomLevels().map((_, index) =>
+      index < 8 ? 50 : 0,
+    );
+    const { curve } = order(
+      intent({ type: "custom", customLevels, maxBuy: "1000", maxSell: "" }),
+    );
+    expect(curve.buy[0]).toBe(500n);
+  });
+
+  it("rejects a fraction of a BEAT and names the market's token", () => {
+    expect(
+      buildOrder(intent({ unit: "base", amount: "0.5" }), beatGrid, MAX, beat),
+    ).toMatchObject({ ok: false, error: "BEAT amounts go down to 1." });
+    expect(
+      buildOrder(
+        intent({ unit: "base", amount: "2000000" }),
+        beatGrid,
+        MAX,
+        beat,
+      ),
+    ).toMatchObject({
+      ok: false,
+      error: "This market allows at most 1000000 BEAT per price level.",
+    });
   });
 });
 

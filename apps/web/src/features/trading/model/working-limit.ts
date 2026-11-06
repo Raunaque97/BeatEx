@@ -1,4 +1,4 @@
-import { baseUnitsToTokens, type AuctionGridLevel } from "@beatex/sdk";
+import type { AuctionGridLevel } from "@beatex/sdk";
 
 import {
   buildOrder,
@@ -6,6 +6,7 @@ import {
   type BuildResult,
   type OrderSide,
 } from "@/features/orders/model/order-curve";
+import { baseUnitsToTokens, type MarketUnits } from "@/lib/format";
 
 /** A limit order this tab keeps submitting until it has fully filled. */
 export interface WorkingLimit {
@@ -41,6 +42,7 @@ export function remainingOrder(
   working: WorkingLimit,
   grid: readonly AuctionGridLevel[],
   maxOrderQuantity: bigint,
+  market: MarketUnits,
 ): BuildResult | null {
   const limitIndex = limitLevel(grid, working.side, working.limitPrice);
   if (limitIndex === null) return null;
@@ -48,7 +50,7 @@ export function remainingOrder(
     {
       type: "limit",
       side: working.side,
-      amount: baseUnitsToTokens(working.total - working.filled),
+      amount: baseUnitsToTokens(working.total - working.filled, market),
       unit: "base",
       limitIndex,
       customLevels: emptyCustomLevels(),
@@ -57,5 +59,6 @@ export function remainingOrder(
     },
     grid,
     maxOrderQuantity,
+    market,
   );
 }

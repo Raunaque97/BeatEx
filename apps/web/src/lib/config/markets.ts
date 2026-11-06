@@ -18,6 +18,8 @@ export interface MarketConfig {
   readonly faucet: boolean;
   /** Binance pair charted while the market is idle. BEAT has none. */
   readonly binanceSymbol?: string;
+  /** Starting Max buy and Max sell of a custom curve, in base tokens. */
+  readonly defaultCurveMax: string;
 }
 
 /**
@@ -36,6 +38,7 @@ export const MARKETS: readonly MarketConfig[] = [
           quote: { symbol: "tUSD", decimals: 6 },
           faucet: true,
           binanceSymbol: "BTCUSDT",
+          defaultCurveMax: "0.1",
         },
       ]),
   ...(publicEnv.beatMarketId === undefined
@@ -48,6 +51,7 @@ export const MARKETS: readonly MarketConfig[] = [
           base: { symbol: "BEAT", decimals: 2 },
           quote: { symbol: "tUSD", decimals: 6 },
           faucet: false,
+          defaultCurveMax: "1000",
         },
       ]),
 ];

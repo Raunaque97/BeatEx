@@ -1,14 +1,14 @@
 import { BASE_UNIT_SIZE } from "@beatex/sdk";
 
-/** Token atoms held of a market's base (satoshis) and quote (micro-tUSD) tokens. */
+/** Token atoms held of a market's base and quote (micro-tUSD) tokens. */
 export interface Holdings {
   readonly baseAtoms: bigint;
   readonly quoteAtoms: bigint;
 }
 
 /**
- * Value in quote atoms. `price` is quote atoms per 100-satoshi base unit, which
- * reads as tUSD per tBTC. Rounds down.
+ * Value in quote atoms. `price` is quote atoms per 100-atom base unit. Rounds
+ * down.
  */
 export function valueInQuote(holdings: Holdings, price: bigint): bigint {
   return holdings.quoteAtoms + (holdings.baseAtoms * price) / BASE_UNIT_SIZE;

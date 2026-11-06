@@ -1,7 +1,5 @@
 import {
   BASE_UNIT_SIZE,
-  baseTokensToUnits,
-  baseUnitsToTokens,
   quoteTokensToUnits,
   quoteUnitsToTokens,
   type AuctionGridLevel,
@@ -9,7 +7,12 @@ import {
 
 import { percentOf, shareOf } from "@/components/percent-slider";
 import type { MarketConfig } from "@/lib/config/markets";
-import { baseAtomsToTokens, baseTokensToAtoms } from "@/lib/format";
+import {
+  baseAtomsToTokens,
+  baseTokensToAtoms,
+  baseTokensToUnits,
+  baseUnitsToTokens,
+} from "@/lib/format";
 import type { Holdings } from "@/lib/portfolio";
 
 import type { OrderIntentState } from "./use-order-intent";
@@ -22,14 +25,14 @@ function parseOr0(parse: (value: string) => bigint, text: string): bigint {
   }
 }
 
-/** Whole 100-satoshi base units, as a tBTC amount. */
-function wholeUnits(atoms: bigint): string {
-  return baseAtomsToTokens((atoms / BASE_UNIT_SIZE) * BASE_UNIT_SIZE);
+/** Whole 100-atom base units, as a base-token amount. */
+function wholeUnits(atoms: bigint, market: MarketConfig): string {
+  return baseAtomsToTokens((atoms / BASE_UNIT_SIZE) * BASE_UNIT_SIZE, market);
 }
 
 /**
  * Size a market or limit order as a share of the BeatEx balance being spent:
- * tUSD for a buy, tBTC for a sell.
+ * the quote token for a buy, the base token for a sell.
  */
 export function spendSizing(
   order: OrderIntentState,
@@ -49,7 +52,9 @@ export function spendSizing(
   const entered =
     intent.unit === spendUnit
       ? parseOr0(
-          spendsQuote ? quoteTokensToUnits : baseTokensToAtoms,
+          spendsQuote
+            ? quoteTokensToUnits
+            : (value) => baseTokensToAtoms(value, market),
           intent.amount,
         )
       : // Entered in the other asset: size by what the order would lock.
@@ -68,20 +73,21 @@ export function spendSizing(
         ? ""
         : spendsQuote
           ? quoteUnitsToTokens(atoms)
-          : // Orders trade whole 100-satoshi base units.
-            wholeUnits(atoms),
+          : // Orders trade whole 100-atom base units.
+            wholeUnits(atoms, market),
     );
   };
   return { symbol, available, percent, size };
 }
 
 /**
- * Size a custom curve's Max sell from the tBTC balance, and its Max buy from
- * the tUSD balance at the highest grid price, so even a full buy at the top
+ * Size a custom curve's Max sell from the base balance, and its Max buy from
+ * the quote balance at the highest grid price, so even a full buy at the top
  * level stays within what the trader holds.
  */
 export function customSizing(
   order: OrderIntentState,
+  market: MarketConfig,
   balance: Holdings | null,
   grid: readonly AuctionGridLevel[] | null,
 ) {
@@ -94,7 +100,7 @@ export function customSizing(
           grid[0]!.price,
         );
   const sellAtoms = balance?.baseAtoms ?? null;
-  // Base units the tUSD balance can buy at the top level.
+  // Base units the quote balance can buy at the top level.
   const buyUnits =
     balance === null || top === null || top === 0n
       ? null
@@ -103,11 +109,17 @@ export function customSizing(
   const sellPercent =
     sellAtoms === null
       ? 0
-      : percentOf(parseOr0(baseTokensToAtoms, intent.maxSell), sellAtoms);
+      : percentOf(
+          parseOr0((value) => baseTokensToAtoms(value, market), intent.maxSell),
+          sellAtoms,
+        );
   const buyPercent =
     buyUnits === null
       ? 0
-      : percentOf(parseOr0(baseTokensToUnits, intent.maxBuy), buyUnits);
+      : percentOf(
+          parseOr0((value) => baseTokensToUnits(value, market), intent.maxBuy),
+          buyUnits,
+        );
 
   return {
     sell: {
@@ -116,17 +128,17 @@ export function customSizing(
       size: (next: number) => {
         if (sellAtoms === null) return;
         const atoms = shareOf(sellAtoms, next);
-        order.setMaxSell(atoms === 0n ? "" : wholeUnits(atoms));
+        order.setMaxSell(atoms === 0n ? "" : wholeUnits(atoms, market));
       },
     },
     buy: {
-      /** tBTC the tUSD balance covers at the top price, in base units. */
+      /** What the quote balance covers at the top price, in base units. */
       available: buyUnits,
       percent: buyPercent,
       size: (next: number) => {
         if (buyUnits === null) return;
         const units = shareOf(buyUnits, next);
-        order.setMaxBuy(units === 0n ? "" : baseUnitsToTokens(units));
+        order.setMaxBuy(units === 0n ? "" : baseUnitsToTokens(units, market));
       },
     },
   };

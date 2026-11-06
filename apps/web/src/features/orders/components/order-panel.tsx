@@ -55,7 +55,7 @@ export function OrderPanel({
   const grid = batch?.grid ?? null;
   const isCustom = intent.type === "custom";
   const spend = spendSizing(order, market, balance);
-  const custom = customSizing(order, balance, grid);
+  const custom = customSizing(order, market, balance, grid);
   const estimate =
     !isCustom && built?.ok && grid !== null
       ? estimateOutcome(built.order, grid, intent.side)
@@ -70,7 +70,7 @@ export function OrderPanel({
     }
     if (built.order.baseReserve > 0n) {
       locks.push(
-        `${formatBase(built.order.baseReserve)} ${market.base.symbol}`,
+        `${formatBase(built.order.baseReserve, market)} ${market.base.symbol}`,
       );
     }
   }
@@ -104,7 +104,7 @@ export function OrderPanel({
                   note:
                     custom.sell.available === null
                       ? ""
-                      : `Balance ${formatBaseAtoms(custom.sell.available)} ${market.base.symbol}`,
+                      : `Balance ${formatBaseAtoms(custom.sell.available, market)} ${market.base.symbol}`,
                   slider: `Share of your ${market.base.symbol} balance`,
                 },
                 {
@@ -117,7 +117,7 @@ export function OrderPanel({
                   note:
                     balance === null || custom.buy.available === null
                       ? ""
-                      : `${formatQuoteShort(balance.quoteAtoms)} ${market.quote.symbol} ≈ ${formatBase(custom.buy.available)} ${market.base.symbol}`,
+                      : `${formatQuoteShort(balance.quoteAtoms)} ${market.quote.symbol} ≈ ${formatBase(custom.buy.available, market)} ${market.base.symbol}`,
                   slider: `Share of what your ${market.quote.symbol} can buy`,
                 },
               ] as const
@@ -125,6 +125,7 @@ export function OrderPanel({
               <div key={field.id} className="flex min-w-0 flex-col gap-1.5">
                 <div className="h-14">
                   <MaxField
+                    market={market}
                     id={field.id}
                     label={field.label}
                     value={field.value}
@@ -184,6 +185,7 @@ export function OrderPanel({
         </div>
       ) : (
         <CurveEditor
+          market={market}
           grid={grid}
           stepBps={marketAccount.gridStepBps}
           order={order}
@@ -217,7 +219,7 @@ export function OrderPanel({
             ? ""
             : `≈ ${
                 intent.side === "buy"
-                  ? `${formatBase(estimate.receive)} ${market.base.symbol}`
+                  ? `${formatBase(estimate.receive, market)} ${market.base.symbol}`
                   : `${formatQuote(estimate.receive)} ${market.quote.symbol}`
               }`}
         </span>

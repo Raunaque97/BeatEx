@@ -11,6 +11,7 @@ const market: MarketConfig = {
   base: { symbol: "tBTC", decimals: 8 },
   quote: { symbol: "tUSD", decimals: 6 },
   faucet: true,
+  defaultCurveMax: "0.1",
 };
 
 describe("describeSettlement", () => {
@@ -81,5 +82,27 @@ describe("describeSettlement", () => {
         market,
       ).summary,
     ).toBe("Auction #9 was cancelled. 1 tUSD returned to your balance.");
+  });
+
+  it("reports BEAT at its own two decimals", () => {
+    const outcome = describeSettlement(
+      9n,
+      {
+        baseReserve: 0n,
+        quoteReserve: 1_000_000_000n,
+        basePayout: 99_800n,
+        quotePayout: 2_000_000n,
+      },
+      false,
+      {
+        ...market,
+        slug: "beat-tusd",
+        label: "BEAT / tUSD",
+        base: { symbol: "BEAT", decimals: 2 },
+      },
+    );
+    expect(outcome.summary).toBe(
+      "Auction #9 filled: bought 998 BEAT for 998 tUSD.",
+    );
   });
 });

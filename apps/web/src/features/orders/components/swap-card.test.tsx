@@ -7,6 +7,7 @@ import type { CurrentBatch } from "@/features/auctions/model/current-batch";
 import type { MarketConfig } from "@/lib/config/markets";
 
 import type { OrderIntentState } from "../hooks/use-order-intent";
+import { buildOrder } from "../model/order-curve";
 import { SwapCard } from "./swap-card";
 
 const market: MarketConfig = {
@@ -16,6 +17,7 @@ const market: MarketConfig = {
   base: { symbol: "tBTC", decimals: 8 },
   quote: { symbol: "tUSD", decimals: 6 },
   faucet: true,
+  defaultCurveMax: "0.1",
 };
 const grid = buildAuctionGrid({
   referencePrice: 83_000n,
@@ -85,5 +87,55 @@ describe("spend slider", () => {
     expect(
       screen.getByRole("slider", { name: "Share of your tUSD balance" }),
     ).toHaveValue("10");
+  });
+});
+
+describe("BEAT market", () => {
+  const beat: MarketConfig = {
+    address: "beat-market",
+    slug: "beat-tusd",
+    label: "BEAT / tUSD",
+    base: { symbol: "BEAT", decimals: 2 },
+    quote: { symbol: "tUSD", decimals: 6 },
+    faucet: false,
+    defaultCurveMax: "1000",
+  };
+  const beatGrid = buildAuctionGrid({
+    referencePrice: 1_002_001n,
+    gridStepBps: 10,
+    gridSize: 17,
+  });
+
+  it("estimates in whole BEAT and shows the band in tUSD per BEAT", () => {
+    const amount = "1000";
+    const intent = {
+      type: "market",
+      side: "buy",
+      amount,
+      unit: "quote",
+      limitIndex: 8,
+      customLevels: [],
+      maxBuy: "",
+      maxSell: "",
+    } as const;
+    const built = buildOrder(intent, beatGrid, 1_000_000n, beat);
+    render(
+      <SwapCard
+        market={beat}
+        marketAccount={undefined}
+        batch={{ auctionId: 1n, grid: beatGrid } as unknown as CurrentBatch}
+        order={{ intent, built } as unknown as OrderIntentState}
+        action={null}
+        balance={{ baseAtoms: 12_345n, quoteAtoms: 4_900_000_000n }}
+        onAdvanced={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("≈ 998 BEAT")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        /Auction #1 · one price for everyone · 0\.99\d{4}–1\.01\d{4}/,
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/tUSD per BEAT/)).toBeInTheDocument();
   });
 });

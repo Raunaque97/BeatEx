@@ -1,9 +1,7 @@
 "use client";
 
-import { baseUnitsToTokens } from "@beatex/sdk";
-
 import type { MarketConfig } from "@/lib/config/markets";
-import { formatPrice } from "@/lib/format";
+import { baseUnitsToTokens, formatPrice } from "@/lib/format";
 
 import type { WorkingLimit } from "../model/working-limit";
 
@@ -31,10 +29,12 @@ export function WorkingLimitLine({
           <span>
             Limit {working.side}{" "}
             <span className="font-mono">
-              {baseUnitsToTokens(working.total)} {market.base.symbol}
+              {baseUnitsToTokens(working.total, market)} {market.base.symbol}
             </span>{" "}
             at{" "}
-            <span className="font-mono">{formatPrice(working.limitPrice)}</span>
+            <span className="font-mono">
+              {formatPrice(working.limitPrice, market)}
+            </span>
           </span>
           <span
             tabIndex={0}

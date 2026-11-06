@@ -58,6 +58,7 @@ const market: MarketConfig = {
   base: { symbol: "tBTC", decimals: 8 },
   quote: { symbol: "tUSD", decimals: 6 },
   faucet: true,
+  defaultCurveMax: "0.1",
 };
 const grid = buildAuctionGrid({
   referencePrice: 85_500n,
@@ -336,6 +337,56 @@ describe("primary order action", () => {
     await waitFor(() => expect(mocks.getAuction).toHaveBeenCalled());
     expect(mocks.placeOrder).not.toHaveBeenCalled();
     expect(mocks.replaceOrder).not.toHaveBeenCalled();
+  });
+
+  describe("faucet hint", () => {
+    const empty = {
+      status: "ready",
+      record: {
+        state: {
+          balance: { baseValue: 0n, quoteValue: 0n },
+          activeOrder: null,
+        },
+      },
+    } as PrivateStateView;
+    const hintFor = (target: MarketConfig) =>
+      render(
+        <MainAction
+          intent={marketBuy}
+          limit={noLimit}
+          market={target}
+          privateState={empty}
+          orderLabel="Buy"
+          orderError={null}
+          order={order}
+          batch={batch}
+          onDeposit={mocks.openDeposit}
+          settlement={idleSettlement}
+          funds={new Map()}
+          mints={MINTS}
+        />,
+      );
+
+    it("offers both tokens on a faucet market", () => {
+      hintFor(market);
+      expect(
+        screen.getByText("Free Devnet tBTC, tUSD, and SOL for fees."),
+      ).toBeInTheDocument();
+    });
+
+    it("offers only tUSD where the faucet has no base token", () => {
+      hintFor({
+        ...market,
+        slug: "beat-tusd",
+        base: { symbol: "BEAT", decimals: 2 },
+        faucet: false,
+      });
+      expect(
+        screen.getByText(
+          "Free Devnet tUSD and SOL for fees. Buy BEAT here with tUSD.",
+        ),
+      ).toBeInTheDocument();
+    });
   });
 
   it("sends a funded wallet to the deposit slider before the first trade", () => {

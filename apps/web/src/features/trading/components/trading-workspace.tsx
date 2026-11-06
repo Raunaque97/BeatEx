@@ -76,6 +76,7 @@ export function TradingWorkspace({
   const order = useOrderIntent(
     snapshot.batch?.grid ?? null,
     snapshot.market?.maxOrderQuantity,
+    market,
   );
 
   // A never-deposited trader has a BeatEx balance of zero, not an unknown one.
@@ -193,7 +194,9 @@ export function TradingWorkspace({
               {headlinePrice?.label ?? "Price"}
             </div>
             <div className="font-mono text-lg">
-              {headlinePrice === null ? "—" : formatPrice(headlinePrice.price)}
+              {headlinePrice === null
+                ? "—"
+                : formatPrice(headlinePrice.price, market)}
             </div>
           </div>
           <BatchClock
@@ -270,6 +273,7 @@ export function TradingWorkspace({
             </div>
             <div className="min-h-0 flex-1">
               <PriceChart
+                market={market}
                 history={snapshot.history}
                 older={olderAuctions.batches}
                 onNeedOlder={olderAuctions.loadOlder}

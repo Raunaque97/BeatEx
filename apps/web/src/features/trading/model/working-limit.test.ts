@@ -9,6 +9,14 @@ const grid = buildAuctionGrid({
   gridSize: 17,
 });
 const NO_LIMIT = 1n << 40n;
+const market = {
+  base: { symbol: "tBTC", decimals: 8 },
+  quote: { symbol: "tUSD", decimals: 6 },
+};
+const beat = {
+  base: { symbol: "BEAT", decimals: 2 },
+  quote: { symbol: "tUSD", decimals: 6 },
+};
 
 describe("limitLevel", () => {
   it("finds a price that is on the grid", () => {
@@ -44,7 +52,7 @@ describe("remainingOrder", () => {
   };
 
   it("asks only for what is left, up to the trader's price", () => {
-    const built = remainingOrder(working, grid, NO_LIMIT);
+    const built = remainingOrder(working, grid, NO_LIMIT, market);
     if (built === null || !built.ok) throw new Error("expected an order");
 
     expect(built.order.curve.buy[10]).toBe(600n);
@@ -60,7 +68,15 @@ describe("remainingOrder", () => {
         { ...working, limitPrice: grid[0]!.price - 1n },
         grid,
         NO_LIMIT,
+        market,
       ),
     ).toBeNull();
+  });
+
+  it("reads what is left in the market's own units", () => {
+    const built = remainingOrder(working, grid, NO_LIMIT, beat);
+    if (built === null || !built.ok) throw new Error("expected an order");
+
+    expect(built.order.curve.buy[10]).toBe(600n);
   });
 });

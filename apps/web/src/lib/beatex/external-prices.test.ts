@@ -18,6 +18,7 @@ const tbtc: MarketConfig = {
   quote: { symbol: "tUSD", decimals: 6 },
   faucet: true,
   binanceSymbol: "BTCUSDT",
+  defaultCurveMax: "0.1",
 };
 
 function batch(blockTime: number | null): BatchSummary {

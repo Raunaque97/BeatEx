@@ -51,7 +51,7 @@ export function SwapCard({
   const sizing = spendSizing(order, market, balance);
   const receive = (units: bigint) =>
     intent.side === "buy"
-      ? `${formatBase(units)} ${market.base.symbol}`
+      ? `${formatBase(units, market)} ${market.base.symbol}`
       : `${formatQuote(units)} ${market.quote.symbol}`;
 
   return (
@@ -103,6 +103,7 @@ export function SwapCard({
       marketAccount !== undefined ? (
         <div className="bg-bg rounded-2xl p-4">
           <LimitStrip
+            market={market}
             grid={grid}
             side={intent.side}
             limitIndex={intent.limitIndex}
@@ -120,7 +121,7 @@ export function SwapCard({
             ? "Loading auction…"
             : `Auction #${batch.auctionId} · one price for everyone`}
           {grid !== null
-            ? ` · ${formatPrice(grid[0]!.price)}–${formatPrice(grid[grid.length - 1]!.price)}`
+            ? ` · ${formatPrice(grid[0]!.price, market)}–${formatPrice(grid[grid.length - 1]!.price, market)}`
             : ""}
         </summary>
         <div className="flex flex-col gap-2 pb-2 leading-relaxed">
@@ -131,14 +132,14 @@ export function SwapCard({
           </p>
           {estimate !== null && built?.ok ? (
             <p className="font-mono text-xs">
-              Fills at {formatPrice(estimate.priceMin)}
+              Fills at {formatPrice(estimate.priceMin, market)}
               {estimate.priceMax === estimate.priceMin
                 ? ""
-                : `–${formatPrice(estimate.priceMax)}`}{" "}
+                : `–${formatPrice(estimate.priceMax, market)}`}{" "}
               {market.quote.symbol} per {market.base.symbol} · locks{" "}
               {intent.side === "buy"
                 ? `${formatQuote(built.order.quoteReserve)} ${market.quote.symbol}`
-                : `${formatBase(built.order.baseReserve)} ${market.base.symbol}`}{" "}
+                : `${formatBase(built.order.baseReserve, market)} ${market.base.symbol}`}{" "}
               until it clears
             </p>
           ) : null}

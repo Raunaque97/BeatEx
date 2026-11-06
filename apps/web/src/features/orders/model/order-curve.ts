@@ -1,11 +1,15 @@
 import {
   PRICE_LEVELS,
-  baseTokensToUnits,
-  baseUnitsToTokens,
   quoteTokensToUnits,
   type AuctionGridLevel,
   type OrderCurve,
 } from "@beatex/sdk";
+
+import {
+  baseTokensToUnits,
+  baseUnitsToTokens,
+  type MarketUnits,
+} from "@/lib/format";
 
 export type OrderType = "market" | "limit" | "custom";
 export type OrderSide = "buy" | "sell";
@@ -24,15 +28,15 @@ export interface OrderIntent {
    * `maxBuy`, negative sells that share of `maxSell`.
    */
   readonly customLevels: readonly number[];
-  /** tBTC amount a custom level buys at 100%. */
+  /** Base-token amount a custom level buys at 100%. */
   readonly maxBuy: string;
-  /** tBTC amount a custom level sells at 100%. */
+  /** Base-token amount a custom level sells at 100%. */
   readonly maxSell: string;
 }
 
 export interface BuiltOrder {
   readonly curve: OrderCurve;
-  /** tBTC (base units) the order locks: the largest sell entry. */
+  /** Base units the order locks: the largest sell entry. */
   readonly baseReserve: bigint;
   /** tUSD (quote units) the order locks: the largest `price * buy` entry. */
   readonly quoteReserve: bigint;
@@ -68,6 +72,7 @@ export function buildOrder(
   intent: OrderIntent,
   grid: readonly AuctionGridLevel[],
   maxOrderQuantity: bigint,
+  market: MarketUnits,
 ): BuildResult {
   if (grid.length !== PRICE_LEVELS) {
     return { ok: false, error: "The auction price grid is not available yet." };
@@ -78,8 +83,8 @@ export function buildOrder(
   if (intent.type === "custom") {
     const usesBuy = intent.customLevels.some((percent) => percent > 0);
     const usesSell = intent.customLevels.some((percent) => percent < 0);
-    const maxBuy = usesBuy ? parseMax(intent.maxBuy, "buy") : 0n;
-    const maxSell = usesSell ? parseMax(intent.maxSell, "sell") : 0n;
+    const maxBuy = usesBuy ? parseMax(intent.maxBuy, "buy", market) : 0n;
+    const maxSell = usesSell ? parseMax(intent.maxSell, "sell", market) : 0n;
     if (typeof maxBuy === "string") return { ok: false, error: maxBuy };
     if (typeof maxSell === "string") return { ok: false, error: maxSell };
     for (let index = 0; index < PRICE_LEVELS; index += 1) {
@@ -93,9 +98,9 @@ export function buildOrder(
       amount =
         intent.unit === "quote"
           ? quoteTokensToUnits(intent.amount.trim())
-          : baseTokensToUnits(intent.amount.trim());
+          : baseTokensToUnits(intent.amount.trim(), market);
     } catch (error) {
-      return { ok: false, error: amountError(intent, error) };
+      return { ok: false, error: amountError(intent, error, market) };
     }
     if (amount === 0n) return { ok: false, error: "Enter an amount." };
     for (let index = 0; index < PRICE_LEVELS; index += 1) {
@@ -126,7 +131,7 @@ export function buildOrder(
   if (largest > maxOrderQuantity) {
     return {
       ok: false,
-      error: `This market allows at most ${baseUnitsToTokens(maxOrderQuantity)} tBTC per price level.`,
+      error: `This market allows at most ${baseUnitsToTokens(maxOrderQuantity, market)} ${market.base.symbol} per price level.`,
     };
   }
   return {
@@ -175,7 +180,7 @@ export interface OutcomeEstimate {
   readonly receive: bigint;
   readonly receiveMin: bigint;
   readonly receiveMax: bigint;
-  /** Lowest and highest price (tUSD per tBTC) the order can fill at. */
+  /** Lowest and highest price (quote units per base unit) the order can fill at. */
   readonly priceMin: bigint;
   readonly priceMax: bigint;
   /** What the trader gives up at `index`: quote units for a buy, base units for a sell. */
@@ -224,21 +229,33 @@ export function estimateOutcome(
   };
 }
 
-function parseMax(value: string, side: OrderSide): bigint | string {
+function parseMax(
+  value: string,
+  side: OrderSide,
+  market: MarketUnits,
+): bigint | string {
   if (value.trim() === "") return `Set a max ${side} amount.`;
   try {
-    const units = baseTokensToUnits(value.trim());
+    const units = baseTokensToUnits(value.trim(), market);
     return units === 0n ? `Set a max ${side} amount.` : units;
   } catch {
-    return "tBTC amounts go down to 0.000001.";
+    return baseStepError(market);
   }
 }
 
-function amountError(intent: OrderIntent, error: unknown): string {
+function baseStepError(market: MarketUnits): string {
+  return `${market.base.symbol} amounts go down to ${baseUnitsToTokens(1n, market)}.`;
+}
+
+function amountError(
+  intent: OrderIntent,
+  error: unknown,
+  market: MarketUnits,
+): string {
   const message = error instanceof Error ? error.message : "";
   if (message.includes("decimal places") || message.includes("multiple")) {
     return intent.unit === "base"
-      ? "tBTC amounts go down to 0.000001."
+      ? baseStepError(market)
       : "tUSD amounts go down to 0.000001.";
   }
   return "Enter a valid amount.";

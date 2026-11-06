@@ -2,6 +2,7 @@
 
 import { AuctionState, buildAuctionGrid } from "@beatex/sdk";
 
+import type { MarketConfig } from "@/lib/config/markets";
 import { formatBase, formatPrice } from "@/lib/format";
 
 import type { BatchSummary } from "../model/batch-summary";
@@ -10,7 +11,13 @@ import type { BatchSummary } from "../model/batch-summary";
  * A compact hover card: what one auction cleared, and the only data it ever
  * decrypted — the demand and supply totals at each price.
  */
-export function BatchReveal({ auction }: { readonly auction: BatchSummary }) {
+export function BatchReveal({
+  auction,
+  market,
+}: {
+  readonly auction: BatchSummary;
+  readonly market: MarketConfig;
+}) {
   const settled = auction.state === AuctionState.Settled;
   let grid: ReturnType<typeof buildAuctionGrid> | null = null;
   try {
@@ -30,8 +37,8 @@ export function BatchReveal({ auction }: { readonly auction: BatchSummary }) {
       <p className="font-mono text-xs">
         {settled
           ? auction.clearingVolume > 0n
-            ? `${formatPrice(auction.clearingPrice)} · ${formatBase(auction.clearingVolume)} tBTC`
-            : `${formatPrice(auction.referencePrice)} · no fill`
+            ? `${formatPrice(auction.clearingPrice, market)} · ${formatBase(auction.clearingVolume, market)} ${market.base.symbol}`
+            : `${formatPrice(auction.referencePrice, market)} · no fill`
           : auction.state === AuctionState.Cancelled
             ? "Cancelled · refundable"
             : "Not published yet"}
@@ -56,7 +63,7 @@ export function BatchReveal({ auction }: { readonly auction: BatchSummary }) {
                 <span
                   className={`text-center font-mono text-[9px] leading-none ${clearing ? "text-accent" : "text-faint"}`}
                 >
-                  {formatPrice(level.price)}
+                  {formatPrice(level.price, market)}
                 </span>
                 <span className="flex">
                   <span

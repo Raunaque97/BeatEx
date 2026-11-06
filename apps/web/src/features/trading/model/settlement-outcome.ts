@@ -21,8 +21,8 @@ export interface SettlementOutcome {
 }
 
 /**
- * Describe a settled or refunded order. A buy locks tUSD and is paid tBTC; a
- * sell locks tBTC and is paid tUSD. Whatever was not traded comes back.
+ * Describe a settled or refunded order. A buy locks quote and is paid base; a
+ * sell locks base and is paid quote. Whatever was not traded comes back.
  */
 export function describeSettlement(
   auctionId: bigint,
@@ -33,7 +33,7 @@ export function describeSettlement(
   const batch = `Auction #${auctionId}`;
   const returned = [
     amounts.basePayout > 0n
-      ? `${formatBaseAtoms(amounts.basePayout)} ${market.base.symbol}`
+      ? `${formatBaseAtoms(amounts.basePayout, market)} ${market.base.symbol}`
       : null,
     amounts.quotePayout > 0n
       ? `${formatQuoteShort(amounts.quotePayout)} ${market.quote.symbol}`
@@ -56,7 +56,7 @@ export function describeSettlement(
       auctionId,
       kind: "bought",
       baseFilled: baseIn / BASE_UNIT_SIZE,
-      summary: `${batch} filled: bought ${formatBaseAtoms(baseIn)} ${market.base.symbol} for ${formatQuoteShort(-quoteIn)} ${market.quote.symbol}.`,
+      summary: `${batch} filled: bought ${formatBaseAtoms(baseIn, market)} ${market.base.symbol} for ${formatQuoteShort(-quoteIn)} ${market.quote.symbol}.`,
     };
   }
   if (baseIn < 0n && quoteIn > 0n) {
@@ -64,7 +64,7 @@ export function describeSettlement(
       auctionId,
       kind: "sold",
       baseFilled: -baseIn / BASE_UNIT_SIZE,
-      summary: `${batch} filled: sold ${formatBaseAtoms(-baseIn)} ${market.base.symbol} for ${formatQuoteShort(quoteIn)} ${market.quote.symbol}.`,
+      summary: `${batch} filled: sold ${formatBaseAtoms(-baseIn, market)} ${market.base.symbol} for ${formatQuoteShort(quoteIn)} ${market.quote.symbol}.`,
     };
   }
   return {
