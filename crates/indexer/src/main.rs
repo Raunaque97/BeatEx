@@ -30,13 +30,21 @@ use {
         process,
         sync::{Arc, RwLock},
         thread,
-        time::Duration,
+        time::{Duration, Instant},
     },
     tower_http::set_header::SetResponseHeaderLayer,
 };
 
 const SIGNATURE_PAGE: usize = 1_000;
 const MAX_HISTORY_RESPONSE: usize = 500;
+/// Consecutive failed polls before the HTTP client is rebuilt, in case its
+/// pooled connections are what is failing.
+const RECONNECT_AFTER_FAILURES: u32 = 5;
+/// Longest wait between failed polls, so an outage cannot flood the log.
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
+/// Failing for this long exits the process so its supervisor restarts it. An
+/// indexer once failed every poll for weeks and recovered only on restart.
+const MAX_OUTAGE: Duration = Duration::from_secs(15 * 60);
 
 struct Config {
     rpc_url: String,
@@ -306,8 +314,10 @@ impl Rpc {
                 serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
                     .to_string(),
             )
-            .send()?
-            .error_for_status()?
+            .send()
+            .and_then(reqwest::blocking::Response::error_for_status)
+            // The URL can carry an RPC provider's API key; keep it out of logs.
+            .map_err(reqwest::Error::without_url)?
             .json_value()?;
         if let Some(error) = response.get("error") {
             return Err(format!("{method} failed: {error}").into());
@@ -398,7 +408,9 @@ trait JsonValue {
 
 impl JsonValue for reqwest::blocking::Response {
     fn json_value(self) -> Result<serde_json::Value, Box<dyn Error>> {
-        Ok(serde_json::from_slice(&self.bytes()?)?)
+        Ok(serde_json::from_slice(
+            &self.bytes().map_err(reqwest::Error::without_url)?,
+        )?)
     }
 }
 
@@ -425,32 +437,109 @@ fn poll_once(rpc: &Rpc, store: &RwLock<Store>) -> Result<usize, Box<dyn Error>> 
     Ok(indexed)
 }
 
+/// What the poller does after its `failures`-th consecutive failed poll, with
+/// `outage` elapsed since the first of them.
+#[derive(Debug, PartialEq)]
+enum Recovery {
+    Retry { delay: Duration, reconnect: bool },
+    Exit,
+}
+
+fn recovery(failures: u32, outage: Duration, interval: Duration) -> Recovery {
+    if outage >= MAX_OUTAGE {
+        return Recovery::Exit;
+    }
+    let doubling = 1u32 << failures.saturating_sub(1).min(16);
+    Recovery::Retry {
+        delay: interval
+            .saturating_mul(doubling)
+            .min(MAX_RETRY_DELAY.max(interval)),
+        reconnect: failures % RECONNECT_AFTER_FAILURES == 0,
+    }
+}
+
+/// An error and its causes. reqwest's own message ("error sending request")
+/// leaves out the DNS, connection or TLS failure underneath.
+fn describe(error: &dyn Error) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    text
+}
+
+fn http_client() -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .expect("HTTP client configuration is static")
+}
+
 fn run_poller(config: &Config, store: Arc<RwLock<Store>>) {
     let url = config.rpc_url.clone();
     let interval = config.poll_interval;
     thread::spawn(move || {
         // reqwest's blocking client must be constructed outside the Tokio runtime.
-        let rpc = Rpc {
-            client: reqwest::blocking::Client::builder()
-                .timeout(Duration::from_secs(20))
-                .build()
-                .expect("HTTP client configuration is static"),
+        let mut rpc = Rpc {
+            client: http_client(),
             url,
         };
+        let mut failures = 0u32;
+        let mut outage_start = Instant::now();
         // Log with `writeln!` and ignore the result: `println!` panics when the
         // log cannot be written (a full disk), which would kill this thread
         // while the server kept serving stale history.
         let _ = panic::catch_unwind(AssertUnwindSafe(|| loop {
-            match poll_once(&rpc, &store) {
-                Ok(0) => {}
+            let delay = match poll_once(&rpc, &store) {
                 Ok(count) => {
-                    let _ = writeln!(io::stdout(), "indexed {count} auction event(s)");
+                    if failures > 0 {
+                        let _ = writeln!(
+                            io::stdout(),
+                            "indexer poll recovered after {failures} failure(s)"
+                        );
+                        failures = 0;
+                    }
+                    if count > 0 {
+                        let _ = writeln!(io::stdout(), "indexed {count} auction event(s)");
+                    }
+                    interval
                 }
                 Err(error) => {
-                    let _ = writeln!(io::stderr(), "indexer poll failed: {error}");
+                    if failures == 0 {
+                        outage_start = Instant::now();
+                    }
+                    failures = failures.saturating_add(1);
+                    match recovery(failures, outage_start.elapsed(), interval) {
+                        Recovery::Retry { delay, reconnect } => {
+                            let _ =
+                                writeln!(
+                                io::stderr(),
+                                "indexer poll failed ({failures} in a row, retrying in {}s{}): {}",
+                                delay.as_secs(),
+                                if reconnect { " with a new connection" } else { "" },
+                                describe(error.as_ref()),
+                            );
+                            if reconnect {
+                                rpc.client = http_client();
+                            }
+                            delay
+                        }
+                        Recovery::Exit => {
+                            let _ = writeln!(
+                                io::stderr(),
+                                "indexer poll failed for {} minutes; exiting so the supervisor restarts it: {}",
+                                outage_start.elapsed().as_secs() / 60,
+                                describe(error.as_ref()),
+                            );
+                            break;
+                        }
+                    }
                 }
-            }
-            thread::sleep(interval);
+            };
+            thread::sleep(delay);
         }));
         // A dead poller must take the process down so the supervisor restarts it.
         process::exit(1);
@@ -617,6 +706,74 @@ mod tests {
         let mut unknown = EVENT_IX_TAG_LE.to_vec();
         unknown.extend_from_slice(&[0; 16]);
         assert!(decode_event(&unknown, "sig", None).unwrap().is_none());
+    }
+
+    #[test]
+    fn backs_off_reconnects_and_finally_exits() {
+        let interval = Duration::from_secs(2);
+        let minute = Duration::from_secs(60);
+        let retry = |failures, outage| match recovery(failures, outage, interval) {
+            Recovery::Retry { delay, reconnect } => (delay.as_secs(), reconnect),
+            Recovery::Exit => panic!("expected a retry after {failures} failure(s)"),
+        };
+        assert_eq!(retry(1, Duration::ZERO), (2, false));
+        assert_eq!(retry(2, minute), (4, false));
+        assert_eq!(retry(4, minute), (16, false));
+        assert_eq!(retry(5, minute), (32, true));
+        assert_eq!(retry(6, minute), (60, false));
+        assert_eq!(retry(10, minute), (60, true));
+        assert_eq!(retry(u32::MAX - 1, minute), (60, false));
+        assert_eq!(recovery(12, MAX_OUTAGE, interval), Recovery::Exit);
+        // A slow configured interval is never shortened by the cap.
+        assert_eq!(
+            recovery(1, Duration::ZERO, Duration::from_secs(90)),
+            Recovery::Retry {
+                delay: Duration::from_secs(90),
+                reconnect: false
+            }
+        );
+    }
+
+    #[test]
+    fn describes_every_cause() {
+        #[derive(Debug)]
+        struct Layer(&'static str, Option<Box<Layer>>);
+        impl std::fmt::Display for Layer {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str(self.0)
+            }
+        }
+        impl Error for Layer {
+            fn source(&self) -> Option<&(dyn Error + 'static)> {
+                self.1.as_deref().map(|cause| cause as &dyn Error)
+            }
+        }
+        let error = Layer(
+            "error sending request",
+            Some(Box::new(Layer(
+                "client error (Connect)",
+                Some(Box::new(Layer("dns error", None))),
+            ))),
+        );
+        assert_eq!(
+            describe(&error),
+            "error sending request: client error (Connect): dns error"
+        );
+    }
+
+    #[test]
+    fn rpc_errors_leave_out_the_url() {
+        let rpc = Rpc {
+            client: http_client(),
+            // Port 9 (discard) on localhost refuses the connection immediately.
+            url: "http://127.0.0.1:9/v2/secret-api-key".to_owned(),
+        };
+        let error = rpc
+            .call("getSlot", serde_json::json!([]))
+            .expect_err("nothing listens on the discard port");
+        let text = describe(error.as_ref());
+        assert!(!text.contains("secret-api-key"), "{text}");
+        assert!(text.contains("error sending request"), "{text}");
     }
 
     #[test]
