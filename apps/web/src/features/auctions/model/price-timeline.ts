@@ -1,8 +1,54 @@
-import type { ChartPoint } from "./chart-series";
+import type { ExternalPrice } from "@/lib/beatex/external-prices";
+
+import type { BatchSummary } from "./batch-summary";
+import type { ChartPoint, PointSource } from "./chart-series";
 
 /** A chart point placed in time (unix seconds). */
 export interface TimedPoint extends ChartPoint {
   readonly time: number;
+}
+
+/** What the chart draws: an auction, or an outside price standing in for one. */
+export interface SeriesPoint {
+  readonly key: string;
+  readonly time: number;
+  readonly price: bigint;
+  readonly volume: bigint;
+  /** `outside` for a sampled outside price, with no auction behind it. */
+  readonly source: PointSource | "outside";
+  readonly auction: BatchSummary | null;
+}
+
+/**
+ * Auctions merged with outside prices, oldest first. Over the outside prices'
+ * span they replace every auction that did not trade, whose reference price
+ * they stand in for; auctions that traded always stay.
+ */
+export function withOutsidePrices(
+  auctions: readonly TimedPoint[],
+  outside: readonly ExternalPrice[],
+): SeriesPoint[] {
+  const from = outside[0]?.time ?? Infinity;
+  return [
+    ...auctions
+      .filter((point) => point.source === "clearing" || point.time < from)
+      .map((point): SeriesPoint => ({
+        key: point.auctionId.toString(),
+        time: point.time,
+        price: point.price,
+        volume: point.volume,
+        source: point.source,
+        auction: point.auction,
+      })),
+    ...outside.map((point): SeriesPoint => ({
+      key: `outside-${point.time}`,
+      time: point.time,
+      price: point.price,
+      volume: 0n,
+      source: "outside",
+      auction: null,
+    })),
+  ].sort((left, right) => left.time - right.time);
 }
 
 /** Auction length to assume before any two timed auctions reveal the real one. */
@@ -97,7 +143,7 @@ export interface Candle {
 
 /** Group points into candles of `seconds` each (1-minute by default), oldest first. */
 export function toCandles(
-  points: readonly TimedPoint[],
+  points: readonly Pick<SeriesPoint, "time" | "price" | "volume">[],
   seconds = 60,
 ): Candle[] {
   const buckets = new Map<number, Candle>();

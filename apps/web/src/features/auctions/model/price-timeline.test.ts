@@ -9,6 +9,7 @@ import {
   secondsPerAuction,
   timeTicks,
   toCandles,
+  withOutsidePrices,
 } from "./price-timeline";
 
 function auction(
@@ -122,5 +123,42 @@ describe("out-of-order publication times", () => {
     );
     expect(points.map((point) => point.time)).toEqual([70, 70, 130]);
     expect(toCandles(points).map((candle) => candle.time)).toEqual([60, 120]);
+  });
+});
+
+describe("merging outside prices", () => {
+  const auctions = placeInTime(
+    toChartPoints(
+      [
+        auction(1, 100, 1_000, 0),
+        auction(2, 105, 1_100, 0),
+        auction(3, 110, 1_110, 4),
+      ],
+      10,
+    ),
+    null,
+  );
+  const outside = [
+    { time: 1_050, price: 200n },
+    { time: 1_060, price: 201n },
+  ];
+
+  it("replaces untraded auctions over the outside span and keeps trades", () => {
+    expect(
+      withOutsidePrices(auctions, outside).map((point) => [
+        point.time,
+        point.price,
+        point.source,
+      ]),
+    ).toEqual([
+      [1_000, 100n, "reference"],
+      [1_050, 200n, "outside"],
+      [1_060, 201n, "outside"],
+      [1_110, 110n, "clearing"],
+    ]);
+  });
+
+  it("is just the auctions without outside prices", () => {
+    expect(withOutsidePrices(auctions, [])).toHaveLength(3);
   });
 });

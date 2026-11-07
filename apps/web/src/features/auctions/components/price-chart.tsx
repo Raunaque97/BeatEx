@@ -21,8 +21,9 @@ import {
   secondsPerAuction,
   timeTicks,
   toCandles,
+  withOutsidePrices,
   type Candle,
-  type TimedPoint,
+  type SeriesPoint,
 } from "../model/price-timeline";
 import { BatchReveal } from "./batch-reveal";
 
@@ -72,7 +73,7 @@ interface View {
 }
 
 type Hover =
-  | { readonly kind: "point"; readonly point: TimedPoint; readonly x: number }
+  | { readonly kind: "point"; readonly point: SeriesPoint; readonly x: number }
   | { readonly kind: "candle"; readonly candle: Candle; readonly x: number };
 
 /**
@@ -101,7 +102,7 @@ export function PriceChart({
   readonly batch: CurrentBatch | null;
   readonly lastClearingPrice: bigint | null;
   readonly limitPrice: bigint | null;
-  /** Outside prices drawn as a plain line while the market is idle. */
+  /** Outside prices drawn as auctions while the market is idle. */
   readonly externalPrices: readonly ExternalPrice[];
   readonly loading: boolean;
 }) {
@@ -139,11 +140,12 @@ export function PriceChart({
     byId.set(auction.auctionId, auction);
   const raw = toChartPoints(byId.values(), Number.MAX_SAFE_INTEGER);
   const rate = secondsPerAuction(raw);
-  const points = placeInTime(
+  const auctions = placeInTime(
     raw,
     batch === null ? null : { auctionId: batch.auctionId, now },
   );
-  const oldest = points[0]?.time ?? now;
+  const oldest = auctions[0]?.time ?? now;
+  const points = withOutsidePrices(auctions, externalPrices);
 
   const liveEnd = now + view.span * LIVE_MARGIN;
   const end = view.end ?? liveEnd;
@@ -215,17 +217,12 @@ export function PriceChart({
   const candles =
     candleSeconds === null ? [] : toCandles(visible, candleSeconds);
 
-  const externalVisible = externalPrices.filter(
-    (point) => point.time >= start && point.time <= end,
-  );
-
   const grid = batch?.grid ?? null;
   const live = batch?.referencePrice ?? null;
   const liveVisible = now >= start && now <= end;
   const autoDomain =
     priceDomain([
       ...visible.map((point) => point.price),
-      ...externalVisible.map((point) => point.price),
       ...(liveVisible && grid !== null
         ? [grid[0]!.price, grid[grid.length - 1]!.price]
         : []),
@@ -288,7 +285,7 @@ export function PriceChart({
         ? null
         : { kind: "candle", candle, x: x(candle.time + candleSeconds / 2) };
     }
-    let best: TimedPoint | null = null;
+    let best: SeriesPoint | null = null;
     for (const point of visible) {
       if (
         best === null ||
@@ -480,12 +477,11 @@ export function PriceChart({
             ) : null}
             {visible.map((point) => (
               <circle
-                key={point.auctionId.toString()}
+                key={point.key}
                 cx={x(point.time)}
                 cy={y(point.price)}
                 r={
-                  hover?.kind === "point" &&
-                  hover.point.auctionId === point.auctionId
+                  hover?.kind === "point" && hover.point.key === point.key
                     ? 4
                     : 2.2
                 }
@@ -542,11 +538,10 @@ export function PriceChart({
           ? visible.map((point) => {
               const height = barHeight(point.volume);
               const hovered =
-                hover?.kind === "point" &&
-                hover.point.auctionId === point.auctionId;
+                hover?.kind === "point" && hover.point.key === point.key;
               return (
                 <rect
-                  key={point.auctionId.toString()}
+                  key={point.key}
                   x={x(point.time) - Math.min(3, pxPerAuction * 0.35)}
                   width={Math.max(2, Math.min(6, pxPerAuction * 0.7))}
                   y={volumeBottom - height}
@@ -637,18 +632,7 @@ export function PriceChart({
             pointerEvents="none"
           />
         ) : null}
-        {externalPrices.length > 1 ? (
-          <polyline
-            points={externalPrices
-              .map((point) => `${x(point.time)},${y(point.price)}`)
-              .join(" ")}
-            fill="none"
-            stroke="var(--color-muted)"
-            strokeWidth={1.5}
-            pointerEvents="none"
-          />
-        ) : null}
-        {points.length === 0 && externalPrices.length === 0 ? (
+        {points.length === 0 ? (
           <text
             x={plotWidth / 2}
             y={(TOP + priceBottom) / 2}
@@ -727,7 +711,16 @@ export function PriceChart({
               <p className="text-faint mb-1 font-mono text-[10px]">
                 {formatTick(hover.point.time, 1)}
               </p>
-              <BatchReveal auction={hover.point.auction} market={market} />
+              {hover.point.auction === null ? (
+                <p className="font-mono text-xs">
+                  {formatPrice(hover.point.price, market)}
+                  <span className="text-faint block text-[10px]">
+                    {market.binanceSymbol} on Binance
+                  </span>
+                </p>
+              ) : (
+                <BatchReveal auction={hover.point.auction} market={market} />
+              )}
             </>
           ) : (
             <CandleCard

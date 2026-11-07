@@ -26,6 +26,21 @@ export interface ExternalPrice {
   readonly price: bigint;
 }
 
+/** One outside one-minute candle, in quote tokens per base token. */
+export interface ExternalCandle {
+  /** Open time, unix seconds. */
+  readonly time: number;
+  readonly open: number;
+  readonly high: number;
+  readonly low: number;
+  readonly close: number;
+}
+
+/** Seconds a candle covers. */
+const CANDLE_SECONDS = 60;
+/** Spacing of sampled prices: about one auction each. */
+const SAMPLE_SECONDS = 10;
+
 /** Convert a price in quote tokens per base token to protocol price units. */
 export function toProtocolPrice(
   quotePerBase: number,
@@ -39,11 +54,11 @@ export function toProtocolPrice(
   );
 }
 
-/** Recent one-minute closes for `market`, oldest first. */
-export async function fetchExternalPrices(
+/** Recent one-minute candles for `market`, oldest first. */
+export async function fetchExternalCandles(
   market: MarketConfig,
   signal?: AbortSignal,
-): Promise<readonly ExternalPrice[]> {
+): Promise<readonly ExternalCandle[]> {
   if (market.binanceSymbol === undefined) return [];
   const params = new URLSearchParams({
     symbol: market.binanceSymbol,
@@ -59,8 +74,72 @@ export async function fetchExternalPrices(
   }
   return klinesSchema.parse(await response.json()).map((row) => ({
     time: row[0] / 1_000,
-    price: toProtocolPrice(Number(row[4]), market),
+    open: Number(row[1]),
+    high: Number(row[2]),
+    low: Number(row[3]),
+    close: Number(row[4]),
   }));
+}
+
+/**
+ * Prices every `SAMPLE_SECONDS`, so an idle market charts like one running
+ * auctions. Each minute opens at its open and ends at its close; the prices
+ * between are random within its range and include its high and low, so the
+ * chart's own one-minute candles match the outside ones. The randomness is
+ * seeded by the minute, so refetching never reshuffles the past. The running
+ * minute is sampled only up to `now`, ending at its latest price.
+ */
+export function sampleExternalPrices(
+  candles: readonly ExternalCandle[],
+  now: number,
+  market: Pick<MarketConfig, "base" | "quote">,
+): readonly ExternalPrice[] {
+  const prices: ExternalPrice[] = [];
+  for (const candle of candles) {
+    const count = Math.min(
+      CANDLE_SECONDS / SAMPLE_SECONDS,
+      Math.floor((now - candle.time) / SAMPLE_SECONDS) + 1,
+    );
+    sampleCandle(candle, count).forEach((value, index) =>
+      prices.push({
+        time: candle.time + index * SAMPLE_SECONDS,
+        price: toProtocolPrice(value, market),
+      }),
+    );
+  }
+  return prices;
+}
+
+/** `count` prices through `candle`: open first, close last, high and low between. */
+function sampleCandle(candle: ExternalCandle, count: number): number[] {
+  if (count <= 0) return [];
+  if (count === 1) return [candle.close];
+  const random = seededRandom(candle.time);
+  const between = Array.from(
+    { length: count - 2 },
+    () => candle.low + random() * (candle.high - candle.low),
+  );
+  // Put the extremes at two random slots, when there are two.
+  if (between.length >= 2) {
+    const high = Math.floor(random() * between.length);
+    const low =
+      (high + 1 + Math.floor(random() * (between.length - 1))) % between.length;
+    between[high] = candle.high;
+    between[low] = candle.low;
+  }
+  return [candle.open, ...between, candle.close];
+}
+
+/** A small deterministic generator (mulberry32) in [0, 1). */
+function seededRandom(seed: number): () => number {
+  let state = seed >>> 0;
+  return () => {
+    state = (state + 0x6d2b79f5) >>> 0;
+    let value = state;
+    value = Math.imul(value ^ (value >>> 15), value | 1);
+    value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
+    return ((value ^ (value >>> 14)) >>> 0) / 4_294_967_296;
+  };
 }
 
 /**

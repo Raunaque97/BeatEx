@@ -1,12 +1,13 @@
 "use client";
 
 import { useQuery } from "@tanstack/react-query";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 import type { MarketConfig } from "@/lib/config/markets";
 import {
-  fetchExternalPrices,
+  fetchExternalCandles,
   isMarketIdle,
+  sampleExternalPrices,
   type ExternalPrice,
 } from "@/lib/beatex/external-prices";
 import { queryKeys } from "@/lib/query/keys";
@@ -18,9 +19,9 @@ const NO_PRICES: readonly ExternalPrice[] = [];
 const REFRESH_MS = 10_000;
 
 /**
- * Outside prices to chart while the market is idle, so a visitor still sees a
- * moving price when nothing trades. Empty once auctions trade, and for markets
- * with no outside pair.
+ * Outside prices, sampled about once per auction, to chart while the market is
+ * idle, so a visitor still sees a moving price when nothing trades. Empty
+ * once auctions trade, and for markets with no outside pair.
  */
 export function useExternalPrices(
   market: MarketConfig,
@@ -38,7 +39,14 @@ export function useExternalPrices(
     queryKey: queryKeys.externalPrices(market.address),
     enabled: idle && market.binanceSymbol !== undefined,
     refetchInterval: REFRESH_MS,
-    queryFn: ({ signal }) => fetchExternalPrices(market, signal),
+    queryFn: ({ signal }) => fetchExternalCandles(market, signal),
   });
-  return idle ? (prices.data ?? NO_PRICES) : NO_PRICES;
+  const sampled = useMemo(
+    () =>
+      prices.data === undefined
+        ? NO_PRICES
+        : sampleExternalPrices(prices.data, now, market),
+    [prices.data, now, market],
+  );
+  return idle ? sampled : NO_PRICES;
 }

@@ -5,9 +5,11 @@ import type { BatchSummary } from "@/features/auctions/model/batch-summary";
 import type { MarketConfig } from "@/lib/config/markets";
 
 import {
-  fetchExternalPrices,
+  fetchExternalCandles,
   isMarketIdle,
+  sampleExternalPrices,
   toProtocolPrice,
+  type ExternalCandle,
 } from "./external-prices";
 
 const tbtc: MarketConfig = {
@@ -52,8 +54,8 @@ describe("toProtocolPrice", () => {
   });
 });
 
-describe("fetchExternalPrices", () => {
-  it("reads each candle's open time and close", async () => {
+describe("fetchExternalCandles", () => {
+  it("reads each candle's open time and prices", async () => {
     const fetchMock = vi.fn(async () =>
       Response.json([
         [1_000_000, "1", "2", "0.5", "76150.01", "9", 1_059_999, "x", 3],
@@ -62,9 +64,9 @@ describe("fetchExternalPrices", () => {
     );
     vi.stubGlobal("fetch", fetchMock);
 
-    await expect(fetchExternalPrices(tbtc)).resolves.toEqual([
-      { time: 1_000, price: 76_150n },
-      { time: 1_060, price: 76_200n },
+    await expect(fetchExternalCandles(tbtc)).resolves.toEqual([
+      { time: 1_000, open: 1, high: 2, low: 0.5, close: 76_150.01 },
+      { time: 1_060, open: 1, high: 2, low: 0.5, close: 76_200 },
     ]);
     expect(String(fetchMock.mock.calls[0]?.at(0))).toContain("symbol=BTCUSDT");
   });
@@ -74,7 +76,7 @@ describe("fetchExternalPrices", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     await expect(
-      fetchExternalPrices({ ...tbtc, binanceSymbol: undefined }),
+      fetchExternalCandles({ ...tbtc, binanceSymbol: undefined }),
     ).resolves.toEqual([]);
     expect(fetchMock).not.toHaveBeenCalled();
   });
@@ -85,7 +87,7 @@ describe("fetchExternalPrices", () => {
       vi.fn(async () => new Response("blocked", { status: 451 })),
     );
 
-    await expect(fetchExternalPrices(tbtc)).rejects.toThrow("HTTP 451");
+    await expect(fetchExternalCandles(tbtc)).rejects.toThrow("HTTP 451");
   });
 });
 
@@ -112,5 +114,50 @@ describe("isMarketIdle", () => {
 
   it("is not idle once an auction trades", () => {
     expect(isMarketIdle([batch(now - 20), batch(now - 900)], now)).toBe(false);
+  });
+});
+
+describe("sampleExternalPrices", () => {
+  const minute: ExternalCandle = {
+    time: 6_000,
+    open: 76_100,
+    high: 76_180,
+    low: 76_020,
+    close: 76_050,
+  };
+
+  it("samples a finished minute every 10 seconds, open first and close last", () => {
+    const prices = sampleExternalPrices([minute], 7_000, tbtc);
+
+    expect(prices.map((point) => point.time)).toEqual([
+      6_000, 6_010, 6_020, 6_030, 6_040, 6_050,
+    ]);
+    expect(prices[0]?.price).toBe(76_100n);
+    expect(prices.at(-1)?.price).toBe(76_050n);
+  });
+
+  it("reaches the minute's high and low and stays within them", () => {
+    const values = sampleExternalPrices([minute], 7_000, tbtc).map(
+      (point) => point.price,
+    );
+
+    expect(values).toContain(76_180n);
+    expect(values).toContain(76_020n);
+    expect(values.every((value) => value >= 76_020n && value <= 76_180n)).toBe(
+      true,
+    );
+  });
+
+  it("gives a minute the same prices every time", () => {
+    expect(sampleExternalPrices([minute], 7_000, tbtc)).toEqual(
+      sampleExternalPrices([minute], 9_000, tbtc),
+    );
+  });
+
+  it("samples the running minute only up to now, ending at its latest price", () => {
+    const prices = sampleExternalPrices([minute], 6_025, tbtc);
+
+    expect(prices.map((point) => point.time)).toEqual([6_000, 6_010, 6_020]);
+    expect(prices.at(-1)?.price).toBe(76_050n);
   });
 });
