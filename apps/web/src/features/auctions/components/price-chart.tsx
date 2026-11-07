@@ -106,7 +106,7 @@ export function PriceChart({
   readonly batch: CurrentBatch | null;
   readonly lastClearingPrice: bigint | null;
   readonly limitPrice: bigint | null;
-  /** Outside prices drawn as auctions while the market is idle. */
+  /** Outside prices drawn as auctions between trades. */
   readonly externalPrices: readonly ExternalPrice[];
   /** Ask for older outside prices once the view nears the oldest one. */
   readonly onNeedOlderExternal: () => void;
@@ -153,7 +153,7 @@ export function PriceChart({
     batch === null ? null : { auctionId: batch.auctionId, now },
   );
   const oldest = auctions[0]?.time ?? now;
-  const points = withOutsidePrices(auctions, externalPrices);
+  const points = withOutsidePrices(auctions, externalPrices, rate);
 
   const liveEnd = now + view.span * LIVE_MARGIN;
   const end = view.end ?? liveEnd;

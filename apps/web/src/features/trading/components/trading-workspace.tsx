@@ -95,7 +95,7 @@ export function TradingWorkspace({
 
   // With no recent trade the last clear can be hours old, since zero-volume
   // auctions repeat it; an idle market shows the outside price instead.
-  const outsidePrice = outside.prices.at(-1);
+  const outsidePrice = outside.idle ? outside.prices.at(-1) : undefined;
   const lastClear =
     outsidePrice === undefined
       ? (snapshot.market?.lastClearingPrice ?? 0n)
@@ -280,9 +280,11 @@ export function TradingWorkspace({
           >
             <div className="text-muted mb-1.5 flex flex-wrap justify-between gap-2 text-xs">
               <span>
-                {outside.prices.length > 0
-                  ? `No recent auctions · showing ${market.binanceSymbol} from Binance`
-                  : "Price per auction · on-chain"}
+                {outside.prices.length === 0
+                  ? "Price per auction · on-chain"
+                  : outside.idle
+                    ? `No recent trades · showing ${market.binanceSymbol} from Binance`
+                    : `Trades on-chain · ${market.binanceSymbol} from Binance between them`}
               </span>
             </div>
             <div className="min-h-0 flex-1">

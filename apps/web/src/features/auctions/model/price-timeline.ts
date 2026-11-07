@@ -20,15 +20,32 @@ export interface SeriesPoint {
 }
 
 /**
- * Auctions merged with outside prices, oldest first. Over the outside prices'
- * span they replace every auction that did not trade, whose reference price
- * they stand in for; auctions that traded always stay.
+ * Auctions merged with outside prices, oldest first, so the chart moves
+ * between trades. Over the outside prices' span they replace every auction
+ * that did not trade, whose reference price they stand in for. Auctions that
+ * traded always stay, and outside prices within `near` seconds of one give way
+ * to it, so a busy market charts only its own trades.
  */
 export function withOutsidePrices(
   auctions: readonly TimedPoint[],
   outside: readonly ExternalPrice[],
+  near: number,
 ): SeriesPoint[] {
   const from = outside[0]?.time ?? Infinity;
+  const trades = auctions
+    .filter((point) => point.source === "clearing")
+    .map((point) => point.time);
+  // Both lists run oldest first, so one pass finds each price's nearest trade.
+  let next = 0;
+  const gaps = outside.filter((point) => {
+    while (next < trades.length && trades[next]! < point.time) next += 1;
+    const after = trades[next];
+    const before = trades[next - 1];
+    return !(
+      (after !== undefined && after - point.time < near) ||
+      (before !== undefined && point.time - before < near)
+    );
+  });
   return [
     ...auctions
       .filter((point) => point.source === "clearing" || point.time < from)
@@ -40,7 +57,7 @@ export function withOutsidePrices(
         source: point.source,
         auction: point.auction,
       })),
-    ...outside.map((point): SeriesPoint => ({
+    ...gaps.map((point): SeriesPoint => ({
       key: `outside-${point.time}`,
       time: point.time,
       price: point.price,

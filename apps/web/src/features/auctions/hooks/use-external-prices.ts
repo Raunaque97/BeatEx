@@ -26,11 +26,12 @@ const NO_PRICES: readonly ExternalPrice[] = [];
 const REFRESH_MS = 10_000;
 
 /**
- * Outside prices, sampled about once per auction, to chart while the market is
- * idle, so a visitor still sees a moving price when nothing trades. Empty
- * once auctions trade, and for markets with no outside pair. They come from
- * `interval`-second candles, the size the chart is drawing, and `loadOlder`
- * extends them back a page at a time as the chart zooms or pans out.
+ * Outside prices, sampled about once per auction, for the chart to fill the
+ * time between trades with, so it moves even when nothing trades. Empty for
+ * markets with no outside pair. They come from `interval`-second candles, the
+ * size the chart is drawing, and `loadOlder` extends them back a page at a
+ * time as the chart zooms or pans out. `idle` says nothing traded recently,
+ * so the latest outside price is fresher than the last clear.
  */
 export function useExternalPrices(
   market: MarketConfig,
@@ -39,6 +40,7 @@ export function useExternalPrices(
   interval: number,
 ): {
   readonly prices: readonly ExternalPrice[];
+  readonly idle: boolean;
   readonly loadOlder: () => void;
 } {
   const [now, setNow] = useState(() => Date.now() / 1_000);
@@ -54,7 +56,7 @@ export function useExternalPrices(
   // pages already loaded, so the moving live window never leaves a gap.
   const candles = useQuery({
     queryKey,
-    enabled: idle && market.binanceSymbol !== undefined,
+    enabled: market.binanceSymbol !== undefined,
     refetchInterval: REFRESH_MS,
     // Keep drawing the last size's candles while a new size loads.
     placeholderData: keepPreviousData,
@@ -90,7 +92,7 @@ export function useExternalPrices(
   } | null>(null);
   const loadOlder = () => {
     const before = candles.data?.[0]?.time;
-    if (!idle || candles.isPlaceholderData || before === undefined) return;
+    if (candles.isPlaceholderData || before === undefined) return;
     const attempt = lastAttempt.current;
     if (
       attempt?.interval === interval &&
@@ -114,5 +116,5 @@ export function useExternalPrices(
       .catch(() => undefined);
   };
 
-  return { prices: idle ? sampled : NO_PRICES, loadOlder };
+  return { prices: sampled, idle, loadOlder };
 }

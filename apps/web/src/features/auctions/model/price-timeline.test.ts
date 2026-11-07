@@ -159,7 +159,7 @@ describe("merging outside prices", () => {
 
   it("replaces untraded auctions over the outside span and keeps trades", () => {
     expect(
-      withOutsidePrices(auctions, outside).map((point) => [
+      withOutsidePrices(auctions, outside, 10).map((point) => [
         point.time,
         point.price,
         point.source,
@@ -173,6 +173,41 @@ describe("merging outside prices", () => {
   });
 
   it("is just the auctions without outside prices", () => {
-    expect(withOutsidePrices(auctions, [])).toHaveLength(3);
+    expect(withOutsidePrices(auctions, [], 10)).toHaveLength(3);
+  });
+
+  it("drops outside prices within an auction of a trade", () => {
+    const near = [
+      { time: 1_095, price: 200n },
+      { time: 1_105, price: 201n },
+      { time: 1_118, price: 202n },
+      { time: 1_125, price: 203n },
+    ];
+    expect(
+      withOutsidePrices(auctions, near, 10).map((point) => point.time),
+    ).toEqual([1_000, 1_095, 1_110, 1_125]);
+  });
+
+  it("charts only trades while every auction trades", () => {
+    const busy = placeInTime(
+      toChartPoints(
+        [
+          auction(1, 100, 1_000),
+          auction(2, 101, 1_010),
+          auction(3, 102, 1_020),
+        ],
+        10,
+      ),
+      null,
+    );
+    const sampled = [1_000, 1_010, 1_020].map((time) => ({
+      time: time + 3,
+      price: 200n,
+    }));
+    expect(
+      withOutsidePrices(busy, sampled, 10).every(
+        (point) => point.source === "clearing",
+      ),
+    ).toBe(true);
   });
 });
