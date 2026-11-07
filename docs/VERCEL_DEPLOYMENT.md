@@ -173,3 +173,51 @@ requests should use the frontend origin and `/api/indexer/...`.
 For local development, the origin defaults to `http://127.0.0.1:8787`; an existing
 `.env.local` can omit `BEATEX_INDEXER_URL` or set it explicitly. Restart Next.js
 after changing it.
+
+## 5. Run the demo without market makers
+
+Standing market-maker bots aren't needed for the demo. While a trader has an
+order drafted, or a limit order working, the page calls `POST /api/maker` once per
+auction. The route quotes the next auction from a throwaway wallet derived from
+`FAUCET_SECRET_KEY`, the market, and the auction ID. The wallet lives for one
+function call, so no private state is stored: it receives freshly minted tokens
+and a loan of SOL, deposits, places a two-sided order, settles once the auction
+finishes, and returns the remaining SOL. A maker takes longer to prepare than the
+16-second window, so it has to start before the trader clicks. An order always
+goes into the running auction: if no maker reached that auction, it comes back
+unfilled and the page says there was nothing to match.
+
+The route also opens any auction a trader or maker needs, paying about 0.0376 SOL
+of rent from the faucet wallet. Finishing the auction returns that rent to the
+market authority, not the faucet, because the program fixes the receiver. Start
+one on-demand committee with `--sweep-to <FAUCET_ADDRESS>` to send the authority's
+SOL above a 0.25 SOL reserve back each minute; only one needs it, as the
+committees share that wallet. Beyond that round trip, each auction with a maker
+costs about 0.004 SOL, the page stops asking after a minute without input or when
+its tab is hidden, and an idle market costs nothing.
+One maker runs per auction however many traders ask.
+
+`FAUCET_SECRET_KEY` must be the mint authority of the market's tokens, because
+both the faucet and the maker mint rather than hold stock. The optional sizing
+settings are in `apps/web/.env.example`. The route needs the default 300-second
+function duration, and it fetches the prover assets from its own origin, so
+previews behind Deployment Protection can't run it.
+
+Only the committee stays running, one per market. It must use `--on-demand` so it
+never opens auctions. It then polls every two seconds and sends nothing while
+idle:
+
+```sh
+scripts/devnet/run-committee-bot.sh --on-demand \
+  --wallet .devnet/devnet/devnet-wallet.json
+```
+
+Auction rent is paid by the faucet wallet and refunded to the market authority,
+which is also the committee's fee payer. Move SOL back to the faucet wallet when
+it runs low.
+
+The setup scripts mint with `--wallet`, so re-running their mint steps
+(`devnetSetup.sh`, `setup-test-tokens.sh`, `setup-beat-market.sh`) fails unless
+that wallet is the mint authority. Use the faucet wallet for those steps, or move
+the authority back with `spl-token authorize`.
+

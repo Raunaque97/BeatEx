@@ -225,7 +225,7 @@ impl PythPriceProvider {
 
 impl PriceProvider for PythPriceProvider {
     fn fetch(&self) -> Result<PriceSnapshot, String> {
-        let mut bytes = self.fetch_account_bytes()?;
+        let bytes = self.fetch_account_bytes()?;
         let update = PriceUpdateV2::try_deserialize(&mut bytes.as_slice())
             .map_err(|error| format!("could not decode Pyth account: {error}"))?;
         let price = update.price_message;

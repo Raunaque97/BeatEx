@@ -25,6 +25,8 @@ fi
 
 cluster='devnet'
 wallet=''
+on_demand=()
+sweep_to=()
 state_dir=''
 rpc_url=''
 base_symbol='tBTC'
@@ -37,6 +39,10 @@ Usage:
 
 Options:
   --wallet <KEYPAIR>          Fee payer (default: <state-dir>/devnet-wallet.json)
+  --on-demand                 Fold and publish only; never open auctions, so an
+                              idle market sends no transactions
+  --sweep-to <PUBKEY>         With --on-demand, send SOL above a 0.25 SOL reserve
+                              here: the wallet that opens auctions
   --cluster localnet|devnet   Target cluster (default: devnet)
   --state-dir <DIRECTORY>     Setup state (default: .devnet/<cluster>)
   --rpc-url <URL>             Primary Solana RPC URL
@@ -52,6 +58,8 @@ EOF
 while (( $# > 0 )); do
   case "$1" in
     --wallet) wallet="${2:?--wallet requires a value}"; shift 2 ;;
+    --on-demand) on_demand=(--on-demand); shift ;;
+    --sweep-to) sweep_to=(--sweep-to "${2:?--sweep-to requires a value}"); shift 2 ;;
     --cluster) cluster="${2:?--cluster requires a value}"; shift 2 ;;
     --state-dir) state_dir="${2:?--state-dir requires a value}"; shift 2 ;;
     --rpc-url) rpc_url="${2:?--rpc-url requires a value}"; shift 2 ;;
@@ -112,4 +120,6 @@ exec "$client_binary" committee \
   --quote-mint "$quote_mint" \
   --wallet "$wallet" \
   --state-dir "$state_dir" \
-  --rpc-url "$rpc_url"
+  --rpc-url "$rpc_url" \
+  ${on_demand[@]+"${on_demand[@]}"} \
+  ${sweep_to[@]+"${sweep_to[@]}"}

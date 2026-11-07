@@ -9,6 +9,7 @@ import {
 } from "@beatex/sdk";
 import { address } from "@solana/kit";
 import { useQuery } from "@tanstack/react-query";
+import { useMemo } from "react";
 
 import { beatexRpc } from "@/lib/beatex/rpc";
 import { fetchIndexedAuctions } from "@/lib/beatex/indexer";
@@ -54,6 +55,8 @@ async function fetchPendingAuctions(
 /**
  * The most recent `limit` batches: finished ones from the auction-history
  * indexer, plus in-flight ones read directly from their pending accounts.
+ * The two load separately, so the on-chain batches survive an indexer outage
+ * and the last good indexer page survives a failed refetch.
  */
 export function useAuctionHistory(
   market: string,
@@ -61,15 +64,32 @@ export function useAuctionHistory(
   currentAuctionId: bigint | null,
   limit = 60,
 ) {
-  return useQuery({
+  const finished = useQuery({
+    queryKey: [...queryKeys.auctionHistory(market), "finished", limit],
+    enabled: marketAccount !== undefined,
+    retry: 1,
+    refetchInterval: 8_000,
+    queryFn: () =>
+      fetchIndexedAuctions(
+        market,
+        {
+          gridStepBps: marketAccount!.gridStepBps,
+          gridSize: marketAccount!.gridRadius * 2 + 1,
+        },
+        limit,
+      ),
+  });
+
+  const pending = useQuery({
     queryKey: [
       ...queryKeys.auctionHistory(market),
+      "pending",
       currentAuctionId?.toString(),
     ],
     enabled: currentAuctionId !== null && marketAccount !== undefined,
     placeholderData: (previous) => previous,
     refetchInterval: 8_000,
-    queryFn: async () => {
+    queryFn: () => {
       const inFlight: bigint[] = [];
       for (
         let id = currentAuctionId! - IN_FLIGHT_BATCHES;
@@ -78,23 +98,22 @@ export function useAuctionHistory(
       ) {
         if (id >= 0n) inFlight.push(id);
       }
-      const [finished, pending] = await Promise.all([
-        fetchIndexedAuctions(
-          market,
-          {
-            gridStepBps: marketAccount!.gridStepBps,
-            gridSize: marketAccount!.gridRadius * 2 + 1,
-          },
-          limit,
-        ),
-        fetchPendingAuctions(market, inFlight),
-      ]);
-      const byId = new Map<bigint, BatchSummary>();
-      for (const batch of [...pending, ...finished])
-        byId.set(batch.auctionId, batch);
-      return [...byId.values()]
-        .sort((a, b) => (a.auctionId < b.auctionId ? 1 : -1))
-        .slice(0, limit);
+      return fetchPendingAuctions(market, inFlight);
     },
   });
+
+  const data = useMemo(() => {
+    const byId = new Map<bigint, BatchSummary>();
+    for (const batch of [...(pending.data ?? []), ...(finished.data ?? [])])
+      byId.set(batch.auctionId, batch);
+    return [...byId.values()]
+      .sort((a, b) => (a.auctionId < b.auctionId ? 1 : -1))
+      .slice(0, limit);
+  }, [pending.data, finished.data, limit]);
+
+  // A query that never succeeded reads as pending again on every refetch.
+  return {
+    data,
+    isPending: finished.isPending && finished.errorUpdateCount === 0,
+  };
 }

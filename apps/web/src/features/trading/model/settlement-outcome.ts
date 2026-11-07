@@ -1,3 +1,5 @@
+import { BASE_UNIT_SIZE } from "@beatex/sdk";
+
 import type { MarketConfig } from "@/lib/config/markets";
 import { formatBaseAtoms, formatQuoteShort } from "@/lib/format";
 
@@ -12,6 +14,8 @@ export interface SettlementAmounts {
 export interface SettlementOutcome {
   readonly auctionId: bigint;
   readonly kind: "bought" | "sold" | "unfilled" | "refunded";
+  /** Base units traded; zero unless bought or sold. */
+  readonly baseFilled: bigint;
   /** One sentence for the trader. */
   readonly summary: string;
 }
@@ -41,6 +45,7 @@ export function describeSettlement(
     return {
       auctionId,
       kind: "refunded",
+      baseFilled: 0n,
       summary: `${batch} was cancelled. ${returned || "Your funds"} returned to your balance.`,
     };
   }
@@ -50,6 +55,7 @@ export function describeSettlement(
     return {
       auctionId,
       kind: "bought",
+      baseFilled: baseIn / BASE_UNIT_SIZE,
       summary: `${batch} filled: bought ${formatBaseAtoms(baseIn, market)} ${market.base.symbol} for ${formatQuoteShort(-quoteIn)} ${market.quote.symbol}.`,
     };
   }
@@ -57,12 +63,14 @@ export function describeSettlement(
     return {
       auctionId,
       kind: "sold",
+      baseFilled: -baseIn / BASE_UNIT_SIZE,
       summary: `${batch} filled: sold ${formatBaseAtoms(-baseIn, market)} ${market.base.symbol} for ${formatQuoteShort(quoteIn)} ${market.quote.symbol}.`,
     };
   }
   return {
     auctionId,
     kind: "unfilled",
-    summary: `${batch} didn't fill your order. ${returned || "Your funds"} returned to your balance.`,
+    baseFilled: 0n,
+    summary: `${batch}: there were no other orders for yours to match. ${returned || "Your funds"} returned to your balance.`,
   };
 }

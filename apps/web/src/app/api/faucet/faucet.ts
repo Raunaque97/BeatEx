@@ -5,28 +5,21 @@ import {
 } from "@beatex/sdk";
 import {
   address,
-  appendTransactionMessageInstructions,
   createKeyPairSignerFromBytes,
-  createTransactionMessage,
-  getTransactionEncoder,
-  pipe,
-  setTransactionMessageFeePayerSigner,
-  setTransactionMessageLifetimeUsingBlockhash,
-  signTransactionMessageWithSigners,
   type Address,
-  type Blockhash,
   type Instruction,
 } from "@solana/kit";
 
 import { SOL_TOP_UP_FLOOR_LAMPORTS } from "@/lib/config/faucet";
 import type { MarketConfig } from "@/lib/config/markets";
 import { publicEnv } from "@/lib/config/public-env";
+import { sendInstructions } from "@/lib/solana/send";
 import {
   associatedTokenAddress,
   createAssociatedTokenAccountIdempotent,
+  mintToChecked,
   systemTransfer,
   tokenAccountAmount,
-  transferChecked,
 } from "@/lib/solana/token";
 
 /** SOL the faucet keeps back for its own fees and recipients' token-account rent. */
@@ -104,8 +97,9 @@ export interface FaucetResult {
 
 /**
  * Send whatever a demo wallet is missing: one drip of each test token it holds
- * less than, and SOL up to the target when it is below the top-up floor. A wallet
- * missing nothing is refused, which keeps the route stateless on serverless hosting.
+ * less than, minted fresh, and SOL up to the target when it is below the top-up
+ * floor. A wallet missing nothing is refused, which keeps the route stateless on
+ * serverless hosting.
  */
 export async function dripTestFunds(
   config: FaucetConfig,
@@ -119,28 +113,17 @@ export async function dripTestFunds(
   }
 
   const faucet = await createKeyPairSignerFromBytes(config.secretKey);
-  const [recipientBase, recipientQuote, faucetBase, faucetQuote] =
-    await Promise.all([
-      associatedTokenAddress(recipient, config.baseMint),
-      associatedTokenAddress(recipient, config.quoteMint),
-      associatedTokenAddress(faucet.address, config.baseMint),
-      associatedTokenAddress(faucet.address, config.quoteMint),
-    ]);
-  const [
-    recipientAccount,
-    faucetAccount,
-    baseAccount,
-    quoteAccount,
-    faucetBaseAccount,
-    faucetQuoteAccount,
-  ] = await config.rpc.getMultipleAccounts([
-    recipient,
-    faucet.address,
-    recipientBase,
-    recipientQuote,
-    faucetBase,
-    faucetQuote,
+  const [recipientBase, recipientQuote] = await Promise.all([
+    associatedTokenAddress(recipient, config.baseMint),
+    associatedTokenAddress(recipient, config.quoteMint),
   ]);
+  const [recipientAccount, faucetAccount, baseAccount, quoteAccount] =
+    await config.rpc.getMultipleAccounts([
+      recipient,
+      faucet.address,
+      recipientBase,
+      recipientQuote,
+    ]);
 
   const held = (account: { readonly data: Uint8Array } | null) =>
     account === null ? 0n : tokenAccountAmount(account.data);
@@ -161,9 +144,8 @@ export async function dripTestFunds(
     );
   }
   if (
-    held(faucetBaseAccount) < baseAtoms ||
-    held(faucetQuoteAccount) < quoteAtoms ||
-    (faucetAccount?.lamports ?? 0n) < lamports + FAUCET_SOL_RESERVE_LAMPORTS
+    (faucetAccount?.lamports ?? 0n) <
+    lamports + FAUCET_SOL_RESERVE_LAMPORTS
   ) {
     throw new FaucetError("The faucet is empty. Please try again later.", 503);
   }
@@ -180,8 +162,7 @@ export async function dripTestFunds(
         config.baseMint,
         recipientBase,
       ),
-      transferChecked(
-        faucetBase,
+      mintToChecked(
         config.baseMint,
         recipientBase,
         faucet.address,
@@ -198,8 +179,7 @@ export async function dripTestFunds(
         config.quoteMint,
         recipientQuote,
       ),
-      transferChecked(
-        faucetQuote,
+      mintToChecked(
         config.quoteMint,
         recipientQuote,
         faucet.address,
@@ -209,25 +189,6 @@ export async function dripTestFunds(
     );
   }
 
-  const { blockhash, lastValidBlockHeight } =
-    await config.rpc.getLatestBlockhash("confirmed");
-  const message = pipe(
-    createTransactionMessage({ version: 0 }),
-    (draft) => setTransactionMessageFeePayerSigner(faucet, draft),
-    (draft) =>
-      setTransactionMessageLifetimeUsingBlockhash(
-        { blockhash: blockhash as Blockhash, lastValidBlockHeight },
-        draft,
-      ),
-    (draft) => appendTransactionMessageInstructions(instructions, draft),
-  );
-  const signed = await signTransactionMessageWithSigners(message);
-  const bytes = new Uint8Array(getTransactionEncoder().encode(signed));
-  const signature = await config.rpc.sendRawTransaction(bytes);
-  await config.rpc.confirmTransaction(signature, {
-    commitment: "confirmed",
-    blockhash,
-    lastValidBlockHeight,
-  });
+  const signature = await sendInstructions(config.rpc, faucet, instructions);
   return { signature, baseAtoms, quoteAtoms, lamports };
 }

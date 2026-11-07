@@ -16,6 +16,8 @@ export interface MarketConfig {
   /** Whether the test-token faucet dispenses this market's tokens. BEAT has
    * no faucet: users buy it on the DEX with faucet tUSD. */
   readonly faucet: boolean;
+  /** Binance pair charted while the market is idle. BEAT has none. */
+  readonly binanceSymbol?: string;
   /** Starting Max buy and Max sell of a custom curve, in base tokens. */
   readonly defaultCurveMax: string;
 }
@@ -35,6 +37,7 @@ export const MARKETS: readonly MarketConfig[] = [
           base: { symbol: "tBTC", decimals: 8 },
           quote: { symbol: "tUSD", decimals: 6 },
           faucet: true,
+          binanceSymbol: "BTCUSDT",
           defaultCurveMax: "0.1",
         },
       ]),

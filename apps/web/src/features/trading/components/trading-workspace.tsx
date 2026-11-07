@@ -6,6 +6,7 @@ import { useState } from "react";
 
 import { BatchClock } from "@/features/auctions/components/batch-clock";
 import { PriceChart } from "@/features/auctions/components/price-chart";
+import { useExternalPrices } from "@/features/auctions/hooks/use-external-prices";
 import { useMarketSnapshot } from "@/features/auctions/hooks/use-market-snapshot";
 import { useOlderAuctions } from "@/features/auctions/hooks/use-older-auctions";
 import { BalanceChip } from "@/features/balances/components/balance-chip";
@@ -27,6 +28,7 @@ import { useMarketFunds } from "@/features/balances/hooks/use-market-funds";
 import { useBeatEx } from "@/providers/beatex-provider";
 
 import { useAutoSettle } from "../hooks/use-auto-settle";
+import { useWorkingLimit } from "../hooks/use-working-limit";
 import { useTradeView, type TradeView } from "../hooks/use-trade-view";
 import { MainAction } from "./main-action";
 
@@ -46,8 +48,20 @@ export function TradingWorkspace({
   const { owner, client } = useBeatEx();
   const privateState = usePrivateState(market.address);
   const snapshot = useMarketSnapshot(market.address);
-  // Lives here, not in the order button, so switching views never interrupts it.
-  const settlement = useAutoSettle(market, privateState);
+  const externalPrices = useExternalPrices(
+    market,
+    snapshot.history,
+    snapshot.historyLoading,
+  );
+  // These live here, not in the order button, so switching views never
+  // interrupts them.
+  const limit = useWorkingLimit(
+    market,
+    snapshot.batch,
+    privateState,
+    snapshot.market?.maxOrderQuantity,
+  );
+  const settlement = useAutoSettle(market, privateState, limit.onSettled);
   const olderAuctions = useOlderAuctions(
     market.address,
     snapshot.market,
@@ -136,6 +150,7 @@ export function TradingWorkspace({
     <MainAction
       onDeposit={() => setBalances("deposit")}
       settlement={settlement}
+      limit={limit}
       funds={funds.tokens}
       mints={mints}
       market={market}
@@ -143,6 +158,7 @@ export function TradingWorkspace({
       orderLabel={orderLabel}
       orderError={orderError}
       order={built?.ok ? built.order : null}
+      intent={intent}
       batch={snapshot.batch}
     />
   );
@@ -249,7 +265,11 @@ export function TradingWorkspace({
             className="border-line flex h-[460px] min-w-0 flex-col border-b px-4 py-3 lg:h-auto lg:min-h-0 lg:flex-1 lg:border-r lg:border-b-0"
           >
             <div className="text-muted mb-1.5 flex flex-wrap justify-between gap-2 text-xs">
-              <span>Price per auction · on-chain</span>
+              <span>
+                {externalPrices.length > 0
+                  ? `No recent auctions · showing ${market.binanceSymbol} from Binance`
+                  : "Price per auction · on-chain"}
+              </span>
             </div>
             <div className="min-h-0 flex-1">
               <PriceChart
@@ -260,6 +280,8 @@ export function TradingWorkspace({
                 batch={snapshot.batch}
                 lastClearingPrice={lastClear > 0n ? lastClear : null}
                 limitPrice={limitPrice}
+                externalPrices={externalPrices}
+                loading={snapshot.historyLoading}
               />
             </div>
           </section>

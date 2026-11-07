@@ -25,7 +25,12 @@ const mocks = vi.hoisted(() => ({
   deposit: vi.fn(),
   wallet: vi.fn(),
   openDeposit: vi.fn(),
+  requestMaker: vi.fn(),
+  owner: "owner",
+  startLimit: vi.fn(),
 }));
+
+vi.mock("@/lib/beatex/maker", () => ({ requestMaker: mocks.requestMaker }));
 
 vi.mock("@/providers/beatex-provider", () => ({
   useBeatEx: () => ({
@@ -84,6 +89,24 @@ const order = {
   baseReserve: 0n,
   quoteReserve: 86_184n,
 };
+const marketBuy = {
+  type: "market",
+  side: "buy",
+  amount: "1",
+  unit: "base",
+  limitIndex: 8,
+  customLevels: [],
+  maxBuy: "",
+  maxSell: "",
+} as const;
+const noLimit = {
+  working: null,
+  error: null,
+  progress: { phase: "idle" },
+  start: mocks.startLimit,
+  stop: vi.fn(),
+  onSettled: () => true,
+} as const;
 const privateState = {
   status: "ready",
   record: {
@@ -99,6 +122,8 @@ function show(
   currentBatch = batch,
   settlement: Parameters<typeof MainAction>[0]["settlement"] = idleSettlement,
   funds: Parameters<typeof MainAction>[0]["funds"] = new Map(),
+  intent: Parameters<typeof MainAction>[0]["intent"] = marketBuy,
+  limit: Parameters<typeof MainAction>[0]["limit"] = noLimit,
 ) {
   return render(
     <MainAction
@@ -107,6 +132,8 @@ function show(
       orderLabel="Buy tBTC"
       orderError={null}
       order={order}
+      intent={intent}
+      limit={limit}
       batch={currentBatch}
       onDeposit={mocks.openDeposit}
       settlement={settlement}
@@ -143,11 +170,82 @@ describe("primary order action", () => {
         initializeAuction: false,
       }),
     );
-    // The crank creates auctions; a trader never pays for one.
+    // The server creates auctions; a trader never pays for one.
     expect(mocks.initializeCurrentAuction).not.toHaveBeenCalled();
   });
 
-  it("waits for the crank to open the auction before ordering", async () => {
+  it("asks the server to open an idle auction, then orders straight into it", async () => {
+    show(privateState, { ...batch, auction: null, gridIsPreview: true });
+    fireEvent.click(screen.getByRole("button", { name: "Buy tBTC" }));
+    await waitFor(() => expect(mocks.placeOrder).toHaveBeenCalled());
+    expect(mocks.requestMaker).toHaveBeenCalledWith("tbtc-tusd", "owner", {
+      open: true,
+    });
+  });
+
+  it("does not hold an order back when the auction is already open", async () => {
+    show();
+    fireEvent.click(screen.getByRole("button", { name: "Buy tBTC" }));
+    await waitFor(() => expect(mocks.placeOrder).toHaveBeenCalled());
+    expect(mocks.requestMaker).not.toHaveBeenCalledWith(
+      "tbtc-tusd",
+      "owner",
+      expect.anything(),
+    );
+    expect(mocks.getCurrentAuctionId).toHaveBeenCalledTimes(1);
+  });
+
+  it("resends an order to the next auction if this one closes on the way", async () => {
+    mocks.placeOrder
+      .mockRejectedValueOnce(new Error("Error Code: QueueInvariant"))
+      .mockResolvedValue({});
+    show();
+    fireEvent.click(screen.getByRole("button", { name: "Buy tBTC" }));
+    await waitFor(() => expect(mocks.placeOrder).toHaveBeenCalledTimes(2));
+  });
+
+  it("keeps a placed limit order working at its price", async () => {
+    show(privateState, batch, idleSettlement, new Map(), {
+      ...marketBuy,
+      type: "limit",
+      limitIndex: 8,
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Buy tBTC" }));
+    await waitFor(() =>
+      expect(mocks.startLimit).toHaveBeenCalledWith({
+        side: "buy",
+        limitPrice: grid[8]!.price,
+        total: 1n,
+        filled: 0n,
+        auctionId: 5n,
+      }),
+    );
+  });
+
+  it("does not keep a market order working", async () => {
+    show();
+    fireEvent.click(screen.getByRole("button", { name: "Buy tBTC" }));
+    await waitFor(() => expect(mocks.placeOrder).toHaveBeenCalled());
+    expect(mocks.startLimit).not.toHaveBeenCalled();
+  });
+
+  it("shows a working limit order and blocks a second one", () => {
+    show(privateState, batch, idleSettlement, new Map(), marketBuy, {
+      ...noLimit,
+      working: {
+        side: "buy",
+        limitPrice: 85_500n,
+        total: 1_000n,
+        filled: 250n,
+        auctionId: null,
+      },
+    });
+    expect(screen.getByText(/25% filled/)).toBeInTheDocument();
+    expect(screen.getByLabelText(/Closing the tab/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Buy tBTC" })).toBeDisabled();
+  });
+
+  it("waits for the server to open the auction before ordering", async () => {
     mocks.getAuction
       .mockResolvedValueOnce(null)
       .mockResolvedValue({ referencePrice: 85_500n, gridStepBps: 10 });
@@ -176,6 +274,8 @@ describe("primary order action", () => {
     // 5 base units are 500 satoshis.
     const { unmount } = render(
       <MainAction
+        intent={marketBuy}
+        limit={noLimit}
         market={market}
         privateState={funded(499n)}
         orderLabel="Sell tBTC"
@@ -194,6 +294,8 @@ describe("primary order action", () => {
     unmount();
     render(
       <MainAction
+        intent={marketBuy}
+        limit={noLimit}
         market={market}
         privateState={funded(500n)}
         orderLabel="Sell tBTC"
@@ -250,6 +352,8 @@ describe("primary order action", () => {
     const hintFor = (target: MarketConfig) =>
       render(
         <MainAction
+          intent={marketBuy}
+          limit={noLimit}
           market={target}
           privateState={empty}
           orderLabel="Buy"
@@ -349,13 +453,15 @@ describe("primary order action", () => {
           {
             auctionId: 5n,
             kind: "bought",
+            baseFilled: 1n,
             summary: "Auction #5 filled: bought 0.0012 tBTC for 99.95 tUSD.",
           },
           {
             auctionId: 4n,
             kind: "unfilled",
+            baseFilled: 0n,
             summary:
-              "Auction #4 didn't fill your order. 490 tUSD returned to your balance.",
+              "Auction #4: there were no other orders for yours to match. 490 tUSD returned to your balance.",
           },
         ],
       });

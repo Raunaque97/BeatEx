@@ -92,21 +92,14 @@ function instructionCount(bytes: Uint8Array) {
 
 describe("dripTestFunds", () => {
   it("sends a new wallet SOL plus one drip of each token", async () => {
-    const { config, sent } = await setup([
-      null,
-      RICH_FAUCET,
-      null,
-      null,
-      tokenAccount(1_000_000_000n),
-      tokenAccount(1_000_000_000_000n),
-    ]);
+    const { config, sent } = await setup([null, RICH_FAUCET, null, null]);
     const result = await dripTestFunds(config, RECIPIENT);
     expect(result).toMatchObject({
       baseAtoms: 5_000_000n,
       quoteAtoms: 5_000_000_000n,
       lamports: 50_000_000n,
     });
-    // One SOL transfer, then an account creation and TransferChecked per token.
+    // One SOL transfer, then an account creation and MintToChecked per token.
     expect(sent).toHaveLength(1);
     expect(instructionCount(sent[0]!)).toBe(5);
   });
@@ -117,8 +110,6 @@ describe("dripTestFunds", () => {
       RICH_FAUCET,
       tokenAccount(5_000_000n),
       tokenAccount(5_000_000_000n),
-      tokenAccount(1n),
-      tokenAccount(1n),
     ]);
     const result = await dripTestFunds(config, RECIPIENT);
     expect(result).toMatchObject({
@@ -129,43 +120,22 @@ describe("dripTestFunds", () => {
     expect(instructionCount(sent[0]!)).toBe(1);
   });
 
-  it("refuses wallets missing nothing, and an empty faucet", async () => {
+  it("refuses wallets missing nothing, and a faucet out of SOL", async () => {
     const funded = await setup([
       wallet(30_000_000n),
       RICH_FAUCET,
       tokenAccount(5_000_000n),
       tokenAccount(5_000_000_000n),
-      tokenAccount(1n),
-      tokenAccount(1n),
     ]);
     await expect(dripTestFunds(funded.config, RECIPIENT)).rejects.toMatchObject(
       { status: 429 },
     );
 
-    const noTokens = await setup([
-      null,
-      RICH_FAUCET,
-      null,
-      null,
-      tokenAccount(1n),
-      tokenAccount(1n),
-    ]);
-    await expect(
-      dripTestFunds(noTokens.config, RECIPIENT),
-    ).rejects.toMatchObject({ status: 503 });
-
-    const noSol = await setup([
-      null,
-      wallet(20_000_000n),
-      null,
-      null,
-      tokenAccount(1_000_000_000n),
-      tokenAccount(1_000_000_000_000n),
-    ]);
+    const noSol = await setup([null, wallet(20_000_000n), null, null]);
     await expect(dripTestFunds(noSol.config, RECIPIENT)).rejects.toMatchObject({
       status: 503,
     });
-    expect([...noTokens.sent, ...noSol.sent]).toHaveLength(0);
+    expect(noSol.sent).toHaveLength(0);
   });
 
   it("rejects malformed addresses", async () => {

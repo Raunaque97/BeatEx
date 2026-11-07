@@ -4,8 +4,10 @@ import {
   address,
   getAddressEncoder,
   getProgramDerivedAddress,
+  type AccountSignerMeta,
   type Address,
   type Instruction,
+  type TransactionSigner,
 } from "@solana/kit";
 
 export const ASSOCIATED_TOKEN_PROGRAM = address(
@@ -86,6 +88,46 @@ export function transferChecked(
   };
 }
 
+/** Token-2022 `MintToChecked`, signed by the mint's authority. */
+export function mintToChecked(
+  mint: Address,
+  destination: Address,
+  authority: Address,
+  amount: bigint,
+  decimals: number,
+): Instruction {
+  const data = new Uint8Array(10);
+  data[0] = 14;
+  new DataView(data.buffer).setBigUint64(1, amount, true);
+  data[9] = decimals;
+  return {
+    programAddress: TOKEN_2022_PROGRAM,
+    accounts: [
+      { address: mint, role: AccountRole.WRITABLE },
+      { address: destination, role: AccountRole.WRITABLE },
+      { address: authority, role: AccountRole.READONLY_SIGNER },
+    ],
+    data,
+  };
+}
+
+/** Token-2022 `CloseAccount`: an empty account's rent goes to `destination`. */
+export function closeTokenAccount(
+  account: Address,
+  destination: Address,
+  owner: Address,
+): Instruction {
+  return {
+    programAddress: TOKEN_2022_PROGRAM,
+    accounts: [
+      { address: account, role: AccountRole.WRITABLE },
+      { address: destination, role: AccountRole.WRITABLE },
+      { address: owner, role: AccountRole.READONLY_SIGNER },
+    ],
+    data: Uint8Array.of(9),
+  };
+}
+
 /** System Program transfer of `lamports` from a signing `source`. */
 export function systemTransfer(
   source: Address,
@@ -101,6 +143,33 @@ export function systemTransfer(
     accounts: [
       { address: source, role: AccountRole.WRITABLE_SIGNER },
       { address: destination, role: AccountRole.WRITABLE },
+    ],
+    data,
+  };
+}
+
+/**
+ * System Program account holding only `lamports`, for a signing `account`. Unlike
+ * a transfer it fails if the account already exists, so only one caller can win.
+ */
+export function createSystemAccount(
+  payer: Address,
+  account: TransactionSigner,
+  lamports: bigint,
+): Instruction {
+  const data = new Uint8Array(52);
+  const view = new DataView(data.buffer);
+  view.setBigUint64(4, lamports, true);
+  data.set(encoder.encode(SYSTEM_PROGRAM), 20);
+  return {
+    programAddress: SYSTEM_PROGRAM,
+    accounts: [
+      { address: payer, role: AccountRole.WRITABLE_SIGNER },
+      {
+        address: account.address,
+        role: AccountRole.WRITABLE_SIGNER,
+        signer: account,
+      } as AccountSignerMeta,
     ],
     data,
   };
