@@ -8,6 +8,8 @@ import type { MarketConfig } from "@/lib/config/markets";
 const BINANCE_KLINES = "https://data-api.binance.vision/api/v3/klines";
 /** One-minute candles to request: two hours, past the chart's default span. */
 const KLINE_LIMIT = 120;
+/** Older candles to request at a time as the chart zooms out: six hours. */
+export const OLDER_KLINE_LIMIT = 360;
 /** With no trade for this long, the market reads as idle. */
 const IDLE_AFTER_SECONDS = 5 * 60;
 
@@ -54,19 +56,29 @@ export function toProtocolPrice(
   );
 }
 
-/** Recent one-minute candles for `market`, oldest first. */
+/**
+ * One-minute candles for `market`, oldest first: the latest ones, or with
+ * `before` (unix seconds) the ones that opened before it.
+ */
 export async function fetchExternalCandles(
   market: MarketConfig,
-  signal?: AbortSignal,
+  options: {
+    readonly before?: number;
+    readonly limit?: number;
+    readonly signal?: AbortSignal;
+  } = {},
 ): Promise<readonly ExternalCandle[]> {
   if (market.binanceSymbol === undefined) return [];
   const params = new URLSearchParams({
     symbol: market.binanceSymbol,
     interval: "1m",
-    limit: String(KLINE_LIMIT),
+    limit: String(options.limit ?? KLINE_LIMIT),
   });
+  if (options.before !== undefined) {
+    params.set("endTime", String(options.before * 1_000 - 1));
+  }
   const response = await fetch(`${BINANCE_KLINES}?${params}`, {
-    signal,
+    signal: options.signal,
     credentials: "omit",
   });
   if (!response.ok) {
@@ -79,6 +91,16 @@ export async function fetchExternalCandles(
     low: Number(row[3]),
     close: Number(row[4]),
   }));
+}
+
+/** Two candle lists as one, oldest first; `next` wins for a minute in both. */
+export function mergeCandles(
+  previous: readonly ExternalCandle[],
+  next: readonly ExternalCandle[],
+): readonly ExternalCandle[] {
+  const byTime = new Map<number, ExternalCandle>();
+  for (const candle of [...previous, ...next]) byTime.set(candle.time, candle);
+  return [...byTime.values()].sort((left, right) => left.time - right.time);
 }
 
 /**

@@ -91,6 +91,7 @@ export function PriceChart({
   lastClearingPrice,
   limitPrice,
   externalPrices,
+  onNeedOlderExternal,
   loading,
 }: {
   readonly market: MarketConfig;
@@ -104,6 +105,8 @@ export function PriceChart({
   readonly limitPrice: bigint | null;
   /** Outside prices drawn as auctions while the market is idle. */
   readonly externalPrices: readonly ExternalPrice[];
+  /** Ask for older outside prices once the view nears the oldest one. */
+  readonly onNeedOlderExternal: () => void;
   readonly loading: boolean;
 }) {
   const box = useRef<HTMLDivElement>(null);
@@ -160,6 +163,12 @@ export function PriceChart({
   useEffect(() => {
     if (start < oldest + view.span * 0.25) onNeedOlder();
   }, [start, oldest, view.span, onNeedOlder]);
+  const oldestExternal = externalPrices[0]?.time ?? null;
+  useEffect(() => {
+    if (oldestExternal !== null && start < oldestExternal + view.span * 0.25) {
+      onNeedOlderExternal();
+    }
+  }, [start, oldestExternal, view.span, onNeedOlderExternal]);
 
   // Wheel zooms around the cursor (pinch arrives as ctrl+wheel); sideways
   // scroll pans. Registered natively: React's wheel listener is passive.

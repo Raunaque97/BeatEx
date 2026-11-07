@@ -48,7 +48,7 @@ export function TradingWorkspace({
   const { owner, client } = useBeatEx();
   const privateState = usePrivateState(market.address);
   const snapshot = useMarketSnapshot(market.address);
-  const externalPrices = useExternalPrices(
+  const outside = useExternalPrices(
     market,
     snapshot.history,
     snapshot.historyLoading,
@@ -92,7 +92,7 @@ export function TradingWorkspace({
 
   // With no recent trade the last clear can be hours old, since zero-volume
   // auctions repeat it; an idle market shows the outside price instead.
-  const outsidePrice = externalPrices.at(-1);
+  const outsidePrice = outside.prices.at(-1);
   const lastClear =
     outsidePrice === undefined
       ? (snapshot.market?.lastClearingPrice ?? 0n)
@@ -277,7 +277,7 @@ export function TradingWorkspace({
           >
             <div className="text-muted mb-1.5 flex flex-wrap justify-between gap-2 text-xs">
               <span>
-                {externalPrices.length > 0
+                {outside.prices.length > 0
                   ? `No recent auctions · showing ${market.binanceSymbol} from Binance`
                   : "Price per auction · on-chain"}
               </span>
@@ -291,7 +291,8 @@ export function TradingWorkspace({
                 batch={snapshot.batch}
                 lastClearingPrice={lastClear > 0n ? lastClear : null}
                 limitPrice={limitPrice}
-                externalPrices={externalPrices}
+                externalPrices={outside.prices}
+                onNeedOlderExternal={outside.loadOlder}
                 loading={snapshot.historyLoading}
               />
             </div>

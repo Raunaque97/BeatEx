@@ -7,6 +7,7 @@ import type { MarketConfig } from "@/lib/config/markets";
 import {
   fetchExternalCandles,
   isMarketIdle,
+  mergeCandles,
   sampleExternalPrices,
   toProtocolPrice,
   type ExternalCandle,
@@ -69,6 +70,17 @@ describe("fetchExternalCandles", () => {
       { time: 1_060, open: 1, high: 2, low: 0.5, close: 76_200 },
     ]);
     expect(String(fetchMock.mock.calls[0]?.at(0))).toContain("symbol=BTCUSDT");
+  });
+
+  it("asks for the page of candles that opened before a time", async () => {
+    const fetchMock = vi.fn(async () => Response.json([]));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await fetchExternalCandles(tbtc, { before: 6_000, limit: 360 });
+
+    const url = new URL(String(fetchMock.mock.calls[0]?.at(0)));
+    expect(url.searchParams.get("endTime")).toBe("5999999");
+    expect(url.searchParams.get("limit")).toBe("360");
   });
 
   it("fetches nothing for a market with no outside pair", async () => {
@@ -159,5 +171,30 @@ describe("sampleExternalPrices", () => {
 
     expect(prices.map((point) => point.time)).toEqual([6_000, 6_010, 6_020]);
     expect(prices.at(-1)?.price).toBe(76_050n);
+  });
+});
+
+describe("mergeCandles", () => {
+  const candle = (time: number, close: number): ExternalCandle => ({
+    time,
+    open: close,
+    high: close,
+    low: close,
+    close,
+  });
+
+  it("joins an older page and the latest one in time order", () => {
+    expect(
+      mergeCandles(
+        [candle(120, 2), candle(180, 3)],
+        [candle(0, 0), candle(60, 1)],
+      ).map((item) => item.time),
+    ).toEqual([0, 60, 120, 180]);
+  });
+
+  it("takes the newer copy of a minute both have", () => {
+    expect(mergeCandles([candle(60, 1)], [candle(60, 9)])).toEqual([
+      candle(60, 9),
+    ]);
   });
 });
