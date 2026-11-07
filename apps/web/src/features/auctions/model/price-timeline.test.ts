@@ -101,14 +101,28 @@ describe("1-minute candles", () => {
 
 describe("time axis", () => {
   it("picks round ticks that fit", () => {
-    expect(timeTicks(0, 600, 7)).toEqual([0, 120, 240, 360, 480, 600]);
-    expect(timeTicks(30, 100, 7)).toEqual([30, 45, 60, 75, 90]);
+    expect(timeTicks(0, 600, 7, 0)).toEqual([0, 120, 240, 360, 480, 600]);
+    expect(timeTicks(30, 100, 7, 0)).toEqual([30, 45, 60, 75, 90]);
+  });
+
+  it("starts hours and days on the local clock", () => {
+    // UTC+5:30: local hours start at :30 past UTC hours.
+    expect(timeTicks(0, 3 * 3_600, 3, 19_800)).toEqual([1_800, 5_400, 9_000]);
+    // A month of days falls back to week ticks at local midnight.
+    const ticks = timeTicks(0, 30 * 86_400, 7, 19_800);
+    expect(ticks[1]! - ticks[0]!).toBe(7 * 86_400);
+    expect((ticks[0]! + 19_800) % 86_400).toBe(0);
   });
 
   it("labels in hours and minutes, with seconds for fine ticks", () => {
     const time = new Date(2026, 9, 13, 9, 5, 30).getTime() / 1_000;
     expect(formatTick(time, 60)).toBe("09:05");
     expect(formatTick(time, 15)).toBe("09:05:30");
+  });
+
+  it("labels day ticks with the date", () => {
+    const time = new Date(2026, 10, 7, 0, 0).getTime() / 1_000;
+    expect(formatTick(time, 86_400)).toBe("Nov 7");
   });
 });
 

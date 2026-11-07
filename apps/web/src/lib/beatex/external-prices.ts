@@ -6,10 +6,20 @@ import type { MarketConfig } from "@/lib/config/markets";
 
 /** Binance's public market-data host: no API key, and it allows browser requests. */
 const BINANCE_KLINES = "https://data-api.binance.vision/api/v3/klines";
-/** One-minute candles to request: two hours, past the chart's default span. */
+/** Latest candles to request: two hours of minutes, past the chart's default span. */
 const KLINE_LIMIT = 120;
-/** Older candles to request at a time as the chart zooms out: six hours. */
-export const OLDER_KLINE_LIMIT = 360;
+/** Older candles to request at a time as the chart zooms or pans out. */
+export const OLDER_KLINE_LIMIT = 500;
+
+/** Binance's name for each candle size the chart draws, in seconds. */
+const KLINE_INTERVALS: ReadonlyMap<number, string> = new Map([
+  [60, "1m"],
+  [300, "5m"],
+  [900, "15m"],
+  [3_600, "1h"],
+  [14_400, "4h"],
+  [86_400, "1d"],
+]);
 /** With no trade for this long, the market reads as idle. */
 const IDLE_AFTER_SECONDS = 5 * 60;
 
@@ -28,7 +38,7 @@ export interface ExternalPrice {
   readonly price: bigint;
 }
 
-/** One outside one-minute candle, in quote tokens per base token. */
+/** One outside candle, in quote tokens per base token. */
 export interface ExternalCandle {
   /** Open time, unix seconds. */
   readonly time: number;
@@ -38,7 +48,7 @@ export interface ExternalCandle {
   readonly close: number;
 }
 
-/** Seconds a candle covers. */
+/** Seconds a sampled candle covers: one minute. */
 const CANDLE_SECONDS = 60;
 /** Spacing of sampled prices: about one auction each. */
 const SAMPLE_SECONDS = 10;
@@ -57,12 +67,14 @@ export function toProtocolPrice(
 }
 
 /**
- * One-minute candles for `market`, oldest first: the latest ones, or with
- * `before` (unix seconds) the ones that opened before it.
+ * Candles for `market`, oldest first, `interval` seconds each (one minute by
+ * default): the latest ones, or with `before` (unix seconds) the ones that
+ * opened before it.
  */
 export async function fetchExternalCandles(
   market: MarketConfig,
   options: {
+    readonly interval?: number;
     readonly before?: number;
     readonly limit?: number;
     readonly signal?: AbortSignal;
@@ -71,7 +83,7 @@ export async function fetchExternalCandles(
   if (market.binanceSymbol === undefined) return [];
   const params = new URLSearchParams({
     symbol: market.binanceSymbol,
-    interval: "1m",
+    interval: klineInterval(options.interval ?? CANDLE_SECONDS),
     limit: String(options.limit ?? KLINE_LIMIT),
   });
   if (options.before !== undefined) {
@@ -93,6 +105,12 @@ export async function fetchExternalCandles(
   }));
 }
 
+function klineInterval(seconds: number): string {
+  const name = KLINE_INTERVALS.get(seconds);
+  if (name === undefined) throw new Error(`no ${seconds}-second candles`);
+  return name;
+}
+
 /** Two candle lists as one, oldest first; `next` wins for a minute in both. */
 export function mergeCandles(
   previous: readonly ExternalCandle[],
@@ -101,6 +119,35 @@ export function mergeCandles(
   const byTime = new Map<number, ExternalCandle>();
   for (const candle of [...previous, ...next]) byTime.set(candle.time, candle);
   return [...byTime.values()].sort((left, right) => left.time - right.time);
+}
+
+/**
+ * Prices to chart from `interval`-second candles. One-minute candles are
+ * sampled about once per auction; larger ones, for views too wide to show
+ * auctions, become their open, high, low and close in the order a price
+ * would most simply take, which the chart's candles of that size match.
+ */
+export function externalPrices(
+  candles: readonly ExternalCandle[],
+  interval: number,
+  now: number,
+  market: Pick<MarketConfig, "base" | "quote">,
+): readonly ExternalPrice[] {
+  if (interval === CANDLE_SECONDS) {
+    return sampleExternalPrices(candles, now, market);
+  }
+  return candles.flatMap((candle) => {
+    // The running candle has only lasted until now.
+    const step = Math.max(0, Math.min(interval, now - candle.time)) / 4;
+    const path =
+      candle.close >= candle.open
+        ? [candle.open, candle.low, candle.high, candle.close]
+        : [candle.open, candle.high, candle.low, candle.close];
+    return path.map((value, index) => ({
+      time: candle.time + index * step,
+      price: toProtocolPrice(value, market),
+    }));
+  });
 }
 
 /**

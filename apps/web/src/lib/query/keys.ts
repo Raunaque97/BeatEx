@@ -7,8 +7,8 @@ export const queryKeys = {
   slot: () => [...root, "slot"] as const,
   market: (market: string) => [...root, market, "market"] as const,
   oracle: (market: string) => [...root, market, "oracle"] as const,
-  externalPrices: (market: string) =>
-    [...root, market, "external-prices"] as const,
+  externalPrices: (market: string, interval: number) =>
+    [...root, market, "external-prices", interval] as const,
   auction: (market: string, auctionId: bigint) =>
     [...root, market, "auction", auctionId.toString()] as const,
   auctionHistory: (market: string) =>

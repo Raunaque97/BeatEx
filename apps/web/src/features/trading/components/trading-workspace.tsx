@@ -48,10 +48,13 @@ export function TradingWorkspace({
   const { owner, client } = useBeatEx();
   const privateState = usePrivateState(market.address);
   const snapshot = useMarketSnapshot(market.address);
+  // The chart picks the candle size; one minute until it does.
+  const [externalInterval, setExternalInterval] = useState(60);
   const outside = useExternalPrices(
     market,
     snapshot.history,
     snapshot.historyLoading,
+    externalInterval,
   );
   // These live here, not in the order button, so switching views never
   // interrupts them.
@@ -293,6 +296,7 @@ export function TradingWorkspace({
                 limitPrice={limitPrice}
                 externalPrices={outside.prices}
                 onNeedOlderExternal={outside.loadOlder}
+                onExternalInterval={setExternalInterval}
                 loading={snapshot.historyLoading}
               />
             </div>

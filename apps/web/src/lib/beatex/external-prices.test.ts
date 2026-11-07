@@ -5,6 +5,7 @@ import type { BatchSummary } from "@/features/auctions/model/batch-summary";
 import type { MarketConfig } from "@/lib/config/markets";
 
 import {
+  externalPrices,
   fetchExternalCandles,
   isMarketIdle,
   mergeCandles,
@@ -70,6 +71,16 @@ describe("fetchExternalCandles", () => {
       { time: 1_060, open: 1, high: 2, low: 0.5, close: 76_200 },
     ]);
     expect(String(fetchMock.mock.calls[0]?.at(0))).toContain("symbol=BTCUSDT");
+  });
+
+  it("asks for the candle size wanted", async () => {
+    const fetchMock = vi.fn(async () => Response.json([]));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await fetchExternalCandles(tbtc, { interval: 14_400 });
+
+    const url = new URL(String(fetchMock.mock.calls[0]?.at(0)));
+    expect(url.searchParams.get("interval")).toBe("4h");
   });
 
   it("asks for the page of candles that opened before a time", async () => {
@@ -196,5 +207,41 @@ describe("mergeCandles", () => {
     expect(mergeCandles([candle(60, 1)], [candle(60, 9)])).toEqual([
       candle(60, 9),
     ]);
+  });
+});
+
+describe("externalPrices", () => {
+  const hour: ExternalCandle = {
+    time: 36_000,
+    open: 76_100,
+    high: 76_400,
+    low: 75_900,
+    close: 76_300,
+  };
+
+  it("draws a larger candle as its open, low, high and close", () => {
+    expect(externalPrices([hour], 3_600, 50_000, tbtc)).toEqual([
+      { time: 36_000, price: 76_100n },
+      { time: 36_900, price: 75_900n },
+      { time: 37_800, price: 76_400n },
+      { time: 38_700, price: 76_300n },
+    ]);
+  });
+
+  it("visits the high first in a falling candle", () => {
+    const falling = { ...hour, close: 76_000 };
+    expect(
+      externalPrices([falling], 3_600, 50_000, tbtc).map((p) => p.price),
+    ).toEqual([76_100n, 76_400n, 75_900n, 76_000n]);
+  });
+
+  it("keeps the running candle's prices before now", () => {
+    const prices = externalPrices([hour], 3_600, 36_400, tbtc);
+    expect(prices.at(-1)?.time).toBe(36_300);
+  });
+
+  it("samples one-minute candles into auctions", () => {
+    const minute = { ...hour, time: 6_000 };
+    expect(externalPrices([minute], 60, 7_000, tbtc)).toHaveLength(6);
   });
 });

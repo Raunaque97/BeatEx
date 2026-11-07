@@ -36,11 +36,13 @@ const GAP = 10;
 const LIVE_MARGIN = 0.1;
 const DEFAULT_SPAN = 10 * 60;
 const MIN_SPAN = 2 * 60;
-const MAX_SPAN = 24 * 60 * 60;
+const MAX_SPAN = 30 * 24 * 60 * 60;
+/** Wider than this, older auctions stop loading: a page holds minutes of them. */
+const MAX_AUCTION_PAGING_SPAN = 24 * 60 * 60;
 /** Below this many pixels per auction, points give way to candles. */
 const MIN_POINT_PX = 6;
 /** Candle sizes to step through as the view widens; 1 minute first. */
-const CANDLE_SECONDS = [60, 300, 900, 3_600];
+const CANDLE_SECONDS = [60, 300, 900, 3_600, 14_400, 86_400];
 const MIN_CANDLE_PX = 5;
 
 const mono = { fontFamily: "var(--font-mono)" };
@@ -92,6 +94,7 @@ export function PriceChart({
   limitPrice,
   externalPrices,
   onNeedOlderExternal,
+  onExternalInterval,
   loading,
 }: {
   readonly market: MarketConfig;
@@ -107,6 +110,8 @@ export function PriceChart({
   readonly externalPrices: readonly ExternalPrice[];
   /** Ask for older outside prices once the view nears the oldest one. */
   readonly onNeedOlderExternal: () => void;
+  /** The candle size, in seconds, outside prices should come in for this view. */
+  readonly onExternalInterval: (seconds: number) => void;
   readonly loading: boolean;
 }) {
   const box = useRef<HTMLDivElement>(null);
@@ -159,9 +164,29 @@ export function PriceChart({
   const volumeBottom = size.height - TIME_AXIS;
   const priceBottom = volumeBottom - VOLUME_HEIGHT - GAP;
 
+  const pxPerAuction = (plotWidth * rate) / view.span;
+  const candleSeconds =
+    pxPerAuction >= MIN_POINT_PX
+      ? null
+      : (CANDLE_SECONDS.find(
+          (seconds) => (plotWidth * seconds) / view.span >= MIN_CANDLE_PX,
+        ) ?? CANDLE_SECONDS.at(-1)!);
+  // Outside prices come as candles of the size drawn, or as minutes sampled
+  // into auctions when auctions are drawn.
+  const externalInterval = candleSeconds ?? CANDLE_SECONDS[0]!;
+  const measured = size.width > 0;
+  useEffect(() => {
+    if (measured) onExternalInterval(externalInterval);
+  }, [measured, externalInterval, onExternalInterval]);
+
   // Fetch older history before the view reaches the oldest loaded auction.
   useEffect(() => {
-    if (start < oldest + view.span * 0.25) onNeedOlder();
+    if (
+      view.span <= MAX_AUCTION_PAGING_SPAN &&
+      start < oldest + view.span * 0.25
+    ) {
+      onNeedOlder();
+    }
   }, [start, oldest, view.span, onNeedOlder]);
   const oldestExternal = externalPrices[0]?.time ?? null;
   useEffect(() => {
@@ -216,13 +241,6 @@ export function PriceChart({
   const visible = points.filter(
     (point) => point.time >= start - rate && point.time <= end + rate,
   );
-  const pxPerAuction = (plotWidth * rate) / view.span;
-  const candleSeconds =
-    pxPerAuction >= MIN_POINT_PX
-      ? null
-      : (CANDLE_SECONDS.find(
-          (seconds) => (plotWidth * seconds) / view.span >= MIN_CANDLE_PX,
-        ) ?? CANDLE_SECONDS.at(-1)!);
   const candles =
     candleSeconds === null ? [] : toCandles(visible, candleSeconds);
 
@@ -756,6 +774,12 @@ function clampView(span: number, end: number): View {
   return end >= liveEnd ? { span, end: null } : { span, end };
 }
 
+/** A candle edge: with the date once candles are hours long. */
+function candleTime(time: number, seconds: number): string {
+  const clock = formatTick(time, 60);
+  return seconds >= 14_400 ? `${formatTick(time, 86_400)} ${clock}` : clock;
+}
+
 function CandleCard({
   market,
   candle,
@@ -775,7 +799,8 @@ function CandleCard({
   return (
     <div className="w-[150px] font-mono text-xs">
       <p className="text-faint mb-1 text-[10px]">
-        {formatTick(candle.time, 60)}–{formatTick(candle.time + seconds, 60)}
+        {candleTime(candle.time, seconds)}–
+        {candleTime(candle.time + seconds, seconds)}
       </p>
       {rows.map(([label, value]) => (
         <p key={label} className="flex justify-between gap-3">

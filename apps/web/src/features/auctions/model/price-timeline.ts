@@ -175,28 +175,81 @@ export function toCandles(
   return [...buckets.values()].sort((left, right) => left.time - right.time);
 }
 
+const DAY = 86_400;
+
 /** Tick spacings for the time axis, in seconds. */
 const TICK_STEPS = [
-  15, 30, 60, 120, 300, 600, 900, 1_800, 3_600, 7_200, 14_400, 21_600, 43_200,
-  86_400,
+  15,
+  30,
+  60,
+  120,
+  300,
+  600,
+  900,
+  1_800,
+  3_600,
+  7_200,
+  14_400,
+  21_600,
+  43_200,
+  DAY,
+  2 * DAY,
+  7 * DAY,
+  14 * DAY,
 ];
 
-/** Round-numbered time-axis ticks across [start, end], at most `max` of them. */
-export function timeTicks(start: number, end: number, max = 7): number[] {
+const MONTHS = [
+  "Jan",
+  "Feb",
+  "Mar",
+  "Apr",
+  "May",
+  "Jun",
+  "Jul",
+  "Aug",
+  "Sep",
+  "Oct",
+  "Nov",
+  "Dec",
+];
+
+/**
+ * Round-numbered time-axis ticks across [start, end], at most `max` of them,
+ * on the local clock: `utcOffset` is seconds ahead of UTC, so hours and days
+ * start where the viewer's do rather than at UTC's.
+ */
+export function timeTicks(
+  start: number,
+  end: number,
+  max = 7,
+  utcOffset = localUtcOffset(start),
+): number[] {
   const span = Math.max(1, end - start);
   const step =
     TICK_STEPS.find((candidate) => span / candidate <= max) ??
     TICK_STEPS.at(-1)!;
   const ticks: number[] = [];
-  for (let tick = Math.ceil(start / step) * step; tick <= end; tick += step) {
+  for (
+    let tick = Math.ceil((start + utcOffset) / step) * step - utcOffset;
+    tick <= end;
+    tick += step
+  ) {
     ticks.push(tick);
   }
   return ticks;
 }
 
-/** A tick label in local time: seconds only when ticks are under a minute apart. */
+function localUtcOffset(time: number): number {
+  return -new Date(time * 1_000).getTimezoneOffset() * 60;
+}
+
+/**
+ * A tick label in local time: the date for ticks a day or more apart, and
+ * seconds only when they are under a minute apart.
+ */
 export function formatTick(time: number, step: number): string {
   const date = new Date(time * 1_000);
+  if (step >= DAY) return `${MONTHS[date.getMonth()]} ${date.getDate()}`;
   const pad = (value: number) => value.toString().padStart(2, "0");
   const clock = `${pad(date.getHours())}:${pad(date.getMinutes())}`;
   return step < 60 ? `${clock}:${pad(date.getSeconds())}` : clock;
