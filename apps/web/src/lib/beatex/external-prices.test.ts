@@ -21,7 +21,7 @@ const tbtc: MarketConfig = {
   defaultCurveMax: "0.1",
 };
 
-function batch(blockTime: number | null): BatchSummary {
+function batch(blockTime: number | null, clearingVolume = 10n): BatchSummary {
   return {
     auctionId: 1n,
     state: AuctionState.Settled,
@@ -31,7 +31,7 @@ function batch(blockTime: number | null): BatchSummary {
     gridSize: 17,
     clearingIndex: 8,
     clearingPrice: 100n,
-    clearingVolume: 0n,
+    clearingVolume,
     decryptedDemand: [],
     decryptedSupply: [],
     blockTime,
@@ -104,7 +104,13 @@ describe("isMarketIdle", () => {
     expect(isMarketIdle([batch(now - 301)], now)).toBe(true);
   });
 
-  it("is not idle while auctions are publishing", () => {
+  it("is idle while auctions run but trade nothing, as with only a maker", () => {
+    expect(isMarketIdle([batch(now - 20, 0n), batch(now - 900)], now)).toBe(
+      true,
+    );
+  });
+
+  it("is not idle once an auction trades", () => {
     expect(isMarketIdle([batch(now - 20), batch(now - 900)], now)).toBe(false);
   });
 });

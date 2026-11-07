@@ -90,20 +90,31 @@ export function TradingWorkspace({
         ? { baseAtoms: 0n, quoteAtoms: 0n }
         : null;
 
-  const lastClear = snapshot.market?.lastClearingPrice ?? 0n;
+  // With no recent trade the last clear can be hours old, since zero-volume
+  // auctions repeat it; an idle market shows the outside price instead.
+  const outsidePrice = externalPrices.at(-1);
+  const lastClear =
+    outsidePrice === undefined
+      ? (snapshot.market?.lastClearingPrice ?? 0n)
+      : 0n;
   const headlinePrice =
-    lastClear > 0n
-      ? { label: "Last clear", price: lastClear }
-      : snapshot.oracle !== null && snapshot.market !== undefined
-        ? {
-            label: "Pyth",
-            price: normalizeOraclePrice(
-              snapshot.oracle.price,
-              snapshot.oracle.exponent,
-              snapshot.market.oracleExponentAdjustment,
-            ),
-          }
-        : null;
+    outsidePrice !== undefined
+      ? {
+          label: `${market.binanceSymbol} · Binance`,
+          price: outsidePrice.price,
+        }
+      : lastClear > 0n
+        ? { label: "Last clear", price: lastClear }
+        : snapshot.oracle !== null && snapshot.market !== undefined
+          ? {
+              label: "Pyth",
+              price: normalizeOraclePrice(
+                snapshot.oracle.price,
+                snapshot.oracle.exponent,
+                snapshot.market.oracleExponentAdjustment,
+              ),
+            }
+          : null;
 
   // One balance per token across every market; an order moves funds here
   // from the others when it needs them.

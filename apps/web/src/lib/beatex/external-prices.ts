@@ -1,4 +1,4 @@
-import { BASE_UNIT_SIZE } from "@beatex/sdk";
+import { AuctionState, BASE_UNIT_SIZE } from "@beatex/sdk";
 import { z } from "zod";
 
 import type { BatchSummary } from "@/features/auctions/model/batch-summary";
@@ -8,7 +8,7 @@ import type { MarketConfig } from "@/lib/config/markets";
 const BINANCE_KLINES = "https://data-api.binance.vision/api/v3/klines";
 /** One-minute candles to request: two hours, past the chart's default span. */
 const KLINE_LIMIT = 120;
-/** With no timed auction for this long, the market reads as idle. */
+/** With no trade for this long, the market reads as idle. */
 const IDLE_AFTER_SECONDS = 5 * 60;
 
 /** A row is [openTime, open, high, low, close, ...]; only these fields are read. */
@@ -64,9 +64,10 @@ export async function fetchExternalPrices(
 }
 
 /**
- * Whether no auction has a block time within the idle window. Pending auctions
- * have none, so this holds both when the indexer is down and when it is up but
- * the bots have stopped publishing.
+ * Whether no auction traded within the idle window. Pending auctions have no
+ * block time, so this holds when the indexer is down, when the bots have
+ * stopped, and when auctions run with only a maker's quote: those clear no
+ * volume and repeat the last clearing price, however old it is.
  */
 export function isMarketIdle(
   history: readonly BatchSummary[],
@@ -74,6 +75,8 @@ export function isMarketIdle(
 ): boolean {
   return !history.some(
     (batch) =>
+      batch.state === AuctionState.Settled &&
+      batch.clearingVolume > 0n &&
       typeof batch.blockTime === "number" &&
       now - batch.blockTime < IDLE_AFTER_SECONDS,
   );
